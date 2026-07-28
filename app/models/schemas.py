@@ -28,19 +28,30 @@ class TranscriptSegment(BaseModel):
         return value
 
 
+class TranscribeRequest(BaseModel):
+    uuid: str
+
+
 class PipelineConfig(BaseModel):
     source_language: str | None = Field(default=None, max_length=16)
     target_language: str = Field(default="en", min_length=2, max_length=16)
-    asr_model: Literal["tiny", "base", "small"] = "base"
+    translation_provider: Literal["9router", "google", "mock"] = "9router"
+    translation_model: str = Field(default="ag/gemini-3-flash-agent", min_length=1, max_length=160)
+    asr_model: str = Field(default="base", min_length=1, max_length=160)
     compute_type: Literal["int8", "float16"] = "int8"
     word_timestamps: bool = False
     voice_model: str = Field(default="Trúc Ly", min_length=1, max_length=64)
     tts_device: Literal["cuda", "cpu"] = "cuda"
-    background_volume: float = Field(default=0.35, ge=0, le=1)
+    background_volume: float = Field(default=0.0, ge=0, le=1)
     tts_volume: float = Field(default=1.0, ge=0, le=2)
     burn_subtitles: bool = True
-    mock_translation: bool = True
+    mock_translation: bool = False
     mock_tts: bool = True
+    ocr_fallback: bool = True
+    ocr_force: bool = False
+    ocr_model: str = Field(default="gemini/gemini-2.5-flash", min_length=1, max_length=160)
+    ocr_interval_seconds: float = Field(default=0.75, ge=0.25, le=5.0)
+    ocr_crop_bottom_ratio: float = Field(default=0.35, ge=0.12, le=0.85)
 
 
 class PipelineResult(BaseModel):
@@ -50,12 +61,25 @@ class PipelineResult(BaseModel):
     segments: list[TranscriptSegment]
 
 
+class SubtitleStyle(BaseModel):
+    x: float = Field(default=12, ge=0, le=100)
+    y: float = Field(default=72, ge=0, le=100)
+    width: float = Field(default=76, ge=5, le=100)
+    height: float = Field(default=16, ge=4, le=60)
+    font_size: int = Field(default=42, ge=12, le=120)
+    color: str = Field(default="#FFFFFF", pattern=r"^#[0-9A-Fa-f]{6}$")
+    outline_color: str = Field(default="#000000", pattern=r"^#[0-9A-Fa-f]{6}$")
+    outline_width: int = Field(default=3, ge=0, le=12)
+    align: Literal["left", "center", "right"] = "center"
+
+
 class DubbingScriptSegment(BaseModel):
     id: int
     start: float = Field(ge=0)
     end: float = Field(ge=0)
     original_text: str
     translated_text: str
+    subtitle_style: SubtitleStyle = Field(default_factory=SubtitleStyle)
     voice_model: str = "Trúc Ly"
 
     @property
@@ -73,13 +97,34 @@ class AnalyzeResponse(BaseModel):
 class RenderScriptRequest(BaseModel):
     source_video_path: str = Field(min_length=1)
     target_language: str = Field(default="vi", min_length=2, max_length=16)
+    translation_provider: Literal["9router", "google", "mock"] = "9router"
+    translation_model: str = Field(default="ag/gemini-3-flash-agent", min_length=1, max_length=160)
     voice_model: str = Field(default="Trúc Ly", min_length=1, max_length=64)
     tts_device: Literal["cuda", "cpu"] = "cuda"
-    background_volume: float = Field(default=0.35, ge=0, le=1)
+    background_volume: float = Field(default=0.0, ge=0, le=1)
     tts_volume: float = Field(default=1.0, ge=0, le=2)
     burn_subtitles: bool = True
     mock_tts: bool = False
     segments: list[DubbingScriptSegment] = Field(min_length=1)
+
+
+class ShortenTextRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=4000)
+    target_duration: float = Field(gt=0, le=120)
+    target_language: str = Field(default="vi", min_length=2, max_length=16)
+    translation_provider: Literal["9router", "google", "mock"] = "9router"
+    translation_model: str = Field(default="", max_length=160)
+    source_text: str | None = Field(default=None, max_length=4000)
+    context: str | None = Field(default=None, max_length=4000)
+    max_words: int | None = Field(default=None, ge=1, le=300)
+
+
+class ShortenTextResponse(BaseModel):
+    text: str
+    max_words: int
+    target_duration: float
+    provider: str
+    model: str
 
 
 class BatchPipelineResult(BaseModel):

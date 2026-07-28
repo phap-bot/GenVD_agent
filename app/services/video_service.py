@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from app.models.schemas import PipelineConfig, TranscriptSegment
 from app.services.dependency_service import DependencyService
+from app.services.timeline_service import TimelineService
 from app.services.tts_service import TTSAudioTrack
+
+logger = logging.getLogger(__name__)
 
 
 def _ffmpeg():
@@ -30,6 +34,7 @@ class VideoService:
         work_dir: Path,
         output_path: Path,
     ) -> tuple[Path, Path]:
+        segments = TimelineService().from_transcript(segments)
         subtitle_path = work_dir / "subtitles.srt"
         self.generate_srt(segments, subtitle_path)
 
@@ -72,11 +77,8 @@ class VideoService:
             duration="longest",
             normalize=0,
         )
-        (
-            ffmpeg.output(mixed, str(destination), ac=2, ar="44100", format="wav")
-            .overwrite_output()
-            .run(quiet=True)
-        )
+        command = ffmpeg.output(mixed, str(destination), ac=2, ar="44100", format="wav").overwrite_output()
+        self._run_ffmpeg_command(command, "audio_mix")
 
     def _render_video(
         self,
@@ -89,33 +91,46 @@ class VideoService:
         video_input = ffmpeg.input(str(video_path))
         video_stream = video_input.video
         if self.config.burn_subtitles:
-            video_stream = video_stream.filter("subtitles", self._ffmpeg_filter_path(subtitle_path))
+            subtitle_filter_path = self._ffmpeg_filter_path(subtitle_path)
+            logger.info("video_service.render.subtitle_filter path=%s", subtitle_filter_path)
+            video_stream = video_stream.filter("subtitles", subtitle_filter_path)
 
         if tts_mix_path is None:
-            (
-                ffmpeg.output(video_stream, video_input.audio, str(output_path), vcodec="libx264", acodec="aac")
-                .overwrite_output()
-                .run(quiet=True)
-            )
+            command = ffmpeg.output(
+                video_stream,
+                video_input.audio,
+                str(output_path),
+                vcodec="libx264",
+                acodec="aac",
+            ).overwrite_output()
+            self._run_ffmpeg_command(command, "render")
             return
 
         tts_input = ffmpeg.input(str(tts_mix_path))
-        original_audio = video_input.audio.filter("volume", self.config.background_volume)
         tts_audio = tts_input.audio.filter("volume", self.config.tts_volume)
-        mixed_audio = ffmpeg.filter(
-            [original_audio, tts_audio],
-            "amix",
-            inputs=2,
-            duration="first",
-            dropout_transition=0,
-            normalize=0,
-        )
+        if self.config.background_volume > 0:
+            original_audio = video_input.audio.filter("volume", self.config.background_volume)
+            mixed_audio = ffmpeg.filter(
+                [original_audio, tts_audio],
+                "amix",
+                inputs=2,
+                duration="first",
+                dropout_transition=0,
+                normalize=0,
+            )
+        else:
+            logger.info("video_service.render.original_audio.muted video=%s", video_path)
+            mixed_audio = tts_audio
 
-        (
-            ffmpeg.output(video_stream, mixed_audio, str(output_path), vcodec="libx264", acodec="aac", shortest=None)
-            .overwrite_output()
-            .run(quiet=True)
-        )
+        command = ffmpeg.output(
+            video_stream,
+            mixed_audio,
+            str(output_path),
+            vcodec="libx264",
+            acodec="aac",
+            shortest=None,
+        ).overwrite_output()
+        self._run_ffmpeg_command(command, "render")
 
     def _srt_time(self, seconds: float) -> str:
         millis = round(seconds * 1000)
@@ -125,4 +140,34 @@ class VideoService:
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
 
     def _ffmpeg_filter_path(self, path: Path) -> str:
-        return str(path).replace("\\", "/").replace(":", "\\:")
+        resolved = path.resolve()
+        try:
+            display_path = resolved.relative_to(Path.cwd().resolve())
+        except ValueError:
+            display_path = resolved
+
+        escaped = str(display_path).replace("\\", "/").replace("'", r"\'")
+        if ":" in escaped:
+            escaped = escaped.replace(":", r"\:")
+        return escaped
+
+    def _run_ffmpeg_command(self, command, stage: str) -> None:
+        try:
+            command.run(capture_stdout=True, capture_stderr=True)
+        except Exception as exc:
+            stderr = self._ffmpeg_stderr(exc)
+            logger.error("video_service.ffmpeg.%s.error stderr=%s", stage, stderr or "<empty>")
+            message = self._last_log_lines(stderr) or str(exc)
+            raise RuntimeError(f"FFmpeg {stage} failed: {message}") from exc
+
+    def _ffmpeg_stderr(self, exc: BaseException) -> str:
+        stderr = getattr(exc, "stderr", None)
+        if stderr is None:
+            return ""
+        if isinstance(stderr, bytes):
+            return stderr.decode("utf-8", errors="replace").strip()
+        return str(stderr).strip()
+
+    def _last_log_lines(self, text: str, limit: int = 8) -> str:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return "\n".join(lines[-limit:])

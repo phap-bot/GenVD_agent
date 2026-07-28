@@ -6,8 +6,12 @@ from pathlib import Path
 from app.models.schemas import PipelineConfig, TranscriptSegment, WordTimestamp
 from app.services.dependency_service import DependencyService
 from app.utils.memory import VRAMManager
+from utils.model_cache import configure_model_cache
+from utils.model_registry import model_registry
+from utils.stt import remote_stt_enabled, transcribe_audio_remote
 
 logger = logging.getLogger(__name__)
+MODEL_CACHE_PATHS = configure_model_cache()
 
 
 def _ffmpeg():
@@ -20,7 +24,7 @@ def _ffmpeg():
 
 
 class ASRService:
-    """WhisperX transcription with strict model unload after inference."""
+    """WhisperX transcription through the shared offloaded model registry."""
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
@@ -58,6 +62,21 @@ class ASRService:
         )
 
     def _run_whisperx(self, audio_path: Path) -> list[TranscriptSegment]:
+        if remote_stt_enabled(self.config.asr_model):
+            logger.info(
+                "asr_service.remote.start model=%s language=%s audio=%s",
+                self.config.asr_model,
+                self.config.source_language or "auto",
+                audio_path,
+            )
+            return self._normalize_segments(
+                transcribe_audio_remote(
+                    audio_path,
+                    source_language=self.config.source_language,
+                    model=self.config.asr_model,
+                )
+            )
+
         try:
             import torch
             import whisperx
@@ -68,38 +87,50 @@ class ASRService:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         batch_size = 4 if device == "cuda" else 1
 
-        self.model = whisperx.load_model(
+        logger.info(
+            "asr_service.model.load model=%s compute_type=%s device=%s language=%s cache=%s",
             self.config.asr_model,
+            self.config.compute_type,
+            device,
+            self.config.source_language or "auto",
+            MODEL_CACHE_PATHS.whisperx_asr_cache,
+        )
+        audio = whisperx.load_audio(str(audio_path))
+        with model_registry.acquire_whisperx_asr(
+            whisperx,
+            whisper_arch=self.config.asr_model,
             device=device,
             compute_type=self.config.compute_type,
             language=self.config.source_language,
-        )
-        audio = whisperx.load_audio(str(audio_path))
-        result = self.model.transcribe(audio, batch_size=batch_size)
+        ) as model:
+            result = model.transcribe(
+                audio,
+                batch_size=batch_size,
+                language=self.config.source_language,
+            )
 
-        model = self.model
-        self.model = None
-        VRAMManager.release_model(model)
+        VRAMManager.cleanup()
 
         language_code = result.get("language") or self.config.source_language or "en"
-        try:
-            self.align_model, self.align_metadata = whisperx.load_align_model(
-                language_code=language_code,
-                device=device,
-            )
+        logger.info(
+            "asr_service.align.load language=%s device=%s cache=%s",
+            language_code,
+            device,
+            MODEL_CACHE_PATHS.whisperx_align_cache,
+        )
+        with model_registry.acquire_whisperx_align(
+            whisperx,
+            language_code=language_code,
+            device=device,
+        ) as (align_model, align_metadata):
             result = whisperx.align(
                 result["segments"],
-                self.align_model,
-                self.align_metadata,
+                align_model,
+                align_metadata,
                 audio,
                 device,
                 return_char_alignments=False,
             )
-        finally:
-            align_model = self.align_model
-            self.align_model = None
-            self.align_metadata = None
-            VRAMManager.release_model(align_model)
 
         return self._normalize_segments(result.get("segments", []))
 

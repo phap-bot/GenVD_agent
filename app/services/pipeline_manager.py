@@ -10,6 +10,7 @@ from app.models.schemas import BatchPipelineResult, PipelineConfig, PipelineResu
 from app.services.asr_service import ASRService
 from app.services.downloader_service import DownloaderService
 from app.services.subtitle_service import SubtitleService
+from app.services.timeline_service import TimelineService
 from app.services.translation_service import TranslationService
 from app.services.tts_service import TTSService
 from app.services.video_service import VideoService
@@ -42,13 +43,17 @@ class PipelineManager:
             try:
                 logger.info("Starting ASR stage for request %s", request_id)
                 asr_service = ASRService(config)
-                segments = asr_service.transcribe(video_path, work_dir)
+                segments = TimelineService().from_transcript(
+                    asr_service.transcribe(video_path, work_dir),
+                    merge_semantic=True,
+                    source_language=config.source_language,
+                )
                 del asr_service
                 VRAMManager.cleanup()
 
                 logger.info("Starting translation stage for request %s", request_id)
                 translation_service = TranslationService(config)
-                translated_segments = translation_service.translate(segments)
+                translated_segments = TimelineService().from_transcript(translation_service.translate(segments))
                 del translation_service
                 VRAMManager.cleanup()
 
@@ -101,13 +106,13 @@ class PipelineManager:
             work_dir = Path(temp_root)
             try:
                 logger.info("Starting SRT parse stage for request %s", request_id)
-                segments = SubtitleService().parse_srt(subtitle_path)
+                segments = TimelineService().from_transcript(SubtitleService().parse_srt(subtitle_path))
                 if not segments:
                     raise ValueError("No valid subtitle segments found in SRT file")
 
                 logger.info("Starting translation stage for request %s", request_id)
                 translation_service = TranslationService(config)
-                translated_segments = translation_service.translate(segments)
+                translated_segments = TimelineService().from_transcript(translation_service.translate(segments))
                 del translation_service
                 VRAMManager.cleanup()
 

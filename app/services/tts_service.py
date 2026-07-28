@@ -8,7 +8,12 @@ from pathlib import Path
 
 from app.models.schemas import PipelineConfig, TranscriptSegment
 from app.services.dependency_service import DependencyService
+from app.services.timeline_service import TimelineService
+from app.utils.media_probe import probe_duration
 from app.utils.memory import VRAMManager
+from utils.model_cache import configure_model_cache
+from utils.model_registry import model_registry
+from utils.tts_voice import infer_stable_vieneu_audio, resolve_vieneu_voice
 
 logger = logging.getLogger(__name__)
 
@@ -31,74 +36,82 @@ class TTSAudioTrack:
 
 
 class TTSService:
-    """Generate segment-level TTS while never retaining the model afterward."""
+    """Generate segment-level TTS with the shared offloaded model registry."""
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
         self.model = None
+        self.voice: str | None = None
 
     def synthesize(
         self,
         segments: list[TranscriptSegment],
         work_dir: Path,
     ) -> list[TTSAudioTrack]:
+        segments = TimelineService().from_transcript(segments)
         tts_dir = work_dir / "tts"
         tts_dir.mkdir(parents=True, exist_ok=True)
+        tracks: list[TTSAudioTrack] = []
 
         try:
-            if not self.config.mock_tts:
-                self._load_model()
-
-            tracks: list[TTSAudioTrack] = []
-            for segment in segments:
-                raw_path = tts_dir / f"segment_{segment.id:04d}_raw.wav"
-                final_path = tts_dir / f"segment_{segment.id:04d}.wav"
-                duration = max(segment.end - segment.start, 0.1)
-
-                if self.config.mock_tts:
+            if self.config.mock_tts:
+                for segment in segments:
+                    raw_path = tts_dir / f"segment_{segment.id:04d}_raw.wav"
+                    final_path = tts_dir / f"segment_{segment.id:04d}.wav"
+                    duration = max(segment.end - segment.start, 0.1)
                     self._write_silent_wav(raw_path, duration)
-                else:
-                    self._synthesize_with_model(segment.text, raw_path)
+                    self._fit_duration(raw_path, final_path, duration)
+                    tracks.append(TTSAudioTrack(segment.id, final_path, segment.start, segment.end))
+                return tracks
 
-                self._fit_duration(raw_path, final_path, duration)
-                tracks.append(
-                    TTSAudioTrack(
-                        segment_id=segment.id,
-                        path=final_path,
-                        start=segment.start,
-                        end=segment.end,
-                    )
+            self._log_model_cache()
+            if self.config.tts_device == "cuda":
+                DependencyService().require_cuda()
+
+            backend = "pytorch" if self.config.tts_device == "cuda" else "onnx"
+            with model_registry.acquire_vieneu(device=self.config.tts_device, backend=backend) as model:
+                self.model = model
+                self.voice = resolve_vieneu_voice(model, self.config.voice_model)
+                logger.info(
+                    "tts_service.voice.resolved requested=%s resolved=%s",
+                    self.config.voice_model,
+                    self.voice,
                 )
+                for segment in segments:
+                    raw_path = tts_dir / f"segment_{segment.id:04d}_raw.wav"
+                    final_path = tts_dir / f"segment_{segment.id:04d}.wav"
+                    duration = max(segment.end - segment.start, 0.1)
+
+                    self._synthesize_with_model(segment.text, raw_path)
+                    self._fit_duration(raw_path, final_path, duration)
+                    tracks.append(TTSAudioTrack(segment.id, final_path, segment.start, segment.end))
+
             return tracks
         finally:
-            self.unload()
+            self.model = None
+            self.voice = None
+            VRAMManager.cleanup()
 
     def unload(self) -> None:
-        if self.model is not None:
-            model = self.model
-            self.model = None
-            VRAMManager.release_model(model)
+        self.model = None
+        self.voice = None
         VRAMManager.cleanup()
 
-    def _load_model(self) -> None:
-        try:
-            from vieneu import Vieneu
-        except ImportError as exc:
-            raise RuntimeError("VieNeu-TTS is not installed. Install it with `pip install vieneu`.") from exc
-
-        if self.config.tts_device == "cuda":
-            DependencyService().require_cuda()
-        self.model = Vieneu(
-            mode="v3turbo",
-            device=self.config.tts_device,
-            backend="pytorch" if self.config.tts_device == "cuda" else "onnx",
+    def _log_model_cache(self) -> None:
+        cache_paths = configure_model_cache()
+        logger.info(
+            "tts_service.model_cache device=%s hf_home=%s hf_hub_cache=%s",
+            self.config.tts_device,
+            cache_paths.hf_home,
+            cache_paths.hf_hub_cache,
         )
 
     def _synthesize_with_model(self, text: str, destination: Path) -> None:
         if self.model is None:
             raise RuntimeError("TTS model is not loaded")
 
-        audio = self.model.infer(text=text, voice=self.config.voice_model)
+        voice = getattr(self, "voice", None) or resolve_vieneu_voice(self.model, self.config.voice_model)
+        audio = infer_stable_vieneu_audio(self.model, text, voice)
         self.model.save(audio, str(destination))
 
     def _fit_duration(self, source: Path, destination: Path, target_duration: float) -> None:
@@ -108,12 +121,12 @@ class TTSService:
             self._write_silent_wav(destination, target_duration)
             return
 
-        ratio = current_duration / target_duration
-        filters = self._atempo_filters(ratio)
+        ratio = max(0.1, current_duration / target_duration)
         stream = ffmpeg.input(str(source)).audio
-        for value in filters:
+        for value in self._atempo_filters(ratio):
             stream = stream.filter("atempo", value)
 
+        stream = stream.filter("apad").filter("atrim", duration=max(target_duration, 0.1))
         (
             ffmpeg.output(stream, str(destination), ac=1, ar="24000", format="wav")
             .overwrite_output()
@@ -121,9 +134,7 @@ class TTSService:
         )
 
     def _probe_duration(self, path: Path) -> float:
-        ffmpeg = _ffmpeg()
-        probe = ffmpeg.probe(str(path))
-        return float(probe["format"].get("duration", 0.0))
+        return probe_duration(path, ffmpeg_module=_ffmpeg(), logger=logger)
 
     def _atempo_filters(self, ratio: float) -> list[float]:
         ratio = max(ratio, 0.1)
@@ -144,3 +155,4 @@ class TTSService:
             wav.setsampwidth(2)
             wav.setframerate(sample_rate)
             wav.writeframes(b"\x00\x00" * frames)
+

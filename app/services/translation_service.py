@@ -1,33 +1,47 @@
 from __future__ import annotations
 
+import logging
+
 from app.models.schemas import PipelineConfig, TranscriptSegment
+from utils.translation import normalize_translation_model, translate_segments
+
+logger = logging.getLogger(__name__)
 
 
 class TranslationService:
-    """Timestamp-preserving translation service.
-
-    The current implementation is intentionally mock-friendly. Replace
-    `_translate_text` with a real API client when credentials are available.
-    """
+    """Timestamp-preserving batch translation service."""
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
 
     def translate(self, segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
+        resolved_model = normalize_translation_model(self.config.translation_model)
+        logger.info(
+            "translation.stage.start segments=%s source=%s target=%s provider=%s model=%s mock=%s",
+            len(segments),
+            self.config.source_language or "auto",
+            self.config.target_language,
+            self.config.translation_provider,
+            resolved_model,
+            self.config.mock_translation,
+        )
+        if self.config.mock_translation:
+            translated_texts = [f"[{self.config.target_language}] {segment.text}" for segment in segments]
+        else:
+            translated_texts = translate_segments(
+                [segment.text for segment in segments],
+                source_language=self.config.source_language,
+                target_language=self.config.target_language,
+                provider=self.config.translation_provider,
+                model=resolved_model,
+            )
+
         translated: list[TranscriptSegment] = []
-        for segment in segments:
+        for segment, translated_text in zip(segments, translated_texts):
             translated.append(
                 segment.model_copy(
-                    update={"text": self._translate_text(segment.text)}
+                    update={"text": translated_text}
                 )
             )
+        logger.info("translation.stage.done segments=%s", len(translated))
         return translated
-
-    def _translate_text(self, text: str) -> str:
-        if self.config.mock_translation:
-            return f"[{self.config.target_language}] {text}"
-
-        # Hook for a real provider call. Keep the method synchronous because the
-        # pipeline contract is synchronous end to end.
-        raise NotImplementedError("Configure a real translation provider here.")
-

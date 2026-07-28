@@ -9,13 +9,14 @@ Flow:
 1. Upload video.
 2. Extract audio with ffmpeg.
 3. Run WhisperX ASR to create timestamped text.
-4. Unload ASR model and clear VRAM.
+4. Offload ASR model back to CPU RAM and clear VRAM cache.
 5. Translate text while preserving timestamps.
-6. Run TTS for each translated segment.
-7. Unload TTS model and clear VRAM.
-8. Generate translated SRT.
-9. Mix original background audio with generated TTS audio.
-10. Burn subtitles and export final video.
+6. Normalize the translated script into one canonical timeline.
+7. Run TTS from that same canonical timeline.
+8. Offload TTS model back to CPU RAM and clear VRAM cache.
+9. Generate translated SRT from that same canonical timeline.
+10. Mix original background audio with generated TTS audio.
+11. Burn subtitles and export final video.
 
 ## 2. Video + SRT to Dubbed Video
 
@@ -26,9 +27,21 @@ Flow:
 1. Upload video and `.srt`.
 2. Parse SRT timestamps/text.
 3. Translate subtitle text.
-4. Generate TTS by timestamp segment.
-5. Mix new audio with original audio.
-6. Burn translated subtitles and export final video.
+4. Normalize the translated subtitle script into one canonical timeline.
+5. Generate TTS and SRT from that same canonical timeline.
+6. Mix new audio with original audio.
+7. Burn translated subtitles and export final video.
+
+## Canonical Timeline Rule
+
+Subtitle text, TTS text, segment start time, and segment end time must come from
+the same normalized segment list. After ASR/OCR/SRT parsing, translation, or
+human script edits, the pipeline trims whitespace, reindexes segments, fixes
+minimum duration, and then passes that single timeline to both subtitle rendering
+and TTS generation.
+
+Each TTS chunk is time-fit to its segment duration before it is delayed onto the
+mixed track, so the spoken line occupies the same slot as the subtitle line.
 
 ## 3. Batch Video Processing
 
@@ -55,10 +68,11 @@ Flow:
 
 ## Low VRAM Rule
 
-The GPU stages are never parallelized. The backend must always follow:
+The GPU stages are never parallelized. Models are held by the process-wide
+registry and moved back to CPU RAM after use:
 
 ```text
-load model -> inference -> del model -> torch.cuda.empty_cache() -> next stage
+singleton load -> move to GPU -> inference -> offload to CPU RAM -> torch.cuda.empty_cache() -> next stage
 ```
 
 Batch and Douyin processing are also strictly sequential.

@@ -10,6 +10,18 @@ Synchronous FastAPI pipeline for local, low-VRAM auto-dubbing.
 uvicorn app.main:app --reload
 ```
 
+## Project Structure
+
+The backend lives under `app/`:
+
+- `app/main.py` is the canonical FastAPI entrypoint.
+- `app/api/routes.py` owns all `/api` and `/api/v1` routes.
+- `app/services/` contains pipeline orchestration and stage services.
+- root `utils/` contains shared model, STT, translation, OCR, TTS, workspace, and VRAM helpers.
+
+The root `main.py` is only a compatibility shim so older `uvicorn main:app`
+commands resolve to the same app without mounting duplicate legacy routes.
+
 The setup script downloads `OpenMOSS-Team/MOSS-Audio-Tokenizer-Nano` into
 `models\MOSS-Audio-Tokenizer-Nano` with `hf download --local-dir`, which avoids
 Windows symlink privilege errors in the default Hugging Face cache.
