@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import logging
@@ -18,11 +18,17 @@ from app.services.translation_service import TranslationService
 from app.utils.media_probe import probe_duration, probe_video_dimensions
 from app.utils.vram import VRAMManager
 from app.utils.workspace import Workspace
+from app.utils.cancel import PipelineCancelledError
 from utils.model_cache import configure_model_cache
 from utils.model_registry import model_registry
 from utils.ocr import extract_video_ocr_segments
 from utils.stt import remote_stt_enabled, transcribe_audio_remote
-from utils.tts_voice import infer_stable_vieneu_audio, normalize_vieneu_voice, resolve_vieneu_voice
+from utils.tts_voice import (
+    encode_cloned_vieneu_voice,
+    infer_stable_cloned_vieneu_audio,
+    infer_stable_vieneu_audio,
+    resolve_vieneu_voice,
+)
 
 logger = logging.getLogger(__name__)
 MODEL_CACHE_PATHS = configure_model_cache()
@@ -32,7 +38,7 @@ MAX_SEGMENT_CHARS = 84
 MAX_CJK_SEGMENT_CHARS = 8
 MIN_SEGMENT_DURATION = 0.2
 PUNCTUATION = set(".!?;,\u3002\uff01\uff1f\uff1b\uff0c\u3001")
-GPU_LOCK_POLL_SECONDS = 5.0
+GPU_LOCK_POLL_SECONDS = 1.0
 GPU_LOCK_WAIT_TIMEOUT_SECONDS = 180.0
 
 
@@ -53,13 +59,16 @@ class AutoDubbingPipeline:
 
     _gpu_lock = threading.RLock()
 
-    def __init__(self, config: PipelineConfig) -> None:
+    def __init__(self, config: PipelineConfig, cancel_event: threading.Event | None = None) -> None:
         self.config = config
+        self.cancel_event = cancel_event
         self.dependencies = DependencyService()
         self.last_source_engine = "unknown"
 
     def run(self, workspace: Workspace) -> Generator[str, None, Path]:
         output_path = workspace.output_dir / f"{workspace.request_id}_dubbed.mp4"
+        output_subtitle_path = output_path.with_suffix(".srt")
+        self.config.require_copyright_preflight()
 
         try:
             yield self._event(
@@ -79,7 +88,8 @@ class AutoDubbingPipeline:
                 stats={"video_duration": video_duration},
             )
 
-            with self._gpu_lock:
+            self._acquire_gpu_lock(workspace)
+            try:
                 yield self._event(
                     "processing",
                     "Extracting audio and transcribing...",
@@ -98,6 +108,7 @@ class AutoDubbingPipeline:
                     stats={**source_stats, "engine": self.last_source_engine},
                 )
                 VRAMManager.cleanup()
+                self._raise_if_cancelled(workspace)
 
                 yield self._event(
                     "processing",
@@ -115,6 +126,7 @@ class AutoDubbingPipeline:
                     stats=self._segment_stats(translated_segments),
                 )
                 VRAMManager.cleanup()
+                self._raise_if_cancelled(workspace)
 
                 yield self._event(
                     "processing",
@@ -132,12 +144,14 @@ class AutoDubbingPipeline:
                     stats={"chunks": len(chunks), **self._segment_stats(translated_segments)},
                 )
                 VRAMManager.cleanup()
+            finally:
+                self._gpu_lock.release()
 
             yield self._event("processing", "Rendering final video...", phase="render", progress=92)
             subtitle_path = workspace.root / "translated.srt"
             self._write_srt(translated_segments, subtitle_path)
             tts_mix_path = workspace.root / "tts_mix.wav"
-            self._combine_audio_chunks(chunks, tts_mix_path)
+            self._combine_audio_chunks(chunks, tts_mix_path, total_duration=video_duration)
             yield self._event("processing", "Muxing subtitles and audio...", phase="render", progress=96)
             self._render_video(
                 video_path=workspace.input_video,
@@ -145,9 +159,19 @@ class AutoDubbingPipeline:
                 tts_mix_path=tts_mix_path,
                 output_path=output_path,
             )
+            self._write_srt(translated_segments, output_subtitle_path, video_duration=video_duration)
 
-            yield self._event("success", "Completed", phase="complete", progress=100, video_url=f"/media/{output_path.name}")
+            yield self._event(
+                "success",
+                "Completed",
+                phase="complete",
+                progress=100,
+                video_url=f"/media/{output_path.name}",
+                subtitle_url=f"/media/{output_subtitle_path.name}",
+            )
             return output_path
+        except PipelineCancelledError:
+            raise
         except Exception as exc:
             VRAMManager.cleanup()
             if VRAMManager.is_cuda_oom(exc):
@@ -167,6 +191,7 @@ class AutoDubbingPipeline:
 
     def analyze(self, workspace: Workspace) -> list[DubbingScriptSegment]:
         """Extract script/timeline without rendering final video."""
+        self.config.require_copyright_preflight()
         with self._gpu_lock:
             try:
                 self.dependencies.require_ffmpeg()
@@ -189,6 +214,7 @@ class AutoDubbingPipeline:
 
     def analyze_stream(self, workspace: Workspace) -> Generator[str, None, list[DubbingScriptSegment]]:
         """Extract script/timeline while streaming progress to the client."""
+        self.config.require_copyright_preflight()
         try:
             yield self._event(
                 "processing",
@@ -283,6 +309,8 @@ class AutoDubbingPipeline:
                 segments=[segment.model_dump() for segment in analyzed],
             )
             return analyzed
+        except PipelineCancelledError:
+            raise
         except Exception as exc:
             VRAMManager.cleanup()
             logger.exception("Analyze stream failed")
@@ -299,7 +327,9 @@ class AutoDubbingPipeline:
     ) -> Generator[str, None, Path]:
         """Render a final video from user-edited script/timeline segments."""
         output_path = workspace.output_dir / f"{workspace.request_id}_script_dubbed.mp4"
+        output_subtitle_path = output_path.with_suffix(".srt")
         timeline_segments = TimelineService().from_script(script_segments)
+        self.config.require_copyright_preflight()
 
         try:
             yield self._event(
@@ -311,10 +341,14 @@ class AutoDubbingPipeline:
                 stats=self._script_stats(script_segments),
             )
             self.dependencies.require_ffmpeg()
+            self._raise_if_cancelled(workspace)
             if not source_video_path.exists():
                 raise FileNotFoundError(f"Source video not found: {source_video_path}")
+            video_duration = self._safe_probe_duration(source_video_path)
+            timeline_segments = self._clip_timeline_to_video(timeline_segments, video_duration)
 
-            with self._gpu_lock:
+            self._acquire_gpu_lock(workspace)
+            try:
                 yield self._event(
                     "processing",
                     "Generating AI voice from edited script...",
@@ -331,23 +365,39 @@ class AutoDubbingPipeline:
                     stats={"chunks": len(chunks), **self._script_stats(script_segments)},
                 )
                 VRAMManager.cleanup()
+            finally:
+                self._gpu_lock.release()
 
             yield self._event("processing", "Rendering final video...", phase="render", progress=84)
             subtitle_path = workspace.root / "edited_script.ass"
             video_width, video_height = self._video_dimensions(source_video_path)
-            self._write_ass(script_segments, subtitle_path, video_width=video_width, video_height=video_height)
+            self._write_ass(script_segments, subtitle_path, video_width=video_width, video_height=video_height, video_duration=video_duration)
             tts_mix_path = workspace.root / "tts_mix.wav"
-            self._combine_audio_chunks(chunks, tts_mix_path)
+            self._combine_audio_chunks(chunks, tts_mix_path, total_duration=video_duration)
             yield self._event("processing", "Muxing subtitles and audio...", phase="render", progress=94)
             self._render_video(
                 video_path=source_video_path,
                 subtitle_path=subtitle_path,
                 tts_mix_path=tts_mix_path,
                 output_path=output_path,
+                script_segments=script_segments,
+                video_width=video_width,
+                video_height=video_height,
+                video_duration=video_duration,
             )
+            self._write_srt(timeline_segments, output_subtitle_path, video_duration=video_duration)
 
-            yield self._event("success", "Completed", phase="complete", progress=100, video_url=f"/media/{output_path.name}")
+            yield self._event(
+                "success",
+                "Completed",
+                phase="complete",
+                progress=100,
+                video_url=f"/media/{output_path.name}",
+                subtitle_url=f"/media/{output_subtitle_path.name}",
+            )
             return output_path
+        except PipelineCancelledError:
+            raise
         except Exception as exc:
             VRAMManager.cleanup()
             if VRAMManager.is_cuda_oom(exc):
@@ -397,6 +447,7 @@ class AutoDubbingPipeline:
         return not segments or text_chars < 8 or speech_duration < 0.5
 
     def _run_ocr(self, workspace: Workspace) -> list[TranscriptSegment]:
+        self._raise_if_cancelled(workspace)
         self.last_source_engine = "OCR"
         ocr_segments = extract_video_ocr_segments(
             workspace.input_video,
@@ -404,6 +455,7 @@ class AutoDubbingPipeline:
             model=self.config.ocr_model or self.config.translation_model,
             interval_seconds=self.config.ocr_interval_seconds,
             crop_bottom_ratio=self.config.ocr_crop_bottom_ratio,
+            cancel_event=self.cancel_event,
         )
         return [
             TranscriptSegment(
@@ -417,6 +469,7 @@ class AutoDubbingPipeline:
         ]
 
     def _run_asr(self, workspace: Workspace) -> list[TranscriptSegment]:
+        self._raise_if_cancelled(workspace)
         audio_path = workspace.root / "source_audio.wav"
         if not self._has_audio_stream(workspace.input_video):
             logger.info("asr.skip.no_audio request_id=%s input=%s", workspace.request_id, workspace.input_video)
@@ -450,14 +503,12 @@ class AutoDubbingPipeline:
                 )
 
             try:
-                import torch
                 import whisperx
             except ImportError as exc:
-                logger.warning("WhisperX unavailable, using mock transcript: %s", exc)
-                self.last_source_engine = "mock ASR"
-                return self._mock_segments()
+                raise RuntimeError("WhisperX is required for GPU ASR. Install whisperx, then restart the backend.") from exc
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.dependencies.require_cuda()
+            device = "cuda"
             self.last_source_engine = f"WhisperX {self.config.asr_model} on {device}"
             logger.info(
                 "legacy_pipeline.asr.model.load request_id=%s model=%s compute_type=%s device=%s language=%s cache=%s",
@@ -478,7 +529,7 @@ class AutoDubbingPipeline:
             ) as model:
                 result = model.transcribe(
                     audio,
-                    batch_size=4 if device == "cuda" else 1,
+                    batch_size=4,
                     language=self.config.source_language,
                 )
 
@@ -513,7 +564,8 @@ class AutoDubbingPipeline:
             VRAMManager.cleanup()
 
     def _translate_segments(self, segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
-        return TranslationService(self.config).translate(segments)
+        self._raise_if_cancelled()
+        return TranslationService(self.config, self.cancel_event).translate(segments)
 
     def _source_timeline(self, segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
         return TimelineService().from_transcript(
@@ -527,53 +579,56 @@ class AutoDubbingPipeline:
 
     def _run_tts(self, segments: list[TranscriptSegment], workspace: Workspace) -> list[AudioChunk]:
         chunks: list[AudioChunk] = []
+        self._raise_if_cancelled(workspace)
 
         try:
             if self.config.mock_tts:
-                model_context = None
-            else:
-                cache_paths = configure_model_cache()
-                logger.info(
-                    "legacy_pipeline.tts.model_cache request_id=%s device=%s hf_home=%s hf_hub_cache=%s",
-                    workspace.request_id,
-                    self.config.tts_device,
-                    cache_paths.hf_home,
-                    cache_paths.hf_hub_cache,
-                )
-                if self.config.tts_device == "cuda":
-                    self.dependencies.require_cuda()
-                model_context = model_registry.acquire_vieneu(
-                    device=self.config.tts_device,
-                    backend="pytorch" if self.config.tts_device == "cuda" else "onnx",
-                )
+                raise RuntimeError("Mock TTS is disabled because GPU TTS is required.")
+            if self.config.tts_device != "cuda":
+                raise RuntimeError("CPU TTS is disabled. Use CUDA TTS only.")
+            cache_paths = configure_model_cache()
+            logger.info(
+                "legacy_pipeline.tts.model_cache request_id=%s device=%s hf_home=%s hf_hub_cache=%s",
+                workspace.request_id,
+                self.config.tts_device,
+                cache_paths.hf_home,
+                cache_paths.hf_hub_cache,
+            )
+            self.dependencies.require_cuda()
+            with model_registry.acquire_vieneu(device="cuda", backend="pytorch") as model:
+                if self.config.voice_mode == "clone":
+                    voice_source = encode_cloned_vieneu_voice(
+                        model,
+                        self.config.clone_reference_audio_path or "",
+                    )
+                    logger.info(
+                        "legacy_pipeline.tts.voice.clone request_id=%s reference=%s",
+                        workspace.request_id,
+                        self.config.clone_reference_audio_path,
+                    )
+                else:
+                    voice_source = resolve_vieneu_voice(model, self.config.voice_model)
+                    logger.info(
+                        "legacy_pipeline.tts.voice.system request_id=%s requested=%s resolved=%s",
+                        workspace.request_id,
+                        self.config.voice_model,
+                        voice_source,
+                    )
 
-            if model_context is None:
                 for segment in segments:
+                    self._raise_if_cancelled(workspace)
                     raw_path = workspace.chunks_dir / f"{segment.id:04d}_raw.wav"
                     final_path = workspace.chunks_dir / f"{segment.id:04d}.wav"
                     duration = max(segment.end - segment.start, 0.1)
-                    self._write_silent_wav(raw_path, duration)
+
+                    if self.config.voice_mode == "clone":
+                        audio = infer_stable_cloned_vieneu_audio(model, segment.text, voice_source)
+                    else:
+                        audio = infer_stable_vieneu_audio(model, segment.text, voice_source)
+                    model.save(audio, str(raw_path))
+
                     self._fit_audio_duration(raw_path, final_path, duration)
                     chunks.append(AudioChunk(segment.id, final_path, segment.start, segment.end))
-            else:
-                with model_context as model:
-                    voice = resolve_vieneu_voice(model, self.config.voice_model)
-                    logger.info(
-                        "legacy_pipeline.tts.voice.default request_id=%s requested=%s resolved=%s",
-                        workspace.request_id,
-                        self.config.voice_model,
-                        voice,
-                    )
-                    for segment in segments:
-                        raw_path = workspace.chunks_dir / f"{segment.id:04d}_raw.wav"
-                        final_path = workspace.chunks_dir / f"{segment.id:04d}.wav"
-                        duration = max(segment.end - segment.start, 0.1)
-
-                        audio = infer_stable_vieneu_audio(model, segment.text, voice)
-                        model.save(audio, str(raw_path))
-
-                        self._fit_audio_duration(raw_path, final_path, duration)
-                        chunks.append(AudioChunk(segment.id, final_path, segment.start, segment.end))
 
             return chunks
         finally:
@@ -586,58 +641,54 @@ class AutoDubbingPipeline:
         workspace: Workspace,
     ) -> list[AudioChunk]:
         chunks: list[AudioChunk] = []
+        self._raise_if_cancelled(workspace)
         voice_segments = sorted(script_segments, key=lambda item: (item.start, item.end))
 
         try:
-            if self.config.mock_tts:
-                model_context = None
-            else:
-                cache_paths = configure_model_cache()
-                logger.info(
-                    "legacy_pipeline.tts_script.model_cache request_id=%s device=%s hf_home=%s hf_hub_cache=%s",
-                    workspace.request_id,
-                    self.config.tts_device,
-                    cache_paths.hf_home,
-                    cache_paths.hf_hub_cache,
-                )
-                if self.config.tts_device == "cuda":
-                    self.dependencies.require_cuda()
-                model_context = model_registry.acquire_vieneu(
-                    device=self.config.tts_device,
-                    backend="pytorch" if self.config.tts_device == "cuda" else "onnx",
-                )
+            cache_paths = configure_model_cache()
+            logger.info(
+                "legacy_pipeline.tts.model_cache request_id=%s device=%s hf_home=%s hf_hub_cache=%s",
+                workspace.request_id,
+                self.config.tts_device,
+                cache_paths.hf_home,
+                cache_paths.hf_hub_cache,
+            )
+            self.dependencies.require_cuda()
+            with model_registry.acquire_vieneu(device="cuda", backend="pytorch") as model:
+                if self.config.voice_mode == "clone":
+                    clone_voice_reference = encode_cloned_vieneu_voice(
+                        model,
+                        self.config.clone_reference_audio_path or "",
+                    )
+                    logger.info(
+                        "legacy_pipeline.tts_script.voice.clone request_id=%s reference=%s",
+                        workspace.request_id,
+                        self.config.clone_reference_audio_path,
+                    )
+                else:
+                    clone_voice_reference = None
 
-            if model_context is None:
-                for segment in timeline_segments:
+                if self.config.voice_mode == "system":
+                    character_voice_map: dict[str, str] = {}
+                else:
+                    character_voice_map = {}
+
+                for index, segment in enumerate(timeline_segments):
+                    self._raise_if_cancelled(workspace)
                     raw_path = workspace.chunks_dir / f"{segment.id:04d}_raw.wav"
                     final_path = workspace.chunks_dir / f"{segment.id:04d}.wav"
                     duration = max(segment.end - segment.start, 0.1)
-                    self._write_silent_wav(raw_path, duration)
-                    self._fit_audio_duration(raw_path, final_path, duration)
-                    chunks.append(AudioChunk(segment.id, final_path, segment.start, segment.end))
-            else:
-                with model_context as model:
-                    default_voice = resolve_vieneu_voice(model, self.config.voice_model)
-                    logger.info(
-                        "legacy_pipeline.tts_script.voice.default request_id=%s requested=%s resolved=%s",
-                        workspace.request_id,
-                        self.config.voice_model,
-                        default_voice,
-                    )
-                    character_voice_map: dict[str, str] = {}
-                    for index, segment in enumerate(timeline_segments):
-                        raw_path = workspace.chunks_dir / f"{segment.id:04d}_raw.wav"
-                        final_path = workspace.chunks_dir / f"{segment.id:04d}.wav"
-                        duration = max(segment.end - segment.start, 0.1)
-                        requested_voice = (
-                            voice_segments[index].voice_model
-                            if index < len(voice_segments) and voice_segments[index].voice_model
-                            else default_voice
-                        )
-                        character_key = normalize_vieneu_voice(requested_voice, default_voice)
+
+                    if self.config.voice_mode == "clone":
+                        audio = infer_stable_cloned_vieneu_audio(model, segment.text, clone_voice_reference)
+                    else:
+                        if index >= len(voice_segments) or not voice_segments[index].voice_model.strip():
+                            raise ValueError(f"System voice is missing for segment {segment.id}.")
+                        requested_voice = voice_segments[index].voice_model
+                        character_key = requested_voice.strip()
                         voice = character_voice_map.setdefault(
                             character_key,
-                            resolve_vieneu_voice(model, character_key, default_voice),
+                            resolve_vieneu_voice(model, character_key),
                         )
                         logger.info(
                             "legacy_pipeline.tts_script.segment request_id=%s segment_id=%s requested_voice=%s resolved_voice=%s duration=%.3f",
@@ -647,12 +698,12 @@ class AutoDubbingPipeline:
                             voice,
                             duration,
                         )
-
                         audio = infer_stable_vieneu_audio(model, segment.text, voice)
-                        model.save(audio, str(raw_path))
 
-                        self._fit_audio_duration(raw_path, final_path, duration)
-                        chunks.append(AudioChunk(segment.id, final_path, segment.start, segment.end))
+                    model.save(audio, str(raw_path))
+
+                    self._fit_audio_duration(raw_path, final_path, duration)
+                    chunks.append(AudioChunk(segment.id, final_path, segment.start, segment.end))
 
             return chunks
         finally:
@@ -712,9 +763,10 @@ class AutoDubbingPipeline:
             logger.exception("pydub duration fitting failed, falling back to ffmpeg atempo")
             return False
 
-    def _combine_audio_chunks(self, chunks: list[AudioChunk], destination: Path) -> None:
+    def _combine_audio_chunks(self, chunks: list[AudioChunk], destination: Path, *, total_duration: float | None = None) -> None:
+        target_duration = max(float(total_duration or 0.0), 0.1)
         if not chunks:
-            self._write_silent_wav(destination, 0.1, sample_rate=44100)
+            self._write_silent_wav(destination, target_duration, sample_rate=44100)
             return
 
         ffmpeg = self._ffmpeg()
@@ -734,6 +786,8 @@ class AutoDubbingPipeline:
             duration="longest",
             normalize=0,
         )
+        if target_duration > 0.1:
+            mixed = mixed.filter("apad").filter("atrim", duration=target_duration)
         command = ffmpeg.output(mixed, str(destination), ac=2, ar="44100", format="wav").overwrite_output()
         self._run_ffmpeg_command(command, "audio_mix")
 
@@ -743,12 +797,26 @@ class AutoDubbingPipeline:
         subtitle_path: Path,
         tts_mix_path: Path,
         output_path: Path,
+        *,
+        script_segments: Iterable[DubbingScriptSegment] | None = None,
+        video_width: int | None = None,
+        video_height: int | None = None,
+        video_duration: float | None = None,
     ) -> None:
         ffmpeg = self._ffmpeg()
         video_input = ffmpeg.input(str(video_path))
         tts_input = ffmpeg.input(str(tts_mix_path))
 
         video_stream = video_input.video
+        if script_segments:
+            video_stream = self._apply_blur_boxes(
+                ffmpeg,
+                video_stream,
+                script_segments,
+                video_width=video_width or 0,
+                video_height=video_height or 0,
+                video_duration=video_duration,
+            )
         if self.config.burn_subtitles:
             subtitle_filter_path = self._ffmpeg_filter_path(subtitle_path)
             logger.info("legacy_pipeline.render.subtitle_filter path=%s", subtitle_filter_path)
@@ -775,13 +843,103 @@ class AutoDubbingPipeline:
             str(output_path),
             vcodec="libx264",
             acodec="aac",
-            shortest=None,
         ).overwrite_output()
         self._run_ffmpeg_command(command, "render")
 
-    def _write_srt(self, segments: Iterable[TranscriptSegment], destination: Path) -> None:
+    def _apply_blur_boxes(
+        self,
+        ffmpeg,
+        video_stream,
+        segments: Iterable[DubbingScriptSegment],
+        *,
+        video_width: int,
+        video_height: int,
+        video_duration: float | None = None,
+    ):
+        width = max(1, int(video_width))
+        height = max(1, int(video_height))
+        ordered_segments = sorted(segments, key=lambda item: (item.start, item.end))
+        render_until = max(float(video_duration or 0.0), ordered_segments[-1].end if ordered_segments else 0.0)
+        for index, segment in enumerate(ordered_segments):
+            style = segment.blur_style
+            effective_end = ordered_segments[index + 1].start if index + 1 < len(ordered_segments) else render_until
+            effective_end = max(segment.end, effective_end)
+            if not style.enabled or style.width <= 0 or style.height <= 0 or effective_end <= segment.start:
+                continue
+
+            box_width = max(2, round(width * style.width / 100))
+            box_height = max(2, round(height * style.height / 100))
+            left = round(width * style.x / 100)
+            top = round(height * style.y / 100)
+            left = max(0, min(left, width - box_width))
+            top = max(0, min(top, height - box_height))
+            max_blur_radius = max(0, (min(box_width, box_height) // 2) - 1)
+            blur_radius = max(0, min(int(style.blur), 48, max_blur_radius))
+            opacity = max(0.0, min(float(style.opacity), 0.95))
+            enable = f"between(t,{segment.start:.3f},{effective_end:.3f})"
+
+            if blur_radius > 0:
+                split_streams = video_stream.filter_multi_output("split")
+                base_stream = split_streams[0]
+                crop_source = split_streams[1]
+                blurred_crop = crop_source.crop(
+                    left,
+                    top,
+                    box_width,
+                    box_height,
+                ).filter("boxblur", luma_radius=blur_radius, luma_power=1)
+                video_stream = ffmpeg.overlay(base_stream, blurred_crop, x=left, y=top, enable=enable)
+
+            if opacity > 0:
+                video_stream = video_stream.filter(
+                    "drawbox",
+                    x=left,
+                    y=top,
+                    w=box_width,
+                    h=box_height,
+                    color=f"black@{opacity:.3f}",
+                    t="fill",
+                    enable=enable,
+                )
+        return video_stream
+
+    def _clip_timeline_to_video(
+        self,
+        segments: Iterable[TranscriptSegment],
+        video_duration: float | None,
+    ) -> list[TranscriptSegment]:
+        canonical = TimelineService().from_transcript(segments)
+        duration = max(0.0, float(video_duration or 0.0))
+        if duration <= 0:
+            return canonical
+
+        clipped: list[TranscriptSegment] = []
+        for segment in canonical:
+            if segment.start >= duration:
+                continue
+            end = min(segment.end, duration)
+            if end <= segment.start:
+                continue
+            clipped.append(
+                segment.model_copy(
+                    update={
+                        "id": len(clipped),
+                        "end": end,
+                    }
+                )
+            )
+        return clipped
+
+    def _write_srt(
+        self,
+        segments: Iterable[TranscriptSegment],
+        destination: Path,
+        *,
+        video_duration: float | None = None,
+    ) -> None:
         lines: list[str] = []
-        for index, segment in enumerate(segments, start=1):
+        capcut_timeline = self._clip_timeline_to_video(segments, video_duration)
+        for index, segment in enumerate(capcut_timeline, start=1):
             lines.extend(
                 [
                     str(index),
@@ -790,7 +948,13 @@ class AutoDubbingPipeline:
                     "",
                 ]
             )
-        destination.write_text("\n".join(lines), encoding="utf-8")
+        # CapCut reliably detects Vietnamese when SubRip uses a UTF-8 BOM. CRLF
+        # also keeps the file compatible with its Windows importer/editor.
+        content = "\r\n".join(lines)
+        if content:
+            content += "\r\n"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(content.encode("utf-8-sig"))
 
     def _write_ass(
         self,
@@ -799,6 +963,7 @@ class AutoDubbingPipeline:
         *,
         video_width: int,
         video_height: int,
+        video_duration: float | None = None,
     ) -> None:
         width = max(1, int(video_width))
         height = max(1, int(video_height))
@@ -818,9 +983,13 @@ class AutoDubbingPipeline:
             "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
         ]
         lines = [*header]
-        for segment in segments:
+        ordered_segments = sorted(segments, key=lambda item: (item.start, item.end))
+        render_until = max(float(video_duration or 0.0), ordered_segments[-1].end if ordered_segments else 0.0)
+        for index, segment in enumerate(ordered_segments):
             text = (segment.translated_text or segment.original_text).strip()
-            if not text or segment.end <= segment.start:
+            effective_end = ordered_segments[index + 1].start if index + 1 < len(ordered_segments) else render_until
+            effective_end = max(segment.end, effective_end)
+            if not text or effective_end <= segment.start:
                 continue
 
             style = segment.subtitle_style
@@ -850,7 +1019,7 @@ class AutoDubbingPipeline:
             lines.append(
                 "Dialogue: 0,"
                 f"{self._ass_time(segment.start)},"
-                f"{self._ass_time(segment.end)},"
+                f"{self._ass_time(effective_end)},"
                 "Default,,0,0,0,,"
                 f"{override}{wrapped_text}"
             )
@@ -1279,6 +1448,21 @@ class AutoDubbingPipeline:
             raise RuntimeError("ffmpeg-python is required. Install it with `pip install ffmpeg-python`.") from exc
         return ffmpeg
 
+    def _raise_if_cancelled(self, workspace: Workspace | None = None) -> None:
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            request_id = getattr(workspace, "request_id", None)
+            if request_id:
+                logger.info("pipeline.cancelled request_id=%s", request_id)
+            else:
+                logger.info("pipeline.cancelled")
+            raise PipelineCancelledError("Pipeline cancelled")
+
+    def _acquire_gpu_lock(self, workspace: Workspace | None = None) -> None:
+        while True:
+            self._raise_if_cancelled(workspace)
+            if self._gpu_lock.acquire(timeout=GPU_LOCK_POLL_SECONDS):
+                return
+
     def _acquire_gpu_lock_for_stream(
         self,
         workspace: Workspace,
@@ -1292,6 +1476,7 @@ class AutoDubbingPipeline:
         timeout_seconds = max(0.0, timeout_seconds)
 
         while True:
+            self._raise_if_cancelled(workspace)
             if self._gpu_lock.acquire(timeout=GPU_LOCK_POLL_SECONDS):
                 waited_seconds = time.monotonic() - start
                 if waited_seconds >= 1.0:
@@ -1307,7 +1492,7 @@ class AutoDubbingPipeline:
                         request_id=workspace.request_id,
                         phase=phase,
                         progress=progress,
-                        detail=f"Đã đợi tác vụ trước {waited_seconds:.0f}s, bắt đầu xử lý",
+                        detail=f"Waited {waited_seconds:.0f}s for previous GPU/model job, starting now",
                     )
                 return True
 
@@ -1325,13 +1510,13 @@ class AutoDubbingPipeline:
                 request_id=workspace.request_id,
                 phase=phase,
                 progress=progress,
-                detail=f"Đang đợi tác vụ trước nhả model/GPU ({waited_seconds:.0f}s)",
+                detail=f"Waiting for previous GPU/model job to release resources ({waited_seconds:.0f}s)",
             )
 
             if timeout_seconds and waited_seconds >= timeout_seconds:
                 message = (
-                    f"Backend vẫn bận sau {timeout_seconds:.0f}s. "
-                    "Có thể job trước đang kẹt trong ASR/OCR; hãy hủy job hoặc restart backend rồi chạy lại."
+                    f"Backend is still busy after {timeout_seconds:.0f}s. "
+                    "A previous job may be stuck in ASR/OCR; cancel it or restart the backend, then retry."
                 )
                 logger.warning(
                     "pipeline.lock.timeout request_id=%s operation=%s waited=%.1fs",
@@ -1362,5 +1547,3 @@ class AutoDubbingPipeline:
     def _event(self, status: str, step: str, **extra: object) -> str:
         payload = {"status": status, "step": step, **extra}
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-

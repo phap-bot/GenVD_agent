@@ -6,6 +6,7 @@ import os
 import re
 import time
 from functools import lru_cache
+from threading import Event
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -60,7 +61,15 @@ except ImportError:
     pass
 
 
- param($m) $m.Value -replace 'timeout: float = 20\.0,', 'timeout: float = 30.0,' 
+def translate_text(
+    text: str,
+    *,
+    target_language: str,
+    source_language: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    timeout: float = 30.0,
+    cancel_event: Event | None = None,
 ) -> str:
     clean_text = text.strip()
     if not clean_text:
@@ -75,6 +84,7 @@ except ImportError:
         return f"[{target}] {clean_text}"
 
     try:
+        _raise_if_cancelled(cancel_event)
         if selected_provider in {"9router", "ninerouter", "openai-compatible", "openai_compatible"}:
             translated = _translate_9router_text_with_model_fallback(
                 clean_text,
@@ -84,6 +94,7 @@ except ImportError:
                 base_url=_nine_router_base_url(),
                 api_key=_nine_router_api_key() or "",
                 timeout=timeout,
+                cancel_event=cancel_event,
             )
             return _fallback_if_bad_translation(
                 clean_text,
@@ -115,7 +126,15 @@ except ImportError:
         return clean_text
 
 
- param($m) $m.Value -replace 'timeout: float = 30\.0,', 'timeout: float = 45.0,' 
+def translate_segments(
+    texts: list[str],
+    *,
+    target_language: str,
+    source_language: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    timeout: float = 45.0,
+    cancel_event: Event | None = None,
 ) -> list[str]:
     if not texts:
         return []
@@ -149,6 +168,7 @@ except ImportError:
 
     translated: list[str] = []
     for batch in _translation_batches(clean_texts):
+        _raise_if_cancelled(cancel_event)
         try:
             translated.extend(
                 _translate_9router_segments_with_model_fallback(
@@ -159,6 +179,7 @@ except ImportError:
                     base_url=_nine_router_base_url(),
                     api_key=_nine_router_api_key() or "",
                     timeout=timeout,
+                    cancel_event=cancel_event,
                 )
             )
         except Exception as exc:
@@ -180,6 +201,7 @@ except ImportError:
                         provider=selected_provider,
                         model=selected_model,
                         timeout=timeout,
+                        cancel_event=cancel_event,
                     )
                     if text
                     else text
@@ -201,6 +223,7 @@ except ImportError:
                 provider=selected_provider,
                 model=selected_model,
                 timeout=timeout,
+                cancel_event=cancel_event,
             )
             if text
             else text
@@ -326,8 +349,10 @@ def _translate_9router_text_with_model_fallback(
     base_url: str,
     api_key: str,
     timeout: float,
+    cancel_event: Event | None = None,
 ) -> str:
     last_error: Exception | None = None
+    _raise_if_cancelled(cancel_event)
     attempt_timeout = _translation_attempt_timeout(timeout)
     for model in _translation_model_attempts(selected_model):
         try:
@@ -337,6 +362,7 @@ def _translate_9router_text_with_model_fallback(
                 source=source,
                 target=target,
                 batch_size=1,
+                cancel_event=cancel_event,
             )
         except Exception as exc:
             last_error = exc
@@ -361,8 +387,10 @@ def _translate_9router_segments_with_model_fallback(
     base_url: str,
     api_key: str,
     timeout: float,
+    cancel_event: Event | None = None,
 ) -> list[str]:
     last_error: Exception | None = None
+    _raise_if_cancelled(cancel_event)
     attempt_timeout = _translation_attempt_timeout(timeout)
     for model in _translation_model_attempts(selected_model):
         try:
@@ -380,6 +408,7 @@ def _translate_9router_segments_with_model_fallback(
                 source=source,
                 target=target,
                 batch_size=len(texts),
+                cancel_event=cancel_event,
             )
         except Exception as exc:
             last_error = exc
@@ -410,6 +439,7 @@ def _translate_9router_segments_with_model_fallback(
                 base_url=base_url,
                 api_key=api_key,
                 timeout=timeout,
+                cancel_event=cancel_event,
             ),
             *_translate_9router_segments_with_model_fallback(
                 texts[midpoint:],
@@ -419,6 +449,7 @@ def _translate_9router_segments_with_model_fallback(
                 base_url=base_url,
                 api_key=api_key,
                 timeout=timeout,
+                cancel_event=cancel_event,
             ),
         ]
     if last_error is not None:
@@ -1003,6 +1034,11 @@ def _translation_attempt_timeout(timeout: float) -> float:
     return max(5.0, min(float(timeout), configured))
 
 
+def _raise_if_cancelled(cancel_event: Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("Translation cancelled")
+
+
 def _with_connection_refused_retries(
     operation,
     *,
@@ -1010,18 +1046,34 @@ def _with_connection_refused_retries(
     source: str,
     target: str,
     batch_size: int,
+    cancel_event: Event | None = None,
 ):
     retries = _env_int("AUTODUB_TRANSLATION_CONNECTION_REFUSED_RETRIES", 2, minimum=0, maximum=8)
     for attempt in range(retries + 1):
         try:
+            _raise_if_cancelled(cancel_event)
             return operation()
         except Exception as exc:
             if not _is_connection_refused_error(exc) or attempt >= retries:
+                if _is_connection_refused_error(exc):
+                    logger.error(
+                        "translation.connection_refused_exhausted cause=9router_unreachable base_url=%s hint=%s model=%s source=%s target=%s batch_size=%s attempts=%s error=%s",
+                        _nine_router_base_url(),
+                        "No service is listening on the configured 9Router/OpenAI-compatible endpoint.",
+                        model,
+                        source,
+                        target,
+                        batch_size,
+                        attempt + 1,
+                        exc,
+                    )
                 raise
 
             delay = _connection_refused_retry_delay(attempt)
             logger.warning(
-                "translation.connection_refused_retry model=%s source=%s target=%s batch_size=%s attempt=%s retries=%s delay=%.2f error=%s",
+                "translation.connection_refused_retry cause=9router_unreachable base_url=%s hint=%s model=%s source=%s target=%s batch_size=%s attempt=%s retries=%s delay=%.2f error=%s",
+                _nine_router_base_url(),
+                "Start 9Router/local gateway or switch AUTODUB_TRANSLATION_PROVIDER=google/mock.",
                 model,
                 source,
                 target,
@@ -1031,7 +1083,13 @@ def _with_connection_refused_retries(
                 delay,
                 exc,
             )
-            time.sleep(delay)
+            deadline = time.monotonic() + delay
+            while True:
+                _raise_if_cancelled(cancel_event)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.2, remaining))
     raise RuntimeError("unreachable translation retry state")
 
 
@@ -1278,6 +1336,15 @@ def _language_name(language: str) -> str:
         "es": "Spanish",
     }
     return names.get(language, language)
+
+
+
+
+
+
+
+
+
 
 
 

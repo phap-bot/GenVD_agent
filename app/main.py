@@ -10,6 +10,8 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from app.api.genvideo_routes import router as genvideo_router
+from app.api.genvideo_flow_routes import router as genvideo_flow_router
 from app.api.routes import compat_router, router as dubbing_router, stream_router
 from utils.model_cache import configure_model_cache
 from utils.model_registry import model_registry
@@ -114,6 +116,8 @@ app.add_middleware(
 app.include_router(dubbing_router)
 app.include_router(compat_router)
 app.include_router(stream_router)
+app.include_router(genvideo_flow_router)
+app.include_router(genvideo_router)
 app.mount("/media", StaticFiles(directory="output"), name="media")
 app.mount("/temp", StaticFiles(directory="temp"), name="temp")
 

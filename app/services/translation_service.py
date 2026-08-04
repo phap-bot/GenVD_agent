@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from threading import Event
 
 from app.models.schemas import PipelineConfig, TranscriptSegment
 from utils.translation import normalize_translation_model, translate_segments
@@ -11,8 +12,9 @@ logger = logging.getLogger(__name__)
 class TranslationService:
     """Timestamp-preserving batch translation service."""
 
-    def __init__(self, config: PipelineConfig) -> None:
+    def __init__(self, config: PipelineConfig, cancel_event: Event | None = None) -> None:
         self.config = config
+        self.cancel_event = cancel_event
 
     def translate(self, segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
         resolved_model = normalize_translation_model(self.config.translation_model)
@@ -34,6 +36,7 @@ class TranslationService:
                 target_language=self.config.target_language,
                 provider=self.config.translation_provider,
                 model=resolved_model,
+                cancel_event=self.cancel_event,
             )
 
         translated: list[TranscriptSegment] = []

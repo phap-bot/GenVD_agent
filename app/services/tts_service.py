@@ -13,7 +13,12 @@ from app.utils.media_probe import probe_duration
 from app.utils.memory import VRAMManager
 from utils.model_cache import configure_model_cache
 from utils.model_registry import model_registry
-from utils.tts_voice import infer_stable_vieneu_audio, resolve_vieneu_voice
+from utils.tts_voice import (
+    encode_cloned_vieneu_voice,
+    infer_stable_cloned_vieneu_audio,
+    infer_stable_vieneu_audio,
+    resolve_vieneu_voice,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +47,7 @@ class TTSService:
         self.config = config
         self.model = None
         self.voice: str | None = None
+        self.clone_voice_reference = None
 
     def synthesize(
         self,
@@ -55,28 +61,30 @@ class TTSService:
 
         try:
             if self.config.mock_tts:
-                for segment in segments:
-                    raw_path = tts_dir / f"segment_{segment.id:04d}_raw.wav"
-                    final_path = tts_dir / f"segment_{segment.id:04d}.wav"
-                    duration = max(segment.end - segment.start, 0.1)
-                    self._write_silent_wav(raw_path, duration)
-                    self._fit_duration(raw_path, final_path, duration)
-                    tracks.append(TTSAudioTrack(segment.id, final_path, segment.start, segment.end))
-                return tracks
-
+                raise RuntimeError("Mock TTS is disabled because GPU TTS is required.")
+            if self.config.tts_device != "cuda":
+                raise RuntimeError("CPU TTS is disabled. Use CUDA TTS only.")
             self._log_model_cache()
-            if self.config.tts_device == "cuda":
-                DependencyService().require_cuda()
+            DependencyService().require_cuda()
 
-            backend = "pytorch" if self.config.tts_device == "cuda" else "onnx"
-            with model_registry.acquire_vieneu(device=self.config.tts_device, backend=backend) as model:
+            with model_registry.acquire_vieneu(device="cuda", backend="pytorch") as model:
                 self.model = model
-                self.voice = resolve_vieneu_voice(model, self.config.voice_model)
-                logger.info(
-                    "tts_service.voice.resolved requested=%s resolved=%s",
-                    self.config.voice_model,
-                    self.voice,
-                )
+                if self.config.voice_mode == "clone":
+                    self.clone_voice_reference = encode_cloned_vieneu_voice(
+                        model,
+                        self.config.clone_reference_audio_path or "",
+                    )
+                    logger.info(
+                        "tts_service.voice.clone reference=%s",
+                        self.config.clone_reference_audio_path,
+                    )
+                else:
+                    self.voice = resolve_vieneu_voice(model, self.config.voice_model)
+                    logger.info(
+                        "tts_service.voice.system requested=%s resolved=%s",
+                        self.config.voice_model,
+                        self.voice,
+                    )
                 for segment in segments:
                     raw_path = tts_dir / f"segment_{segment.id:04d}_raw.wav"
                     final_path = tts_dir / f"segment_{segment.id:04d}.wav"
@@ -90,11 +98,13 @@ class TTSService:
         finally:
             self.model = None
             self.voice = None
+            self.clone_voice_reference = None
             VRAMManager.cleanup()
 
     def unload(self) -> None:
         self.model = None
         self.voice = None
+        self.clone_voice_reference = None
         VRAMManager.cleanup()
 
     def _log_model_cache(self) -> None:
@@ -110,8 +120,14 @@ class TTSService:
         if self.model is None:
             raise RuntimeError("TTS model is not loaded")
 
-        voice = getattr(self, "voice", None) or resolve_vieneu_voice(self.model, self.config.voice_model)
-        audio = infer_stable_vieneu_audio(self.model, text, voice)
+        if self.config.voice_mode == "clone":
+            if self.clone_voice_reference is None:
+                raise RuntimeError("Cloned voice was selected but its reference was not encoded.")
+            audio = infer_stable_cloned_vieneu_audio(self.model, text, self.clone_voice_reference)
+        else:
+            if self.voice is None:
+                raise RuntimeError("System voice was selected but was not resolved.")
+            audio = infer_stable_vieneu_audio(self.model, text, self.voice)
         self.model.save(audio, str(destination))
 
     def _fit_duration(self, source: Path, destination: Path, target_duration: float) -> None:

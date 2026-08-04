@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class WordTimestamp(BaseModel):
@@ -41,18 +41,35 @@ class PipelineConfig(BaseModel):
     compute_type: Literal["int8", "float16"] = "int8"
     word_timestamps: bool = False
     voice_model: str = Field(default="Trúc Ly", min_length=1, max_length=64)
-    tts_device: Literal["cuda", "cpu"] = "cuda"
+    voice_mode: Literal["system", "clone"] = "system"
+    clone_reference_audio_path: str | None = Field(default=None, max_length=1024)
+    tts_device: Literal["cuda"] = "cuda"
     background_volume: float = Field(default=0.0, ge=0, le=1)
     tts_volume: float = Field(default=1.0, ge=0, le=2)
     burn_subtitles: bool = True
     mock_translation: bool = False
-    mock_tts: bool = True
+    mock_tts: bool = False
+    copyright_confirmed: bool = False
+    copyright_source: Literal["owned", "licensed", "public_domain", "permission", "platform_library", "unknown"] = "unknown"
+    copyright_notes: str = Field(default="", max_length=500)
     ocr_fallback: bool = True
     ocr_force: bool = False
     ocr_model: str = Field(default="gemini/gemini-2.5-flash", min_length=1, max_length=160)
     ocr_interval_seconds: float = Field(default=0.75, ge=0.25, le=5.0)
     ocr_crop_bottom_ratio: float = Field(default=0.35, ge=0.12, le=0.85)
 
+    @model_validator(mode="after")
+    def require_selected_voice_source(self):
+        if self.voice_mode == "clone" and not (self.clone_reference_audio_path or "").strip():
+            raise ValueError("Clone voice mode requires clone_reference_audio_path.")
+        return self
+
+
+    def require_copyright_preflight(self) -> None:
+        if not self.copyright_confirmed:
+            raise ValueError("Copyright preflight required: confirm you have rights to use this media before processing.")
+        if self.copyright_source == "unknown":
+            raise ValueError("Copyright preflight required: choose a clear rights source before processing.")
 
 class PipelineResult(BaseModel):
     request_id: str
@@ -73,6 +90,16 @@ class SubtitleStyle(BaseModel):
     align: Literal["left", "center", "right"] = "center"
 
 
+class BlurStyle(BaseModel):
+    enabled: bool = False
+    x: float = Field(default=18, ge=0, le=100)
+    y: float = Field(default=10, ge=0, le=100)
+    width: float = Field(default=44, ge=5, le=100)
+    height: float = Field(default=18, ge=4, le=60)
+    blur: int = Field(default=16, ge=0, le=48)
+    opacity: float = Field(default=0.26, ge=0, le=0.95)
+
+
 class DubbingScriptSegment(BaseModel):
     id: int
     start: float = Field(ge=0)
@@ -80,6 +107,7 @@ class DubbingScriptSegment(BaseModel):
     original_text: str
     translated_text: str
     subtitle_style: SubtitleStyle = Field(default_factory=SubtitleStyle)
+    blur_style: BlurStyle = Field(default_factory=BlurStyle)
     voice_model: str = "Trúc Ly"
 
     @property
@@ -100,12 +128,23 @@ class RenderScriptRequest(BaseModel):
     translation_provider: Literal["9router", "google", "mock"] = "9router"
     translation_model: str = Field(default="ag/gemini-3-flash-agent", min_length=1, max_length=160)
     voice_model: str = Field(default="Trúc Ly", min_length=1, max_length=64)
-    tts_device: Literal["cuda", "cpu"] = "cuda"
+    voice_mode: Literal["system", "clone"] = "system"
+    clone_reference_audio_path: str | None = Field(default=None, max_length=1024)
+    tts_device: Literal["cuda"] = "cuda"
     background_volume: float = Field(default=0.0, ge=0, le=1)
     tts_volume: float = Field(default=1.0, ge=0, le=2)
     burn_subtitles: bool = True
     mock_tts: bool = False
+    copyright_confirmed: bool = False
+    copyright_source: Literal["owned", "licensed", "public_domain", "permission", "platform_library", "unknown"] = "unknown"
+    copyright_notes: str = Field(default="", max_length=500)
     segments: list[DubbingScriptSegment] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def require_selected_voice_source(self):
+        if self.voice_mode == "clone" and not (self.clone_reference_audio_path or "").strip():
+            raise ValueError("Clone voice mode requires clone_reference_audio_path.")
+        return self
 
 
 class ShortenTextRequest(BaseModel):

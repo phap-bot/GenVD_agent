@@ -78,14 +78,13 @@ class ASRService:
             )
 
         try:
-            import torch
             import whisperx
         except ImportError as exc:
-            logger.warning("WhisperX unavailable, returning mock transcript: %s", exc)
-            return self._mock_transcript()
+            raise RuntimeError("WhisperX is required for GPU ASR. Install whisperx, then restart the backend.") from exc
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        batch_size = 4 if device == "cuda" else 1
+        DependencyService().require_cuda()
+        device = "cuda"
+        batch_size = 4
 
         logger.info(
             "asr_service.model.load model=%s compute_type=%s device=%s language=%s cache=%s",

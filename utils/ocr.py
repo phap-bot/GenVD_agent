@@ -6,6 +6,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from threading import Event
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.error import HTTPError
@@ -22,6 +23,11 @@ from utils.translation import (
 logger = logging.getLogger("auto_dubbing.ocr")
 
 DEFAULT_OCR_MODEL = "gemini/gemini-2.5-flash"
+
+
+def _raise_if_cancelled(cancel_event: Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("OCR cancelled")
 
 
 @dataclass(frozen=True)
@@ -49,6 +55,7 @@ def extract_video_ocr_segments(
     max_frames: int = 80,
     batch_size: int = 6,
     timeout: float = 45.0,
+    cancel_event: Event | None = None,
 ) -> list[OcrTextSegment]:
     selected_model = (model or os.environ.get("AUTODUB_OCR_MODEL") or DEFAULT_OCR_MODEL).strip()
     interval = min(5.0, max(0.25, interval_seconds))
@@ -70,6 +77,7 @@ def extract_video_ocr_segments(
 
     frame_text: dict[int, str] = {}
     for start in range(0, len(frames), batch_size):
+        _raise_if_cancelled(cancel_event)
         batch = frames[start : start + batch_size]
         try:
             frame_text.update(
@@ -78,6 +86,7 @@ def extract_video_ocr_segments(
                     source_language=source_language,
                     model=selected_model,
                     timeout=timeout,
+                    cancel_event=cancel_event,
                 )
             )
         except Exception:
@@ -170,9 +179,12 @@ def _ocr_frames_with_9router(
     source_language: str | None,
     model: str,
     timeout: float,
+    cancel_event: Event | None = None,
 ) -> dict[int, str]:
     if not frames:
         return {}
+
+    _raise_if_cancelled(cancel_event)
 
     content: list[dict[str, object]] = [
         {
@@ -216,6 +228,7 @@ def _ocr_frames_with_9router(
         method="POST",
     )
     try:
+        _raise_if_cancelled(cancel_event)
         with urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8")
             content_type = response.headers.get("Content-Type", "")
@@ -345,3 +358,6 @@ def _clean_ocr_text(text: str) -> str:
     if clean.lower() in {"none", "null", "no text", "no subtitle", "empty", "n/a"}:
         return ""
     return clean
+
+
+

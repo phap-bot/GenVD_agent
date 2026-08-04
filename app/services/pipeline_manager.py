@@ -30,6 +30,7 @@ class PipelineManager:
 
     def process(self, video_path: Path, config: PipelineConfig) -> PipelineResult:
         """Full video pipeline: extract audio -> ASR -> translate -> TTS -> mux video."""
+        config.require_copyright_preflight()
         with self._pipeline_lock:
             return self._process_unlocked(video_path, config)
 
@@ -89,6 +90,7 @@ class PipelineManager:
         config: PipelineConfig,
     ) -> PipelineResult:
         """Dub a video from an existing SRT instead of running ASR."""
+        config.require_copyright_preflight()
         with self._pipeline_lock:
             return self._process_with_srt_unlocked(video_path, subtitle_path, config)
 

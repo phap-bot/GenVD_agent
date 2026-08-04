@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import queue
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
 from app.models.schemas import (
@@ -25,8 +28,9 @@ from app.models.schemas import (
 from app.services.dependency_service import DependencyService
 from app.services.pipeline import AutoDubbingPipeline
 from app.services.pipeline_manager import PipelineManager
-from app.utils.vram import VRAMManager
+from app.utils.cancel import PipelineCancelledError
 from app.utils.files import safe_filename, save_upload_file
+from app.utils.vram import VRAMManager
 from app.utils.workspace import WorkspaceManager
 from utils.model_registry import model_registry
 from utils.stt import list_stt_models, remote_stt_enabled, transcribe_audio_remote
@@ -39,6 +43,7 @@ logger = logging.getLogger("auto_dubbing.routes")
 
 
 REMOTE_ASR_PROVIDERS = {"9router", "remote", "openai-compatible", "openai_compatible", "gemini"}
+VOICE_REFERENCE_SUFFIXES = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus"}
 
 
 def _first_config_value(value: str | None, env_names: tuple[str, ...], fallback: str) -> str:
@@ -103,6 +108,9 @@ def _config_from_form(
     ocr_model: str = "gemini/gemini-2.5-flash",
     ocr_interval_seconds: float = 0.75,
     ocr_crop_bottom_ratio: float = 0.35,
+    copyright_confirmed: bool = False,
+    copyright_source: str = "unknown",
+    copyright_notes: str = "",
 ) -> PipelineConfig:
     resolved_translation_provider = _first_config_value(
         translation_provider,
@@ -117,7 +125,7 @@ def _config_from_form(
     resolved_asr_model = _fallback_asr_model(asr_model)
     resolved_compute_type = _first_config_value(compute_type, ("AUTODUB_COMPUTE_TYPE",), "int8")
     resolved_voice_model = _first_config_value(voice_model, ("AUTODUB_VOICE_MODEL",), "Trúc Ly")
-    resolved_tts_device = _first_config_value(tts_device, ("AUTODUB_TTS_DEVICE",), "cuda")
+    resolved_tts_device = "cuda"
     resolved_ocr_model = _first_config_value(ocr_model, ("AUTODUB_OCR_MODEL",), "gemini/gemini-2.5-flash")
 
     return PipelineConfig(
@@ -134,7 +142,10 @@ def _config_from_form(
         tts_volume=tts_volume,
         burn_subtitles=burn_subtitles,
         mock_translation=mock_translation,
-        mock_tts=mock_tts,
+        mock_tts=False,
+        copyright_confirmed=copyright_confirmed,
+        copyright_source=copyright_source,
+        copyright_notes=copyright_notes,
         ocr_fallback=ocr_fallback,
         ocr_force=ocr_force,
         ocr_model=resolved_ocr_model,
@@ -142,6 +153,13 @@ def _config_from_form(
         ocr_crop_bottom_ratio=ocr_crop_bottom_ratio,
     )
 
+
+
+def _require_copyright_preflight(config: PipelineConfig) -> None:
+    if not config.copyright_confirmed:
+        raise HTTPException(status_code=422, detail="Copyright preflight required: confirm you have rights to use this media before processing.")
+    if config.copyright_source == "unknown":
+        raise HTTPException(status_code=422, detail="Copyright preflight required: choose a clear rights source before processing.")
 
 def _dubbing_response(result) -> DubbingResponse:
     return DubbingResponse(
@@ -164,8 +182,80 @@ def _batch_response(result) -> BatchDubbingResponse:
     )
 
 
+
+def _streaming_pipeline_response(request: Request, workspace_manager: WorkspaceManager, workspace, runner_factory) -> StreamingResponse:
+    cancel_event = threading.Event()
+    event_queue: queue.Queue[object] = queue.Queue()
+    errors: list[BaseException] = []
+    request_id = getattr(workspace, "request_id", "unknown")
+
+    def worker() -> None:
+        logger.info("stream.worker.start request_id=%s", request_id)
+        try:
+            for event in runner_factory(cancel_event):
+                event_queue.put(("data", event))
+        except PipelineCancelledError:
+            logger.info("stream.worker.cancelled request_id=%s cause=client_disconnected_or_reload", request_id)
+        except BaseException as exc:
+            error_message = str(exc)
+            if isinstance(exc, ValueError) and "Copyright preflight required" in error_message:
+                logger.warning(
+                    "stream.worker.failed request_id=%s cause=copyright_preflight_missing error=%s",
+                    request_id,
+                    error_message,
+                )
+            else:
+                logger.exception("stream.worker.failed request_id=%s error=%s", request_id, exc)
+            errors.append(exc)
+        finally:
+            event_queue.put(("done", None))
+            logger.info("stream.worker.done request_id=%s cancelled=%s", request_id, cancel_event.is_set())
+
+    thread = threading.Thread(target=worker, daemon=True, name=f"autodub-stream-{request_id}")
+    thread.start()
+
+    async def event_stream():
+        try:
+            while True:
+                if await request.is_disconnected():
+                    logger.info("stream.client_disconnected request_id=%s cause=browser_reload_or_closed_tab", request_id)
+                    cancel_event.set()
+                    break
+                try:
+                    kind, payload = await asyncio.to_thread(event_queue.get, True, 0.2)
+                except queue.Empty:
+                    if not thread.is_alive() and event_queue.empty():
+                        break
+                    continue
+                if kind == "data":
+                    yield payload
+                else:
+                    break
+            if errors and not cancel_event.is_set():
+                message = str(errors[0]) or errors[0].__class__.__name__
+                yield "data: " + json.dumps(
+                    {"step": "error", "status": "error", "phase": "error", "progress": 0, "error": message},
+                    ensure_ascii=False,
+                ) + "\n\n"
+        finally:
+            cancel_event.set()
+            thread.join(timeout=5.0)
+            if thread.is_alive():
+                logger.warning(
+                    "stream.worker.still_running_after_cancel request_id=%s cause=blocking_external_call hint=wait_for_timeout_or_check_9router_ffmpeg_tts",
+                    request_id,
+                )
+            workspace_manager.cleanup(workspace)
+            logger.info("stream.workspace.cleaned request_id=%s", request_id)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 @stream_router.post("/dub")
 async def stream_dub_video(
+    request: Request,
     video: UploadFile = File(...),
     source_language: str | None = Form(default=None),
     target_language: str = Form(default="en"),
@@ -186,6 +276,9 @@ async def stream_dub_video(
     ocr_model: str = Form(default=""),
     ocr_interval_seconds: float = Form(default=0.75),
     ocr_crop_bottom_ratio: float = Form(default=0.35),
+    copyright_confirmed: bool = Form(default=False),
+    copyright_source: str = Form(default="unknown"),
+    copyright_notes: str = Form(default=""),
 ) -> StreamingResponse:
     """SSE endpoint for the Next.js client.
 
@@ -213,7 +306,11 @@ async def stream_dub_video(
         ocr_model,
         ocr_interval_seconds,
         ocr_crop_bottom_ratio,
+        copyright_confirmed=copyright_confirmed,
+        copyright_source=copyright_source,
+        copyright_notes=copyright_notes,
     )
+    _require_copyright_preflight(config)
 
     workspace_manager = WorkspaceManager()
     workspace = workspace_manager.create()
@@ -223,18 +320,12 @@ async def stream_dub_video(
         workspace_manager.cleanup(workspace)
         raise
 
-    def events():
-        try:
-            yield from AutoDubbingPipeline(config).run(workspace)
-        finally:
-            workspace_manager.cleanup(workspace)
-
-    return StreamingResponse(
-        events(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    return _streaming_pipeline_response(
+        request,
+        workspace_manager,
+        workspace,
+        lambda cancel_event: AutoDubbingPipeline(config, cancel_event=cancel_event).run(workspace),
     )
-
 
 @stream_router.post("/analyze", response_model=AnalyzeResponse)
 async def analyze_video_script(
@@ -252,6 +343,9 @@ async def analyze_video_script(
     ocr_model: str = Form(default=""),
     ocr_interval_seconds: float = Form(default=0.75),
     ocr_crop_bottom_ratio: float = Form(default=0.35),
+    copyright_confirmed: bool = Form(default=False),
+    copyright_source: str = Form(default="unknown"),
+    copyright_notes: str = Form(default=""),
 ) -> AnalyzeResponse:
     config = _config_from_form(
         None if source_language == "auto" else source_language,
@@ -273,8 +367,12 @@ async def analyze_video_script(
         ocr_model,
         ocr_interval_seconds,
         ocr_crop_bottom_ratio,
+        copyright_confirmed=copyright_confirmed,
+        copyright_source=copyright_source,
+        copyright_notes=copyright_notes,
     )
     config.word_timestamps = True
+    _require_copyright_preflight(config)
 
     workspace_manager = WorkspaceManager()
     workspace = workspace_manager.create()
@@ -295,8 +393,11 @@ async def analyze_video_script(
         workspace_manager.cleanup(workspace)
 
 
+
+
 @stream_router.post("/analyze-stream")
 async def analyze_video_script_stream(
+    request: Request,
     video: UploadFile = File(...),
     source_language: str | None = Form(default=None),
     target_language: str = Form(default="vi"),
@@ -313,6 +414,9 @@ async def analyze_video_script_stream(
     ocr_model: str = Form(default=""),
     ocr_interval_seconds: float = Form(default=0.75),
     ocr_crop_bottom_ratio: float = Form(default=0.35),
+    copyright_confirmed: bool = Form(default=False),
+    copyright_source: str = Form(default="unknown"),
+    copyright_notes: str = Form(default=""),
 ) -> StreamingResponse:
     config = _config_from_form(
         None if source_language == "auto" else source_language,
@@ -334,8 +438,12 @@ async def analyze_video_script_stream(
         ocr_model,
         ocr_interval_seconds,
         ocr_crop_bottom_ratio,
+        copyright_confirmed=copyright_confirmed,
+        copyright_source=copyright_source,
+        copyright_notes=copyright_notes,
     )
     config.word_timestamps = word_timestamps
+    _require_copyright_preflight(config)
 
     workspace_manager = WorkspaceManager()
     workspace = workspace_manager.create()
@@ -347,20 +455,13 @@ async def analyze_video_script_stream(
         workspace_manager.cleanup(workspace)
         raise
 
-    def events():
-        try:
-            yield from AutoDubbingPipeline(config).analyze_stream(workspace)
-        finally:
-            workspace_manager.cleanup(workspace)
-
-    return StreamingResponse(
-        events(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    return _streaming_pipeline_response(
+        request,
+        workspace_manager,
+        workspace,
+        lambda cancel_event: AutoDubbingPipeline(config, cancel_event=cancel_event).analyze_stream(workspace),
     )
-
-
-def _output_media_path(media_path: str) -> Path:
+def _output_media_path(media_path: str, field_name: str = "source_video_path") -> Path:
     raw = media_path.strip()
     if raw.startswith("http://") or raw.startswith("https://"):
         from urllib.parse import urlparse
@@ -369,12 +470,12 @@ def _output_media_path(media_path: str) -> Path:
 
     name = Path(raw).name
     if not name:
-        raise HTTPException(status_code=422, detail="Invalid source_video_path")
+        raise HTTPException(status_code=422, detail=f"Invalid {field_name}")
 
     output_root = Path("output").resolve()
     path = (output_root / name).resolve()
     if path.parent != output_root:
-        raise HTTPException(status_code=403, detail="source_video_path must point to output media")
+        raise HTTPException(status_code=403, detail=f"{field_name} must point to output media")
     return path
 
 
@@ -407,38 +508,76 @@ def shorten_text(request: ShortenTextRequest) -> ShortenTextResponse:
     return _shorten_text_response(request)
 
 
+@stream_router.post("/voice-reference")
+async def upload_voice_reference(audio: UploadFile = File(...)) -> dict[str, str]:
+    safe_name = safe_filename(audio.filename, fallback_suffix=".wav")
+    suffix = Path(safe_name).suffix.lower()
+    if suffix not in VOICE_REFERENCE_SUFFIXES:
+        allowed = ", ".join(sorted(VOICE_REFERENCE_SUFFIXES))
+        raise HTTPException(status_code=422, detail=f"Unsupported voice reference format. Use: {allowed}")
+    if audio.content_type and not (
+        audio.content_type.startswith("audio/") or audio.content_type == "application/octet-stream"
+    ):
+        raise HTTPException(status_code=422, detail="The clone reference must be an audio file.")
+
+    output_root = Path("output")
+    output_root.mkdir(parents=True, exist_ok=True)
+    destination = output_root / f"{uuid4().hex}_voice_reference{suffix}"
+    await save_upload_file(audio, destination)
+    if destination.stat().st_size <= 0:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail="The clone reference audio is empty.")
+
+    return {
+        "path": f"/media/{destination.name}",
+        "filename": safe_name,
+    }
+
+
 @stream_router.post("/render-script")
-async def render_edited_script(request: RenderScriptRequest) -> StreamingResponse:
+async def render_edited_script(request: Request, payload: RenderScriptRequest) -> StreamingResponse:
+    clone_reference_audio_path: Path | None = None
+    if payload.voice_mode == "clone":
+        clone_reference_audio_path = _output_media_path(
+            payload.clone_reference_audio_path or "",
+            field_name="clone_reference_audio_path",
+        )
+        if not clone_reference_audio_path.is_file():
+            raise HTTPException(status_code=404, detail="Clone reference audio not found.")
+
     config = PipelineConfig(
-        target_language=request.target_language,
-        translation_provider=request.translation_provider,
-        translation_model=request.translation_model,
-        voice_model=request.voice_model,
-        tts_device=request.tts_device,
-        background_volume=request.background_volume,
-        tts_volume=request.tts_volume,
-        burn_subtitles=request.burn_subtitles,
+        target_language=payload.target_language,
+        translation_provider=payload.translation_provider,
+        translation_model=payload.translation_model,
+        voice_model=payload.voice_model,
+        voice_mode=payload.voice_mode,
+        clone_reference_audio_path=(
+            str(clone_reference_audio_path) if clone_reference_audio_path is not None else None
+        ),
+        tts_device="cuda",
+        background_volume=payload.background_volume,
+        tts_volume=payload.tts_volume,
+        burn_subtitles=payload.burn_subtitles,
         mock_translation=False,
-        mock_tts=request.mock_tts,
+        mock_tts=False,
+        copyright_confirmed=payload.copyright_confirmed,
+        copyright_source=payload.copyright_source,
+        copyright_notes=payload.copyright_notes,
     )
-    source_video_path = _output_media_path(request.source_video_path)
+    _require_copyright_preflight(config)
+    source_video_path = _output_media_path(payload.source_video_path)
     workspace_manager = WorkspaceManager()
     workspace = workspace_manager.create()
 
-    def events():
-        try:
-            yield from AutoDubbingPipeline(config).render_script(
-                workspace=workspace,
-                source_video_path=source_video_path,
-                script_segments=request.segments,
-            )
-        finally:
-            workspace_manager.cleanup(workspace)
-
-    return StreamingResponse(
-        events(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    return _streaming_pipeline_response(
+        request,
+        workspace_manager,
+        workspace,
+        lambda cancel_event: AutoDubbingPipeline(config, cancel_event=cancel_event).render_script(
+            workspace=workspace,
+            source_video_path=source_video_path,
+            script_segments=payload.segments,
+        ),
     )
 
 
@@ -463,7 +602,10 @@ async def dub_video(
     tts_volume: float = Form(default=1.0),
     burn_subtitles: bool = Form(default=True),
     mock_translation: bool = Form(default=False),
-    mock_tts: bool = Form(default=True),
+    mock_tts: bool = Form(default=False),
+    copyright_confirmed: bool = Form(default=False),
+    copyright_source: str = Form(default="unknown"),
+    copyright_notes: str = Form(default=""),
 ) -> DubbingResponse:
     try:
         config = _config_from_form(
@@ -481,10 +623,16 @@ async def dub_video(
             burn_subtitles,
             mock_translation,
             mock_tts,
+            copyright_confirmed=copyright_confirmed,
+            copyright_source=copyright_source,
+            copyright_notes=copyright_notes,
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    _require_copyright_preflight(config)
     suffix = Path(safe_filename(file.filename)).suffix or ".mp4"
     with tempfile.TemporaryDirectory(prefix="dub_upload_") as upload_dir:
         input_path = Path(upload_dir) / f"input{suffix}"
@@ -514,7 +662,10 @@ async def dub_video_with_srt(
     tts_volume: float = Form(default=1.0),
     burn_subtitles: bool = Form(default=True),
     mock_translation: bool = Form(default=False),
-    mock_tts: bool = Form(default=True),
+    mock_tts: bool = Form(default=False),
+    copyright_confirmed: bool = Form(default=False),
+    copyright_source: str = Form(default="unknown"),
+    copyright_notes: str = Form(default=""),
 ) -> DubbingResponse:
     try:
         config = _config_from_form(
@@ -532,10 +683,16 @@ async def dub_video_with_srt(
             burn_subtitles,
             mock_translation,
             mock_tts,
+            copyright_confirmed=copyright_confirmed,
+            copyright_source=copyright_source,
+            copyright_notes=copyright_notes,
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    _require_copyright_preflight(config)
     video_suffix = Path(safe_filename(video.filename)).suffix or ".mp4"
     subtitle_suffix = Path(safe_filename(subtitle.filename)).suffix or ".srt"
     with tempfile.TemporaryDirectory(prefix="dub_srt_upload_") as upload_dir:
@@ -568,7 +725,10 @@ async def batch_dub_videos(
     tts_volume: float = Form(default=1.0),
     burn_subtitles: bool = Form(default=True),
     mock_translation: bool = Form(default=False),
-    mock_tts: bool = Form(default=True),
+    mock_tts: bool = Form(default=False),
+    copyright_confirmed: bool = Form(default=False),
+    copyright_source: str = Form(default="unknown"),
+    copyright_notes: str = Form(default=""),
 ) -> BatchDubbingResponse:
     try:
         config = _config_from_form(
@@ -586,10 +746,16 @@ async def batch_dub_videos(
             burn_subtitles,
             mock_translation,
             mock_tts,
+            copyright_confirmed=copyright_confirmed,
+            copyright_source=copyright_source,
+            copyright_notes=copyright_notes,
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    _require_copyright_preflight(config)
     with tempfile.TemporaryDirectory(prefix="dub_batch_upload_") as upload_dir:
         video_paths: list[Path] = []
         for index, upload in enumerate(files):
@@ -712,7 +878,8 @@ def transcribe(request: TranscribeRequest) -> list[dict[str, object]]:
         except ImportError as exc:
             raise RuntimeError("torch and whisperx are required for transcription.") from exc
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        DependencyService().require_cuda()
+        device = "cuda"
         audio = whisperx.load_audio(str(audio_path))
         with model_registry.acquire_whisperx_asr(
             whisperx,
@@ -721,7 +888,7 @@ def transcribe(request: TranscribeRequest) -> list[dict[str, object]]:
             compute_type="int8",
             language=None,
         ) as model:
-            result = model.transcribe(audio, batch_size=4 if device == "cuda" else 1, language=None)
+            result = model.transcribe(audio, batch_size=4, language=None)
 
         VRAMManager.cleanup()
         language_code = result.get("language") or "en"
@@ -755,6 +922,7 @@ def transcribe(request: TranscribeRequest) -> list[dict[str, object]]:
 
 @compat_router.post("/process-video")
 async def process_video_stream(
+    request: Request,
     video: UploadFile = File(...),
     source_language: str | None = Form(default=None),
     target_language: str = Form(default="en"),
@@ -767,12 +935,15 @@ async def process_video_stream(
     tts_volume: float = Form(default=1.0),
     burn_subtitles: bool = Form(default=True),
     mock_translation: bool = Form(default=False),
-    mock_tts: bool = Form(default=True),
+    mock_tts: bool = Form(default=False),
     ocr_fallback: bool = Form(default=True),
     ocr_force: bool = Form(default=False),
     ocr_model: str = Form(default=""),
     ocr_interval_seconds: float = Form(default=0.75),
     ocr_crop_bottom_ratio: float = Form(default=0.35),
+    copyright_confirmed: bool = Form(default=False),
+    copyright_source: str = Form(default="unknown"),
+    copyright_notes: str = Form(default=""),
 ) -> StreamingResponse:
     """Compatibility endpoint for browser direct fetch streaming.
 
@@ -788,18 +959,22 @@ async def process_video_stream(
         translation_model=translation_model,
         word_timestamps=word_timestamps,
         voice_model=voice_model,
-        tts_device=tts_device,
+        tts_device="cuda",
         background_volume=background_volume,
         tts_volume=tts_volume,
         burn_subtitles=burn_subtitles,
         mock_translation=mock_translation,
-        mock_tts=mock_tts,
+        mock_tts=False,
+        copyright_confirmed=copyright_confirmed,
+        copyright_source=copyright_source,
+        copyright_notes=copyright_notes,
         ocr_fallback=ocr_fallback,
         ocr_force=ocr_force,
         ocr_model=ocr_model,
         ocr_interval_seconds=ocr_interval_seconds,
         ocr_crop_bottom_ratio=ocr_crop_bottom_ratio,
     )
+    _require_copyright_preflight(config)
 
     workspace_manager = WorkspaceManager()
     workspace = workspace_manager.create()
@@ -809,16 +984,11 @@ async def process_video_stream(
         workspace_manager.cleanup(workspace)
         raise
 
-    def events():
-        try:
-            yield from AutoDubbingPipeline(config).run(workspace)
-        finally:
-            workspace_manager.cleanup(workspace)
-
-    return StreamingResponse(
-        events(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    return _streaming_pipeline_response(
+        request,
+        workspace_manager,
+        workspace,
+        lambda cancel_event: AutoDubbingPipeline(config, cancel_event=cancel_event).run(workspace),
     )
 
 

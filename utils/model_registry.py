@@ -171,7 +171,7 @@ class ModelRegistry:
     def __init__(self) -> None:
         self._handles: dict[tuple[Any, ...], _ModelHandle] = {}
         self._lock = threading.RLock()
-        self.cpu_offload = _env_flag("AUTODUB_CPU_OFFLOAD", True)
+        self.cpu_offload = _env_flag("AUTODUB_CPU_OFFLOAD", False)
 
     def _handle(
         self,
@@ -278,7 +278,9 @@ class ModelRegistry:
             import torch
             import whisperx
 
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA is required for model preload")
+            device = "cuda"
             if "asr" in preload_targets or "all" in preload_targets:
                 arch = os.environ.get("AUTODUB_PRELOAD_ASR_MODEL", "base")
                 compute_type = os.environ.get("AUTODUB_PRELOAD_COMPUTE_TYPE", "int8")
@@ -305,9 +307,7 @@ class ModelRegistry:
                     pass
 
             if "tts" in preload_targets or "all" in preload_targets:
-                tts_device = os.environ.get("AUTODUB_PRELOAD_TTS_DEVICE", device)
-                backend = "pytorch" if tts_device == "cuda" else "onnx"
-                with self.acquire_vieneu(device=tts_device, backend=backend):
+                with self.acquire_vieneu(device="cuda", backend="pytorch"):
                     pass
         except Exception:
             logger.warning("model_registry.preload.failed", exc_info=True)
