@@ -70,6 +70,7 @@ def translate_text(
     model: str | None = None,
     timeout: float = 30.0,
     cancel_event: Event | None = None,
+    failed_models: set[str] | None = None,
 ) -> str:
     clean_text = text.strip()
     if not clean_text:
@@ -95,6 +96,7 @@ def translate_text(
                 api_key=_nine_router_api_key() or "",
                 timeout=timeout,
                 cancel_event=cancel_event,
+                failed_models=failed_models,
             )
             return _fallback_if_bad_translation(
                 clean_text,
@@ -144,6 +146,7 @@ def translate_segments(
     selected_provider = (provider or _config_value("AUTODUB_TRANSLATION_PROVIDER") or "9router").strip().lower()
     selected_model = _selected_translation_model(model)
     clean_texts = [text.strip() for text in texts]
+    failed_models: set[str] = set()
 
     if selected_provider in {"mock", "none", "off"}:
         return [f"[{target}] {text}" if text else text for text in clean_texts]
@@ -180,6 +183,7 @@ def translate_segments(
                     api_key=_nine_router_api_key() or "",
                     timeout=timeout,
                     cancel_event=cancel_event,
+                    failed_models=failed_models,
                 )
             )
         except Exception as exc:
@@ -202,6 +206,7 @@ def translate_segments(
                         model=selected_model,
                         timeout=timeout,
                         cancel_event=cancel_event,
+                        failed_models=failed_models,
                     )
                     if text
                     else text
@@ -224,6 +229,7 @@ def translate_segments(
                 model=selected_model,
                 timeout=timeout,
                 cancel_event=cancel_event,
+                failed_models=failed_models,
             )
             if text
             else text
@@ -350,11 +356,15 @@ def _translate_9router_text_with_model_fallback(
     api_key: str,
     timeout: float,
     cancel_event: Event | None = None,
+    failed_models: set[str] | None = None,
 ) -> str:
     last_error: Exception | None = None
     _raise_if_cancelled(cancel_event)
     attempt_timeout = _translation_attempt_timeout(timeout)
-    for model in _translation_model_attempts(selected_model):
+    attempt_models = _translation_model_attempts(selected_model, failed_models=failed_models)
+    if not attempt_models:
+        raise RuntimeError("No 9Router translation models left after failed attempts")
+    for model in attempt_models:
         try:
             return _with_connection_refused_retries(
                 lambda: _translate_9router_cached(text, source, target, model, base_url, api_key, attempt_timeout),
@@ -366,6 +376,7 @@ def _translate_9router_text_with_model_fallback(
             )
         except Exception as exc:
             last_error = exc
+            _remember_failed_translation_model(model, failed_models)
             logger.warning(
                 "translation.model_attempt_failed model=%s source=%s target=%s error=%s",
                 model,
@@ -388,11 +399,15 @@ def _translate_9router_segments_with_model_fallback(
     api_key: str,
     timeout: float,
     cancel_event: Event | None = None,
+    failed_models: set[str] | None = None,
 ) -> list[str]:
     last_error: Exception | None = None
     _raise_if_cancelled(cancel_event)
     attempt_timeout = _translation_attempt_timeout(timeout)
-    for model in _translation_model_attempts(selected_model):
+    attempt_models = _translation_model_attempts(selected_model, failed_models=failed_models)
+    if not attempt_models:
+        raise RuntimeError("No 9Router translation models left after failed attempts")
+    for model in attempt_models:
         try:
             return _with_connection_refused_retries(
                 lambda: _translate_9router_segments_cached(
@@ -412,6 +427,7 @@ def _translate_9router_segments_with_model_fallback(
             )
         except Exception as exc:
             last_error = exc
+            _remember_failed_translation_model(model, failed_models)
             logger.warning(
                 "translation.batch_model_attempt_failed model=%s source=%s target=%s batch_size=%s error=%s",
                 model,
@@ -440,6 +456,7 @@ def _translate_9router_segments_with_model_fallback(
                 api_key=api_key,
                 timeout=timeout,
                 cancel_event=cancel_event,
+                failed_models=failed_models,
             ),
             *_translate_9router_segments_with_model_fallback(
                 texts[midpoint:],
@@ -450,6 +467,7 @@ def _translate_9router_segments_with_model_fallback(
                 api_key=api_key,
                 timeout=timeout,
                 cancel_event=cancel_event,
+                failed_models=failed_models,
             ),
         ]
     if last_error is not None:
@@ -517,12 +535,15 @@ def _translate_9router_cached(
             {
                 "role": "system",
                 "content": (
-                    "You are a senior audiovisual translator for dubbing and subtitles. "
-                    "Translate meaning faithfully, not word-by-word. Preserve speaker intent, "
-                    "tone, negation, names, numbers, money amounts, slang intensity, and implied "
-                    "relationships. If the source is a short fragment, keep a natural short "
-                    "fragment in the target language. Return only the translated line, with no "
-                    "markdown, labels, notes, romanization, pinyin, or explanation."
+                    "You are a senior audiovisual translator and Vietnamese film-review storyteller. "
+                    "Translate the meaning faithfully, then phrase it as natural spoken narration for "
+                    "a movie review: cinematic, confident, creative, and lightly inspirational when "
+                    "the source allows it. Preserve speaker intent, tone, negation, names, numbers, "
+                    "money amounts, slang intensity, and implied relationships. Do not invent plot "
+                    "facts, jokes, motives, or expert claims not supported by the source. If the "
+                    "source is a short fragment, keep a natural short fragment in the target language. "
+                    "Return only the translated line, with no markdown, labels, notes, romanization, "
+                    "pinyin, or explanation."
                 ),
             },
             {
@@ -592,10 +613,11 @@ def _shorten_9router_cached(
             {
                 "role": "system",
                 "content": (
-                    "You are a professional dubbing script editor. Shorten translated dialogue "
-                    "so a TTS voice can read it inside the target timing while preserving the "
-                    "core meaning, tone, names, numbers, and intent. Return only the shortened "
-                    "line, with no markdown, labels, quotes, or explanation."
+                    "You are a professional dubbing script editor for cinematic review narration. "
+                    "Shorten translated dialogue only as much as needed for a natural speaking pace, "
+                    "while preserving the core meaning, tone, names, numbers, and intent. Keep the "
+                    "line vivid and review-like when possible, but never summarize away the meaning. "
+                    "Return only the shortened line, with no markdown, labels, quotes, or explanation."
                 ),
             },
             {
@@ -610,9 +632,10 @@ def _shorten_9router_cached(
                         "current_translation": text,
                         "context": context,
                         "rules": [
-                            "Keep the result natural for dubbing, not a literal summary.",
+                            "Keep the result natural for dubbing and cinematic review narration, not a literal summary.",
                             "Preserve the main action, speaker attitude, names, numbers, money amounts, and negation.",
                             "Drop filler words, particles, duplicate phrasing, and nonessential politeness first.",
+                            "Do not remove the hook, emotional direction, or key judgment if it is present in the source.",
                             "For Vietnamese, use short spoken Vietnamese and avoid Chinese/Japanese/Korean characters unless they are names.",
                             "Return exactly one shortened line.",
                         ],
@@ -666,11 +689,14 @@ def _translate_9router_segments_cached(
             {
                 "role": "system",
                 "content": (
-                    "You are a senior audiovisual translator for dubbing and subtitle timelines. "
-                    "Translate each numbered segment faithfully while using neighboring segments "
-                    "only as context. Preserve the timing-friendly brevity of short lines without "
-                    "dropping important meaning. Infer omitted subjects conservatively; do not add "
-                    "new facts, jokes, moralizing, or explanations. Return only valid JSON, with no "
+                    "You are a senior audiovisual translator and Vietnamese film-review storyteller "
+                    "for dubbing and subtitle timelines. Translate each numbered segment faithfully "
+                    "while using neighboring segments only as context. Phrase the Vietnamese like a "
+                    "natural movie-review narration: cinematic, confident, creative, and gently "
+                    "inspirational when the source supports it. Preserve the timing-friendly brevity "
+                    "of short lines without dropping important meaning. Infer omitted subjects "
+                    "conservatively; do not add new facts, jokes, moralizing, plot details, or "
+                    "expert opinions not implied by the source. Return only valid JSON, with no "
                     "markdown, notes, romanization, pinyin, or source-language text unless it is a "
                     "proper name."
                 ),
@@ -832,15 +858,17 @@ def _translation_texts_from_objects(items: list[object], *, expected_count: int 
 def _translation_rules(target: str) -> list[str]:
     rules = [
         "Translate the intent and pragmatic meaning, not a literal word-by-word gloss.",
+        "Stay semantically close: do not change who did what, the judgment, the emotion, or the stakes.",
         "Preserve negation, modality, speaker attitude, names, numbers, units, and money amounts.",
         "Keep very short replies short. If the source is a fragment, return a natural target-language fragment.",
-        "Do not add explanations, apologies, safety disclaimers, or content not implied by the source.",
+        "Do not add explanations, apologies, safety disclaimers, plot facts, or content not implied by the source.",
         "Preserve profanity/slang intensity when present, but make it natural in the target language.",
     ]
     if target.startswith("vi"):
         rules.extend(
             [
-                "Use natural spoken Vietnamese suitable for dubbing.",
+                "Use natural spoken Vietnamese suitable for dubbing and movie-review narration.",
+                "Let the phrasing sound like a sharp, charismatic reviewer, but keep every factual meaning anchored to the source.",
                 "Do not copy Chinese/Japanese/Korean characters into Vietnamese output unless they are proper names.",
                 "Avoid word-by-word Sino-Vietnamese. Prefer everyday Vietnamese phrasing.",
                 "Translate Chinese money colloquialisms like 块/块钱 as tệ/đồng depending on context, not đô la.",
@@ -1287,14 +1315,34 @@ def _selected_translation_model(model: str | None) -> str:
     )
 
 
-def _translation_model_attempts(primary_model: str) -> list[str]:
+def _translation_model_attempts(primary_model: str, *, failed_models: set[str] | None = None) -> list[str]:
     configured_fallbacks = _config_value("AUTODUB_TRANSLATION_FALLBACK_MODELS") or ""
     fallback_models = (
         [item.strip() for item in configured_fallbacks.split(",") if item.strip()]
         if configured_fallbacks.strip()
         else DEFAULT_TRANSLATION_FALLBACK_MODELS
     )
-    return _dedupe_models([_gateway_model_id(model) for model in [primary_model, *fallback_models]])
+    attempts = _dedupe_models([_gateway_model_id(model) for model in [primary_model, *fallback_models]])
+    if not failed_models:
+        return attempts
+
+    skipped = {model for model in attempts if model in failed_models}
+    if skipped:
+        logger.info(
+            "translation.model_attempts.skip_failed models=%s",
+            ",".join(sorted(skipped)),
+        )
+    return [model for model in attempts if model not in failed_models]
+
+
+def _remember_failed_translation_model(model: str, failed_models: set[str] | None) -> None:
+    if failed_models is None:
+        return
+    normalized = _gateway_model_id(model)
+    if normalized in failed_models:
+        return
+    failed_models.add(normalized)
+    logger.warning("translation.model_marked_failed model=%s", normalized)
 
 
 def _api_url(base_url: str, path: str) -> str:

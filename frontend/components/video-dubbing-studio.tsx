@@ -20,8 +20,10 @@ import {
   Wand2,
   X,
 } from "lucide-react";
-import { ChangeEvent, DragEvent, PointerEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import AudioClipSelector, { PreparedAudioClip } from "./audio-clip-selector";
 import GenVideoPipeline from "./genvideo-pipeline";
+import { deleteSessionFiles, readSessionFile, writeSessionFile } from '@/lib/session-files';
 
 const BACKEND_URL = "http://localhost:8000";
 const ANALYZE_URL = `${BACKEND_URL}/api/analyze-stream`;
@@ -34,6 +36,8 @@ const DEFAULT_TRANSLATION_MODEL = "ag/gemini-3-flash-agent";
 const DEFAULT_OCR_MODEL = "gemini/gemini-2.5-flash";
 const DEFAULT_ASR_MODEL = "base";
 const VI_WORDS_PER_SECOND = 3;
+const STUDIO_SESSION_KEY = 'video-clone:studio-session:v1';
+const STUDIO_SESSION_VERSION = 1;
 
 type CopyrightSource = "unknown" | "owned" | "licensed" | "public_domain" | "permission" | "platform_library";
 type VoiceMode = "system" | "clone";
@@ -113,15 +117,44 @@ type ProcessingStats = {
   video_duration?: number;
   characters?: number;
   chunks?: number;
+  segment_id?: number;
   engine?: string;
 };
 
 type ProcessingActivity = {
   id: number;
+  key: string;
+  phase: string;
   label: string;
   detail: string;
   progress: number;
+  stats: ProcessingStats | null;
 };
+
+type StudioSessionSnapshot = {
+  version: number;
+  sessionId: string;
+  activeWorkspace: 'clone' | 'gen';
+  sourceVideoUrl: string;
+  segments: ScriptSegment[];
+  config: StudioConfig;
+  activeStep: number;
+  selectedSegmentId: number | null;
+  progress: number;
+  statusText: string;
+  processingPhase: string;
+  processingDetail: string;
+  processingStats: ProcessingStats | null;
+  processingActivities: ProcessingActivity[];
+  resultVideoUrl: string;
+  resultSubtitleUrl: string;
+  textLayerEnabled: boolean;
+  savedDemoSegments: ScriptSegment[] | null;
+  savedTextLayerEnabled: boolean | null;
+  cloneClipSelection: Pick<PreparedAudioClip, 'start' | 'end' | 'sourceDuration'> | null;
+};
+
+type SessionSaveStatus = 'loading' | 'saved' | 'error';
 
 const workflowSteps = ["Video", "Nhận dạng", "Dịch thuật", "Lồng tiếng", "Xuất bản"];
 
@@ -377,16 +410,30 @@ function phaseLabel(phase: string) {
   }
 }
 
+function segmentProgress(stats: ProcessingStats | null) {
+  if (!stats || typeof stats.chunks !== "number" || typeof stats.segments !== "number" || stats.segments <= 0) return null;
+  const done = Math.min(stats.segments, Math.max(0, stats.chunks));
+  return { done, total: stats.segments, percent: clampProgress((done / stats.segments) * 100) };
+}
+
 function statsSummary(stats: ProcessingStats | null) {
   if (!stats) return "";
+  const voiceProgress = segmentProgress(stats);
+  if (voiceProgress) return `Đã tạo ${voiceProgress.done}/${voiceProgress.total} đoạn voice`;
+
   const items = [];
   if (typeof stats.engine === "string" && stats.engine) items.push(stats.engine);
   if (typeof stats.segments === "number") items.push(`${stats.segments} đoạn`);
-  if (typeof stats.chunks === "number") items.push(`${stats.chunks} audio`);
   if (typeof stats.speech_duration === "number" && stats.speech_duration > 0) items.push(`${formatTime(stats.speech_duration)} thoại`);
   if (typeof stats.video_duration === "number" && stats.video_duration > 0) items.push(`${formatTime(stats.video_duration)} video`);
   if (typeof stats.characters === "number" && stats.characters > 0) items.push(`${stats.characters} ký tự`);
   return items.join(" · ");
+}
+
+function activityProgressLabel(activity: ProcessingActivity) {
+  const voiceProgress = segmentProgress(activity.stats);
+  if (voiceProgress) return `${voiceProgress.done}/${voiceProgress.total}`;
+  return `${activity.progress}%`;
 }
 
 function modelOptionsFromPayload(payload: { models?: Array<{ id?: string; label?: string }> }) {
@@ -414,6 +461,11 @@ function preferredTranslationModel(
 export default function VideoDubbingStudio() {
   const inputRef = useRef<HTMLInputElement | null>(null);
   const translationModelTouchedRef = useRef(false);
+  const persistenceReadyRef = useRef(false);
+  const sessionIdRef = useRef('');
+  const lastStoredVideoFileRef = useRef<File | null>(null);
+  const lastStoredCloneFileRef = useRef<File | null>(null);
+  const pendingFileSavesRef = useRef(0);
   const [activeWorkspace, setActiveWorkspace] = useState<"clone" | "gen">("clone");
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
@@ -441,6 +493,8 @@ export default function VideoDubbingStudio() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isRendering, setIsRendering] = useState(false);
   const [cloneReferenceFile, setCloneReferenceFile] = useState<File | null>(null);
+  const [preparedCloneClip, setPreparedCloneClip] = useState<PreparedAudioClip | null>(null);
+  const [initialCloneSelection, setInitialCloneSelection] = useState<{ start: number; end: number } | null>(null);
   const [shorteningSegmentId, setShorteningSegmentId] = useState<number | null>(null);
   const [selectedSegmentId, setSelectedSegmentId] = useState<number | null>(null);
   const [progress, setProgress] = useState(0);
@@ -455,6 +509,13 @@ export default function VideoDubbingStudio() {
   const [savedDemoSegments, setSavedDemoSegments] = useState<ScriptSegment[] | null>(null);
   const [savedTextLayerEnabled, setSavedTextLayerEnabled] = useState<boolean | null>(null);
   const [toast, setToast] = useState<ToastState>(null);
+  const [sessionSaveStatus, setSessionSaveStatus] = useState<SessionSaveStatus>('loading');
+  const [sessionHydrated, setSessionHydrated] = useState(false);
+
+  const handleCloneClipError = useCallback((message: string) => {
+    setToast({ type: "error", message });
+    window.setTimeout(() => setToast(null), 5200);
+  }, []);
 
   const totalDuration = useMemo(() => {
     if (segments.length === 0) return 0;
@@ -476,6 +537,202 @@ export default function VideoDubbingStudio() {
   );
   const hasSavedDemo = Boolean(savedDemoSegments?.length);
   const hasUnsavedDemoChanges = segments.length > 0 && currentDemoSignature !== savedDemoSignature;
+  const sessionSnapshot = useMemo<StudioSessionSnapshot>(() => ({
+    version: STUDIO_SESSION_VERSION,
+    sessionId: sessionIdRef.current,
+    activeWorkspace,
+    sourceVideoUrl: sourceVideoUrl.startsWith('blob:') ? '' : sourceVideoUrl,
+    segments,
+    config,
+    activeStep,
+    selectedSegmentId,
+    progress,
+    statusText,
+    processingPhase,
+    processingDetail,
+    processingStats,
+    processingActivities,
+    resultVideoUrl: resultVideoUrl.startsWith('blob:') ? '' : resultVideoUrl,
+    resultSubtitleUrl: resultSubtitleUrl.startsWith('blob:') ? '' : resultSubtitleUrl,
+    textLayerEnabled,
+    savedDemoSegments,
+    savedTextLayerEnabled,
+    cloneClipSelection: preparedCloneClip
+      ? {
+          start: preparedCloneClip.start,
+          end: preparedCloneClip.end,
+          sourceDuration: preparedCloneClip.sourceDuration,
+        }
+      : initialCloneSelection
+        ? { ...initialCloneSelection, sourceDuration: 0 }
+        : null,
+  }), [
+    activeStep,
+    activeWorkspace,
+    config,
+    initialCloneSelection,
+    preparedCloneClip,
+    processingActivities,
+    processingDetail,
+    processingPhase,
+    processingStats,
+    progress,
+    resultSubtitleUrl,
+    resultVideoUrl,
+    savedDemoSegments,
+    savedTextLayerEnabled,
+    segments,
+    selectedSegmentId,
+    sessionHydrated,
+    sourceVideoUrl,
+    statusText,
+    textLayerEnabled,
+  ]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function restoreSession() {
+      let snapshot: StudioSessionSnapshot | null = null;
+      let fileStoreFailed = false;
+
+      try {
+        const stored = window.sessionStorage.getItem(STUDIO_SESSION_KEY);
+        if (stored) {
+          const parsed = JSON.parse(stored) as StudioSessionSnapshot;
+          if (parsed.version === STUDIO_SESSION_VERSION && parsed.sessionId) snapshot = parsed;
+        }
+      } catch {
+        window.sessionStorage.removeItem(STUDIO_SESSION_KEY);
+      }
+
+      const sessionId = snapshot?.sessionId || window.crypto.randomUUID();
+      sessionIdRef.current = sessionId;
+
+      if (snapshot) {
+        const restoredConfig = { ...config, ...snapshot.config };
+        const restoredSegments = Array.isArray(snapshot.segments)
+          ? snapshot.segments.map((segment) => normalizeSegment(segment, restoredConfig.voiceModel))
+          : [];
+        const restoredSavedSegments = Array.isArray(snapshot.savedDemoSegments)
+          ? snapshot.savedDemoSegments.map((segment) => normalizeSegment(segment, restoredConfig.voiceModel))
+          : null;
+
+        translationModelTouchedRef.current = Boolean(snapshot.config?.translationModel);
+        setActiveWorkspace(snapshot.activeWorkspace === 'gen' ? 'gen' : 'clone');
+        setSourceVideoUrl(snapshot.sourceVideoUrl || '');
+        setSegments(restoredSegments);
+        setConfig(restoredConfig);
+        setActiveStep(clampNumber(snapshot.activeStep, 0, workflowSteps.length - 1));
+        setSelectedSegmentId(snapshot.selectedSegmentId ?? restoredSegments[0]?.id ?? null);
+        setProgress(clampProgress(snapshot.progress));
+        setStatusText(snapshot.statusText || 'Đã khôi phục session');
+        setProcessingPhase(snapshot.processingPhase || '');
+        setProcessingDetail(snapshot.processingDetail || '');
+        setProcessingStats(snapshot.processingStats || null);
+        setProcessingActivities(Array.isArray(snapshot.processingActivities) ? snapshot.processingActivities : []);
+        setResultVideoUrl(snapshot.resultVideoUrl || '');
+        setResultSubtitleUrl(snapshot.resultSubtitleUrl || '');
+        setTextLayerEnabled(snapshot.textLayerEnabled ?? true);
+        setSavedDemoSegments(restoredSavedSegments);
+        setSavedTextLayerEnabled(snapshot.savedTextLayerEnabled ?? null);
+        setInitialCloneSelection(snapshot.cloneClipSelection
+          ? { start: snapshot.cloneClipSelection.start, end: snapshot.cloneClipSelection.end }
+          : null);
+      }
+
+      const safelyReadFile = async (key: string) => {
+        try {
+          return await readSessionFile(key);
+        } catch {
+          fileStoreFailed = true;
+          return null;
+        }
+      };
+      const [restoredVideoFile, restoredCloneFile] = await Promise.all([
+        safelyReadFile(`${sessionId}:video`),
+        safelyReadFile(`${sessionId}:clone-reference`),
+      ]);
+
+      if (!cancelled) {
+        if (restoredVideoFile) {
+          lastStoredVideoFileRef.current = restoredVideoFile;
+          setFile(restoredVideoFile);
+          setPreviewUrl(URL.createObjectURL(restoredVideoFile));
+        }
+        if (restoredCloneFile) {
+          lastStoredCloneFileRef.current = restoredCloneFile;
+          setCloneReferenceFile(restoredCloneFile);
+        }
+        persistenceReadyRef.current = true;
+        setSessionHydrated(true);
+        setSessionSaveStatus(fileStoreFailed ? 'error' : 'saved');
+      }
+    }
+
+    void restoreSession();
+    return () => {
+      cancelled = true;
+    };
+    // The initial config is intentionally captured once, before model discovery updates it.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!persistenceReadyRef.current || !sessionSnapshot.sessionId) return;
+
+    const persistSnapshot = () => {
+      try {
+        window.sessionStorage.setItem(STUDIO_SESSION_KEY, JSON.stringify(sessionSnapshot));
+      } catch {
+        setSessionSaveStatus('error');
+      }
+    };
+    const timer = window.setTimeout(persistSnapshot, 180);
+    window.addEventListener('pagehide', persistSnapshot);
+    return () => {
+      window.clearTimeout(timer);
+      window.removeEventListener('pagehide', persistSnapshot);
+    };
+  }, [sessionSnapshot]);
+
+  useEffect(() => {
+    if (!persistenceReadyRef.current || !sessionIdRef.current || file === lastStoredVideoFileRef.current) return;
+    const nextFile = file;
+    pendingFileSavesRef.current += 1;
+    setSessionSaveStatus('loading');
+    void writeSessionFile(`${sessionIdRef.current}:video`, nextFile)
+      .then(() => {
+        lastStoredVideoFileRef.current = nextFile;
+        pendingFileSavesRef.current -= 1;
+        if (pendingFileSavesRef.current === 0) setSessionSaveStatus('saved');
+      })
+      .catch(() => {
+        pendingFileSavesRef.current -= 1;
+        setSessionSaveStatus('error');
+      });
+  }, [file]);
+
+  useEffect(() => {
+    if (!persistenceReadyRef.current || !sessionIdRef.current || cloneReferenceFile === lastStoredCloneFileRef.current) return;
+    const nextFile = cloneReferenceFile;
+    pendingFileSavesRef.current += 1;
+    setSessionSaveStatus('loading');
+    void writeSessionFile(`${sessionIdRef.current}:clone-reference`, nextFile)
+      .then(() => {
+        lastStoredCloneFileRef.current = nextFile;
+        pendingFileSavesRef.current -= 1;
+        if (pendingFileSavesRef.current === 0) setSessionSaveStatus('saved');
+      })
+      .catch(() => {
+        pendingFileSavesRef.current -= 1;
+        setSessionSaveStatus('error');
+      });
+  }, [cloneReferenceFile]);
+
+  useEffect(() => () => {
+    if (previewUrl.startsWith('blob:')) URL.revokeObjectURL(previewUrl);
+  }, [previewUrl]);
   const copyrightReady = config.copyrightAcknowledged && config.copyrightSource !== "unknown";
 
   useEffect(() => {
@@ -553,6 +810,76 @@ export default function VideoDubbingStudio() {
     window.setTimeout(() => setToast(null), 5200);
   }
 
+  async function startNewSession() {
+    if ((file || sourceVideoUrl || segments.length > 0) && !window.confirm('Tạo session mới? Dữ liệu của session hiện tại sẽ bị xóa khỏi trình duyệt.')) {
+      return;
+    }
+
+    const previousSessionId = sessionIdRef.current;
+    persistenceReadyRef.current = false;
+    setSessionSaveStatus('loading');
+    window.sessionStorage.removeItem(STUDIO_SESSION_KEY);
+    if (previewUrl.startsWith('blob:')) URL.revokeObjectURL(previewUrl);
+
+    setActiveWorkspace('clone');
+    setFile(null);
+    setPreviewUrl('');
+    setSourceVideoUrl('');
+    setSegments([]);
+    setConfig({
+      sourceLanguage: 'auto',
+      targetLanguage: 'vi',
+      translationProvider: '9router',
+      translationModel: DEFAULT_TRANSLATION_MODEL,
+      asrModel: DEFAULT_ASR_MODEL,
+      voiceModel: 'Trúc Ly',
+      voiceMode: 'system',
+      ttsDevice: 'cuda',
+      copyrightAcknowledged: false,
+      copyrightSource: 'unknown',
+      copyrightNotes: '',
+      ocrFallback: true,
+      ocrForce: false,
+      ocrModel: DEFAULT_OCR_MODEL,
+    });
+    setActiveStep(0);
+    setCloneReferenceFile(null);
+    setPreparedCloneClip(null);
+    setInitialCloneSelection(null);
+    setSelectedSegmentId(null);
+    setProgress(0);
+    setStatusText('Chưa có video');
+    setProcessingPhase('');
+    setProcessingDetail('');
+    setProcessingStats(null);
+    setProcessingActivities([]);
+    setResultVideoUrl('');
+    setResultSubtitleUrl('');
+    setTextLayerEnabled(true);
+    setSavedDemoSegments(null);
+    setSavedTextLayerEnabled(null);
+    if (inputRef.current) inputRef.current.value = '';
+
+    try {
+      if (previousSessionId) {
+        await deleteSessionFiles([
+          `${previousSessionId}:video`,
+          `${previousSessionId}:clone-reference`,
+        ]);
+      }
+      setSessionSaveStatus('saved');
+    } catch {
+      setSessionSaveStatus('error');
+    } finally {
+      sessionIdRef.current = window.crypto.randomUUID();
+      lastStoredVideoFileRef.current = null;
+      lastStoredCloneFileRef.current = null;
+      pendingFileSavesRef.current = 0;
+      persistenceReadyRef.current = true;
+      setSessionHydrated((current) => !current);
+    }
+  }
+
   function resetProcessing(label: string, nextProgress = 0, phase = "") {
     setProgress(nextProgress);
     setStatusText(label);
@@ -562,11 +889,25 @@ export default function VideoDubbingStudio() {
     setProcessingActivities([]);
   }
 
-  function pushProcessingActivity(label: string, detail: string, nextProgress: number) {
-    setProcessingActivities((current) => [
-      { id: Date.now() + Math.random(), label, detail, progress: nextProgress },
-      ...current,
-    ].slice(0, 5));
+  function pushProcessingActivity(phase: string, label: string, detail: string, nextProgress: number, stats: ProcessingStats | null) {
+    const key = phase || label;
+    setProcessingActivities((current) => {
+      const nextActivity: ProcessingActivity = {
+        id: Date.now() + Math.random(),
+        key,
+        phase,
+        label,
+        detail,
+        progress: nextProgress,
+        stats,
+      };
+      const existingIndex = current.findIndex((activity) => activity.key === key);
+      if (existingIndex === -1) return [nextActivity, ...current].slice(0, 5);
+
+      const existing = current[existingIndex];
+      const updated = { ...nextActivity, id: existing.id };
+      return [updated, ...current.filter((_, index) => index !== existingIndex)].slice(0, 5);
+    });
   }
 
   function handleFile(nextFile: File | undefined) {
@@ -828,7 +1169,7 @@ export default function VideoDubbingStudio() {
         if (parsedProgress === null && inferredProgress !== null) setProgress(inferredProgress);
       }
       if (parsedProgress !== null) setProgress(nextProgress);
-      if (step || phase || detail || stats) pushProcessingActivity(statusLabel, nextDetail || normalizeStage(step), nextProgress);
+      if (step || phase || detail || stats) pushProcessingActivity(phase, statusLabel, nextDetail || normalizeStage(step), nextProgress, stats);
       if (status === "success") {
         setActiveStep(4);
         setProgress(100);
@@ -875,12 +1216,12 @@ export default function VideoDubbingStudio() {
 
   async function uploadCloneReference(): Promise<string | null> {
     if (config.voiceMode === "system") return null;
-    if (!cloneReferenceFile) {
-      throw new Error("Đã chọn luồng clone nhưng chưa có file giọng mẫu.");
+    if (!preparedCloneClip) {
+      throw new Error("Đã chọn luồng clone nhưng chưa có đoạn giọng mẫu hợp lệ.");
     }
 
     const formData = new FormData();
-    formData.append("audio", cloneReferenceFile);
+    formData.append("audio", preparedCloneClip.file);
     const response = await fetch(VOICE_REFERENCE_URL, {
       method: "POST",
       body: formData,
@@ -893,7 +1234,7 @@ export default function VideoDubbingStudio() {
   }
 
   async function renderFinalVideo() {
-    if (!file) {
+    if (!file && !sourceVideoUrl) {
       showToast({ type: "error", message: "Chọn video trước khi render." });
       return;
     }
@@ -906,8 +1247,8 @@ export default function VideoDubbingStudio() {
       showToast({ type: "error", message: "Bấm Lưu demo trước khi render để giữ đúng layout/blur đã chỉnh." });
       return;
     }
-    if (config.voiceMode === "clone" && !cloneReferenceFile) {
-      showToast({ type: "error", message: "Chọn file giọng mẫu trước khi render bằng giọng clone." });
+    if (config.voiceMode === "clone" && !preparedCloneClip) {
+      showToast({ type: "error", message: "Chọn và cắt đoạn giọng mẫu trước khi render bằng giọng clone." });
       return;
     }
     setIsRendering(true);
@@ -1013,6 +1354,20 @@ export default function VideoDubbingStudio() {
           <button className="rounded-md px-4 py-2 hover:bg-slate-100">Hướng Dẫn</button>
         </nav>
 
+        <p
+          className={`hidden items-center gap-2 rounded-md px-3 py-2 text-xs font-semibold md:flex ${
+            sessionSaveStatus === 'error' ? 'bg-amber-50 text-amber-700' : 'bg-blue-50 text-blue-700'
+          }`}
+          aria-live='polite'
+        >
+          {sessionSaveStatus === 'error' ? <AlertCircle size={14} /> : <CheckCircle2 size={14} />}
+          {sessionSaveStatus === 'loading'
+            ? 'Đang lưu/khôi phục session'
+            : sessionSaveStatus === 'saved'
+              ? 'Session đã tự lưu'
+              : 'Không thể tự lưu session'}
+        </p>
+
         <p className="flex items-center gap-2 rounded-md bg-emerald-50 px-3 py-2 text-xs font-semibold text-emerald-700" aria-label="Trạng thái phần cứng CUDA RTX">
           <span className="h-2 w-2 rounded-full bg-emerald-500" aria-hidden="true" />
           CUDA / RTX
@@ -1026,7 +1381,7 @@ export default function VideoDubbingStudio() {
         <aside className="min-w-0 overflow-hidden border-r border-slate-200 bg-white p-5">
           <header className="flex items-center justify-between">
             <h2 className="text-xs font-bold uppercase tracking-wide text-slate-500">Dự án</h2>
-            <button className="inline-flex items-center gap-1 text-xs font-semibold text-blue-700">
+            <button type='button' onClick={() => void startNewSession()} className="inline-flex items-center gap-1 text-xs font-semibold text-blue-700">
               <RefreshCw size={13} />
               Mới
             </button>
@@ -1152,20 +1507,36 @@ export default function VideoDubbingStudio() {
                 </label>
               </div>
               {config.voiceMode === "clone" && (
-                <label className="grid gap-2 text-sm font-medium text-slate-700">
-                  File giọng mẫu (khuyến nghị 3–10 giây, sạch tạp âm)
-                  <input
-                    type="file"
-                    accept="audio/*,.wav,.flac,.mp3,.m4a,.ogg,.opus"
-                    onChange={(event) => setCloneReferenceFile(event.target.files?.[0] ?? null)}
-                    className="block w-full rounded-md border border-blue-200 bg-white px-3 py-2 text-sm file:mr-3 file:rounded file:border-0 file:bg-blue-50 file:px-3 file:py-1 file:font-semibold file:text-blue-700"
-                  />
+                <div className="grid gap-2 text-sm font-medium text-slate-700">
+                  <label className="grid gap-2">
+                    File giọng mẫu (chọn file dài, sau đó cắt đoạn sạch 3–10 giây)
+                    <input
+                      type="file"
+                      accept="audio/*,.wav,.flac,.mp3,.m4a,.ogg,.opus"
+                      onChange={(event) => {
+                        setCloneReferenceFile(event.target.files?.[0] ?? null);
+                        setPreparedCloneClip(null);
+                        setInitialCloneSelection(null);
+                      }}
+                      className="block w-full rounded-md border border-blue-200 bg-white px-3 py-2 text-sm file:mr-3 file:rounded file:border-0 file:bg-blue-50 file:px-3 file:py-1 file:font-semibold file:text-blue-700"
+                    />
+                  </label>
+                  {cloneReferenceFile && (
+                    <AudioClipSelector
+                      file={cloneReferenceFile}
+                      initialSelection={initialCloneSelection}
+                      onClipReady={setPreparedCloneClip}
+                      onError={handleCloneClipError}
+                    />
+                  )}
                   <span className="text-xs text-slate-500">
-                    {cloneReferenceFile
-                      ? `Sẽ dùng duy nhất giọng clone từ: ${cloneReferenceFile.name}`
-                      : "Bắt buộc chọn file. Nếu clone lỗi, tác vụ sẽ dừng; không đổi sang giọng hệ thống."}
+                    {preparedCloneClip
+                      ? `Sẽ dùng đoạn ${preparedCloneClip.start.toFixed(1)}–${preparedCloneClip.end.toFixed(1)} giây từ ${cloneReferenceFile?.name}.`
+                      : cloneReferenceFile
+                        ? "Đang chuẩn bị đoạn âm thanh đã chọn..."
+                        : "Bắt buộc chọn file. Nếu clone lỗi, tác vụ sẽ dừng; không đổi sang giọng hệ thống."}
                   </span>
-                </label>
+                </div>
               )}
             </fieldset>
             {config.voiceMode === "system" && (
@@ -1184,7 +1555,7 @@ export default function VideoDubbingStudio() {
               <span className="truncate">Tách script</span>
             </button>
             <button
-              disabled={!file || isRendering || !copyrightReady || (config.voiceMode === "clone" && !cloneReferenceFile)}
+              disabled={(!file && !sourceVideoUrl) || isRendering || !copyrightReady || (config.voiceMode === "clone" && !preparedCloneClip)}
               onClick={renderFinalVideo}
               className="inline-flex h-10 min-w-0 items-center justify-center gap-2 rounded-md bg-blue-600 px-2 text-sm font-semibold text-white disabled:bg-slate-300"
             >
@@ -1293,15 +1664,25 @@ export default function VideoDubbingStudio() {
 
             {processingActivities.length > 0 && (
               <ol className="mt-4 grid gap-2" aria-label="Hoạt động xử lý gần nhất">
-                {processingActivities.map((activity) => (
-                  <li key={activity.id} className="flex items-start justify-between gap-3 rounded-md border border-slate-100 px-3 py-2 text-sm">
-                    <span className="min-w-0">
-                      <span className="block font-semibold text-slate-900">{activity.label}</span>
-                      <span className="block truncate text-slate-500">{activity.detail || "Đã nhận event từ backend"}</span>
-                    </span>
-                    <span className="shrink-0 rounded bg-slate-100 px-2 py-0.5 text-xs font-bold text-slate-600">{activity.progress}%</span>
-                  </li>
-                ))}
+                {processingActivities.map((activity) => {
+                  const itemProgress = segmentProgress(activity.stats);
+                  return (
+                    <li key={activity.id} className="rounded-md border border-slate-100 bg-slate-50 px-3 py-3 text-sm">
+                      <div className="flex items-start justify-between gap-3">
+                        <span className="min-w-0">
+                          <span className="block font-semibold text-slate-900">{activity.label}</span>
+                          <span className="block truncate text-slate-500">{activity.detail || "Đã nhận event từ backend"}</span>
+                        </span>
+                        <span className="shrink-0 rounded bg-white px-2 py-0.5 text-xs font-bold text-slate-700 shadow-sm">{activityProgressLabel(activity)}</span>
+                      </div>
+                      {itemProgress && (
+                        <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-200" aria-label={`Tiến độ ${activity.label}`}>
+                          <span className="block h-full rounded-full bg-blue-600 transition-all duration-500" style={{ width: `${itemProgress.percent}%` }} />
+                        </div>
+                      )}
+                    </li>
+                  );
+                })}
               </ol>
             )}
           </section>
@@ -2002,7 +2383,7 @@ function TimelineRow({
             </select>
           )}
           <p className={`text-right text-xs ${needsShortening ? "font-semibold text-rose-600" : "text-slate-500"}`}>
-  const speechUnitLabel = hasCjkText(segment.translated_text) ? "ký tự" : "từ";
+            {speechUnits} {speechUnitLabel} / ~{estimatedDuration.toFixed(1)}s voice
           </p>
           {needsShortening && <p className="text-right text-xs font-bold text-rose-600">Cần rút gọn</p>}
         </label>

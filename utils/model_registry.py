@@ -121,6 +121,18 @@ def _move_vieneu_model(model: Any, device: str) -> None:
         engine.device = target
 
 
+def _prepare_vieneu_for_cuda(model: Any) -> None:
+    """Avoid SDPA CUDA kernel crashes seen in Qwen3-based VieNeu inference."""
+    if getattr(model, "backend", None) != "pytorch":
+        return
+
+    semantic_backbone = getattr(getattr(getattr(model, "engine", None), "model", None), "semantic_backbone", None)
+    config = getattr(semantic_backbone, "config", None)
+    if config is not None and getattr(config, "_attn_implementation", None) != "eager":
+        config._attn_implementation = "eager"
+        logger.info("model_registry.vieneu.attention_backend backend=eager")
+
+
 @dataclass(frozen=True)
 class _HandleConfig:
     key: tuple[Any, ...]
@@ -260,7 +272,7 @@ class ModelRegistry:
             return Vieneu(mode="v3turbo", device=device, backend=backend)
 
         handle = self._handle(key, loader, _move_vieneu_model)
-        with handle.acquire(device=device) as model:
+        with handle.acquire(device=device, prepare=_prepare_vieneu_for_cuda) as model:
             yield model
 
     def startup(self) -> None:

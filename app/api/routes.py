@@ -909,10 +909,11 @@ def transcribe(request: TranscribeRequest) -> list[dict[str, object]]:
     except HTTPException:
         raise
     except Exception as exc:
-        if VRAMManager.is_cuda_oom(exc):
+        if VRAMManager.is_cuda_error(exc):
+            VRAMManager.reset_after_cuda_error()
             raise HTTPException(
                 status_code=507,
-                detail="CUDA out of memory during transcription. Model was offloaded and CUDA cache was cleared.",
+                detail="CUDA failed during transcription. Model cache was reset and VRAM cache was cleared.",
             ) from exc
         logger.exception("transcribe.error uuid=%s", request.uuid)
         raise HTTPException(status_code=500, detail=f"Transcription failed: {exc}") from exc

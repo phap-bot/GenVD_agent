@@ -21,6 +21,7 @@ export type PreparedAudioClip = {
 
 type AudioClipSelectorProps = {
   file: File;
+  initialSelection?: Selection | null;
   onClipReady: (clip: PreparedAudioClip | null) => void;
   onError: (message: string) => void;
 };
@@ -128,7 +129,7 @@ function drawWaveform(canvas: HTMLCanvasElement, buffer: AudioBuffer) {
   }
 }
 
-export default function AudioClipSelector({ file, onClipReady, onError }: AudioClipSelectorProps) {
+export default function AudioClipSelector({ file, initialSelection, onClipReady, onError }: AudioClipSelectorProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
@@ -152,12 +153,12 @@ export default function AudioClipSelector({ file, onClipReady, onError }: AudioC
       try {
         const decoded = await context.decodeAudioData(await file.arrayBuffer());
         if (cancelled) return;
-        const initialSelection = normalizedSelection(
-          { start: 0, end: Math.min(MAX_CLIP_SECONDS, decoded.duration) },
+        const nextSelection = normalizedSelection(
+          initialSelection ?? { start: 0, end: Math.min(MAX_CLIP_SECONDS, decoded.duration) },
           decoded.duration,
         );
         setBuffer(decoded);
-        setSelection(initialSelection);
+        setSelection(nextSelection);
         objectUrlRef.current = URL.createObjectURL(file);
         if (audioRef.current) audioRef.current.src = objectUrlRef.current;
       } catch {
@@ -174,9 +175,11 @@ export default function AudioClipSelector({ file, onClipReady, onError }: AudioC
       if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
       objectUrlRef.current = "";
     };
-  }, [file, onClipReady, onError]);
+  }, [file, initialSelection, onClipReady, onError]);
 
   useEffect(() => {
+    if (audioRef.current && objectUrlRef.current) audioRef.current.src = objectUrlRef.current;
+
     const canvas = canvasRef.current;
     if (!canvas || !buffer) return;
     const render = () => drawWaveform(canvas, buffer);
@@ -184,7 +187,7 @@ export default function AudioClipSelector({ file, onClipReady, onError }: AudioC
     const observer = new ResizeObserver(render);
     observer.observe(canvas);
     return () => observer.disconnect();
-  }, [buffer]);
+  }, [buffer, isLoading]);
 
   useEffect(() => {
     if (!buffer || selection.end <= selection.start) return;

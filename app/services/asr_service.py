@@ -117,21 +117,32 @@ class ASRService:
             device,
             MODEL_CACHE_PATHS.whisperx_align_cache,
         )
-        with model_registry.acquire_whisperx_align(
-            whisperx,
-            language_code=language_code,
-            device=device,
-        ) as (align_model, align_metadata):
-            result = whisperx.align(
-                result["segments"],
-                align_model,
-                align_metadata,
-                audio,
-                device,
-                return_char_alignments=False,
-            )
+        raw_segs = result.get("segments", [])
+        valid_segs = [s for s in raw_segs if s.get("text", "").strip()]
+        if valid_segs:
+            try:
+                with model_registry.acquire_whisperx_align(
+                    whisperx,
+                    language_code=language_code,
+                    device=device,
+                ) as (align_model, align_metadata):
+                    aligned = whisperx.align(
+                        valid_segs,
+                        align_model,
+                        align_metadata,
+                        audio,
+                        device,
+                        return_char_alignments=False,
+                    )
+                return self._normalize_segments(aligned.get("segments", []))
+            except Exception as exc:
+                logger.warning(
+                    "asr_service.align.failed language=%s error=%s, falling back to ASR segments",
+                    language_code,
+                    exc,
+                )
 
-        return self._normalize_segments(result.get("segments", []))
+        return self._normalize_segments(raw_segs)
 
     def _normalize_segments(self, raw_segments: list[dict]) -> list[TranscriptSegment]:
         segments: list[TranscriptSegment] = []

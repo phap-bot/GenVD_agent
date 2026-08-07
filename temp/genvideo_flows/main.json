@@ -1,0 +1,124 @@
+{
+  "flow_id": "main",
+  "version": 26,
+  "nodes": [
+    {
+      "id": "brief-1",
+      "kind": "brief",
+      "title": "Ý tưởng video",
+      "eyebrow": "INPUT",
+      "description": "Nhập ý tưởng và phong cách tổng thể",
+      "x": 12.0,
+      "y": 18.0,
+      "status": "ready",
+      "settings": {
+        "prompt": "Một câu chuyện hoạt hình người que vui nhộn về học cách làm việc nhóm",
+        "style": "minimalist stick figure 2D, clean lines, expressive motion"
+      }
+    },
+    {
+      "id": "script-1",
+      "kind": "script",
+      "title": "Kịch bản AI",
+      "eyebrow": "PLAN",
+      "description": "Chia ý tưởng thành các cảnh có nhịp rõ ràng",
+      "x": 282.4000244140625,
+      "y": 18.0,
+      "status": "idle",
+      "settings": {
+        "language": "vi-VN",
+        "duration_seconds": "30",
+        "scene_count": "5"
+      }
+    },
+    {
+      "id": "image-1",
+      "kind": "image",
+      "title": "Tạo ảnh cảnh",
+      "eyebrow": "VISUAL",
+      "description": "Tạo keyframe đồng nhất nhân vật và bối cảnh",
+      "x": 576.3999633789062,
+      "y": 18.0,
+      "status": "idle",
+      "settings": {
+        "model": "gemini-3.1-flash-image",
+        "aspect_ratio": "9:16",
+        "image_size": "1K"
+      }
+    },
+    {
+      "id": "veo-1",
+      "kind": "veo",
+      "title": "Veo 3.1",
+      "eyebrow": "GENERATE",
+      "description": "Animate keyframe thành clip có chuyển động và âm thanh",
+      "x": 34.800018310546875,
+      "y": 213.199951171875,
+      "status": "idle",
+      "settings": {
+        "model": "veo-3.1-generate-preview",
+        "resolution": "1080p",
+        "aspect_ratio": "9:16"
+      }
+    },
+    {
+      "id": "voice-1",
+      "kind": "voice",
+      "title": "Giọng đọc",
+      "eyebrow": "AUDIO",
+      "description": "Tạo lời dẫn và mix audio theo timeline cảnh",
+      "x": 321.60003662109375,
+      "y": 217.19998168945312,
+      "status": "idle",
+      "settings": {
+        "voice": "Trúc Ly",
+        "language": "vi-VN",
+        "pace": "1.0"
+      }
+    },
+    {
+      "id": "subtitles-1",
+      "kind": "subtitles",
+      "title": "Phụ đề & blur",
+      "eyebrow": "POLISH",
+      "description": "Đồng bộ phụ đề, style box và che nội dung gốc",
+      "x": 579.5999145507812,
+      "y": 214.00003051757812,
+      "status": "idle",
+      "settings": {
+        "position": "bottom-center",
+        "font_size": "42",
+        "blur_original_text": "true"
+      }
+    },
+    {
+      "id": "review-1",
+      "kind": "review",
+      "title": "Kiểm duyệt",
+      "eyebrow": "HITL",
+      "description": "Duyệt nội dung trước khi render file cuối",
+      "x": 38.399993896484375,
+      "y": 428.800048828125,
+      "status": "idle",
+      "settings": {
+        "copyright_confirmed": "false",
+        "safety_review": "required"
+      }
+    },
+    {
+      "id": "export-1",
+      "kind": "export",
+      "title": "Xuất bản",
+      "eyebrow": "OUTPUT",
+      "description": "Render MP4 và đưa vào thư viện video",
+      "x": 399.5999755859375,
+      "y": 416.8000183105469,
+      "status": "idle",
+      "settings": {
+        "format": "mp4",
+        "codec": "h264",
+        "quality": "high"
+      }
+    }
+  ]
+}

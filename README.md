@@ -90,6 +90,18 @@ Then restart the backend and check:
 GET /api/v1/health/dependencies
 ```
 
+## Voice source modes
+
+The studio exposes two isolated VieNeu-TTS paths:
+
+- `system`: every segment must resolve to the selected built-in voice ID.
+- `clone`: upload a clean 3–10 second reference clip; its encoded speaker data
+  is reused for every segment in that render.
+
+Voice selection is strict. An unavailable system voice or an invalid clone
+reference stops the render and returns an error; it never switches to another
+voice or to the model default.
+
 POST a video to:
 
 ```text

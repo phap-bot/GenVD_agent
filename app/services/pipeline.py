@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import logging
@@ -40,6 +40,7 @@ MIN_SEGMENT_DURATION = 0.2
 PUNCTUATION = set(".!?;,\u3002\uff01\uff1f\uff1b\uff0c\u3001")
 GPU_LOCK_POLL_SECONDS = 1.0
 GPU_LOCK_WAIT_TIMEOUT_SECONDS = 180.0
+MAX_NATURAL_TTS_SPEEDUP = 1.12
 
 
 @dataclass(frozen=True)
@@ -135,7 +136,7 @@ class AutoDubbingPipeline:
                     progress=70,
                     stats=self._segment_stats(translated_segments),
                 )
-                chunks = self._run_tts(translated_segments, workspace)
+                chunks = yield from self._run_tts(translated_segments, workspace)
                 yield self._event(
                     "processing",
                     "Voice tracks generated",
@@ -174,11 +175,12 @@ class AutoDubbingPipeline:
             raise
         except Exception as exc:
             VRAMManager.cleanup()
-            if VRAMManager.is_cuda_oom(exc):
-                logger.exception("CUDA OOM during dubbing pipeline")
+            if VRAMManager.is_cuda_error(exc):
+                VRAMManager.reset_after_cuda_error()
+                logger.exception("CUDA failure during dubbing pipeline")
                 yield self._event(
                     "error",
-                    "CUDA OOM prevented. Model was offloaded and VRAM cache was cleared.",
+                    "CUDA bi loi trong luc tao giong. Model cache da reset va VRAM da duoc don; thu render lai, neu con lap thi restart backend.",
                     error=str(exc),
                 )
                 return output_path
@@ -356,7 +358,7 @@ class AutoDubbingPipeline:
                     progress=18,
                     stats=self._script_stats(script_segments),
                 )
-                chunks = self._run_tts_from_script(script_segments, timeline_segments, workspace)
+                chunks = yield from self._run_tts_from_script(script_segments, timeline_segments, workspace)
                 yield self._event(
                     "processing",
                     "Voice tracks generated",
@@ -400,11 +402,12 @@ class AutoDubbingPipeline:
             raise
         except Exception as exc:
             VRAMManager.cleanup()
-            if VRAMManager.is_cuda_oom(exc):
-                logger.exception("CUDA OOM during script render")
+            if VRAMManager.is_cuda_error(exc):
+                VRAMManager.reset_after_cuda_error()
+                logger.exception("CUDA failure during script render")
                 yield self._event(
                     "error",
-                    "CUDA OOM prevented. Model was offloaded and VRAM cache was cleared.",
+                    "CUDA bi loi trong luc tao giong. Model cache da reset va VRAM da duoc don; thu render lai, neu con lap thi restart backend.",
                     error=str(exc),
                 )
                 return output_path
@@ -546,20 +549,33 @@ class AutoDubbingPipeline:
                 device,
                 MODEL_CACHE_PATHS.whisperx_align_cache,
             )
-            with model_registry.acquire_whisperx_align(
-                whisperx,
-                language_code=language_code,
-                device=device,
-            ) as (align_model, metadata):
-                aligned = whisperx.align(
-                    result["segments"],
-                    align_model,
-                    metadata,
-                    audio,
-                    device,
-                    return_char_alignments=False,
-                )
-            return self._normalize_segments(aligned.get("segments", []))
+            raw_segs = result.get("segments", [])
+            valid_segs = [s for s in raw_segs if s.get("text", "").strip()]
+            if valid_segs:
+                try:
+                    with model_registry.acquire_whisperx_align(
+                        whisperx,
+                        language_code=language_code,
+                        device=device,
+                    ) as (align_model, metadata):
+                        aligned = whisperx.align(
+                            valid_segs,
+                            align_model,
+                            metadata,
+                            audio,
+                            device,
+                            return_char_alignments=False,
+                        )
+                    return self._normalize_segments(aligned.get("segments", []))
+                except Exception as exc:
+                    logger.warning(
+                        "legacy_pipeline.asr.align.failed request_id=%s language=%s error=%s, falling back to ASR segments",
+                        workspace.request_id,
+                        language_code,
+                        exc,
+                    )
+
+            return self._normalize_segments(raw_segs)
         finally:
             VRAMManager.cleanup()
 
@@ -577,7 +593,7 @@ class AutoDubbingPipeline:
     def _canonical_timeline(self, segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
         return TimelineService().from_transcript(segments)
 
-    def _run_tts(self, segments: list[TranscriptSegment], workspace: Workspace) -> list[AudioChunk]:
+    def _run_tts(self, segments: list[TranscriptSegment], workspace: Workspace) -> Generator[str, None, list[AudioChunk]]:
         chunks: list[AudioChunk] = []
         self._raise_if_cancelled(workspace)
 
@@ -615,11 +631,22 @@ class AutoDubbingPipeline:
                         voice_source,
                     )
 
-                for segment in segments:
+                total_segments = max(1, len(segments))
+                for index, segment in enumerate(segments):
                     self._raise_if_cancelled(workspace)
                     raw_path = workspace.chunks_dir / f"{segment.id:04d}_raw.wav"
                     final_path = workspace.chunks_dir / f"{segment.id:04d}.wav"
                     duration = max(segment.end - segment.start, 0.1)
+                    logger.info(
+                        "legacy_pipeline.tts.segment.start request_id=%s segment_id=%s index=%s total=%s mode=%s chars=%s duration=%.3f",
+                        workspace.request_id,
+                        segment.id,
+                        index + 1,
+                        total_segments,
+                        self.config.voice_mode,
+                        len(segment.text),
+                        duration,
+                    )
 
                     if self.config.voice_mode == "clone":
                         audio = infer_stable_cloned_vieneu_audio(model, segment.text, voice_source)
@@ -629,6 +656,18 @@ class AutoDubbingPipeline:
 
                     self._fit_audio_duration(raw_path, final_path, duration)
                     chunks.append(AudioChunk(segment.id, final_path, segment.start, segment.end))
+                    progress = min(84, 70 + round(((index + 1) / total_segments) * 14))
+                    yield self._event(
+                        "processing",
+                        f"Đã tạo voice {index + 1}/{total_segments}",
+                        phase="voice",
+                        progress=progress,
+                        stats={
+                            "chunks": len(chunks),
+                            "segments": total_segments,
+                            "segment_id": segment.id,
+                        },
+                    )
 
             return chunks
         finally:
@@ -639,7 +678,7 @@ class AutoDubbingPipeline:
         script_segments: list[DubbingScriptSegment],
         timeline_segments: list[TranscriptSegment],
         workspace: Workspace,
-    ) -> list[AudioChunk]:
+    ) -> Generator[str, None, list[AudioChunk]]:
         chunks: list[AudioChunk] = []
         self._raise_if_cancelled(workspace)
         voice_segments = sorted(script_segments, key=lambda item: (item.start, item.end))
@@ -673,11 +712,22 @@ class AutoDubbingPipeline:
                 else:
                     character_voice_map = {}
 
+                total_segments = max(1, len(timeline_segments))
                 for index, segment in enumerate(timeline_segments):
                     self._raise_if_cancelled(workspace)
                     raw_path = workspace.chunks_dir / f"{segment.id:04d}_raw.wav"
                     final_path = workspace.chunks_dir / f"{segment.id:04d}.wav"
                     duration = max(segment.end - segment.start, 0.1)
+                    logger.info(
+                        "legacy_pipeline.tts_script.segment.start request_id=%s segment_id=%s index=%s total=%s mode=%s chars=%s duration=%.3f",
+                        workspace.request_id,
+                        segment.id,
+                        index + 1,
+                        total_segments,
+                        self.config.voice_mode,
+                        len(segment.text),
+                        duration,
+                    )
 
                     if self.config.voice_mode == "clone":
                         audio = infer_stable_cloned_vieneu_audio(model, segment.text, clone_voice_reference)
@@ -704,6 +754,18 @@ class AutoDubbingPipeline:
 
                     self._fit_audio_duration(raw_path, final_path, duration)
                     chunks.append(AudioChunk(segment.id, final_path, segment.start, segment.end))
+                    progress = min(72, 18 + round(((index + 1) / total_segments) * 54))
+                    yield self._event(
+                        "processing",
+                        f"Đã tạo voice {index + 1}/{total_segments}",
+                        phase="voice",
+                        progress=progress,
+                        stats={
+                            "chunks": len(chunks),
+                            "segments": total_segments,
+                            "segment_id": segment.id,
+                        },
+                    )
 
             return chunks
         finally:
@@ -717,12 +779,14 @@ class AutoDubbingPipeline:
             return
 
         try:
-            tempo = max(0.1, current_duration / target_duration)
+            natural_target = max(target_duration, 0.1)
+            ratio = max(0.1, current_duration / natural_target)
+            tempo = min(ratio, MAX_NATURAL_TTS_SPEEDUP) if current_duration > natural_target else 1.0
             stream = ffmpeg.input(str(source)).audio
             for value in self._atempo_filters(tempo):
                 stream = stream.filter("atempo", value)
 
-            stream = stream.filter("apad").filter("atrim", duration=max(target_duration, 0.1))
+            stream = stream.filter("apad").filter("atrim", duration=natural_target)
             command = ffmpeg.output(stream, str(destination), ac=1, ar="24000", format="wav").overwrite_output()
             self._run_ffmpeg_command(command, "audio_fit")
             return
@@ -747,49 +811,123 @@ class AutoDubbingPipeline:
                 return True
 
             speed = len(audio) / target_ms
-            stretched = audio._spawn(
-                audio.raw_data,
-                overrides={"frame_rate": max(1, round(audio.frame_rate * speed))},
-            ).set_frame_rate(audio.frame_rate)
+            natural_speed = min(speed, MAX_NATURAL_TTS_SPEEDUP) if len(audio) > target_ms else 1.0
+            fitted = audio
+            if natural_speed > 1.0:
+                fitted = audio._spawn(
+                    audio.raw_data,
+                    overrides={"frame_rate": max(1, round(audio.frame_rate * natural_speed))},
+                ).set_frame_rate(audio.frame_rate)
 
-            if len(stretched) > target_ms:
-                stretched = stretched[:target_ms]
-            elif len(stretched) < target_ms:
-                stretched += AudioSegment.silent(duration=target_ms - len(stretched), frame_rate=audio.frame_rate)
+            if len(fitted) > target_ms:
+                fitted = fitted[:target_ms]
+            elif len(fitted) < target_ms:
+                fitted += AudioSegment.silent(duration=target_ms - len(fitted), frame_rate=audio.frame_rate)
 
-            stretched.export(destination, format="wav")
+            fitted.export(destination, format="wav")
             return True
         except Exception:
             logger.exception("pydub duration fitting failed, falling back to ffmpeg atempo")
             return False
 
     def _combine_audio_chunks(self, chunks: list[AudioChunk], destination: Path, *, total_duration: float | None = None) -> None:
+        """Mix TTS audio chunks into a single WAV at sample-accurate offsets.
+
+        Uses direct PCM buffer mixing instead of an FFmpeg CLI filter graph to
+        avoid Windows ``WinError 206`` (command line too long) when the segment
+        count is large.  Output format (44100 Hz, stereo, 16-bit WAV) and
+        additive-sum semantics (equivalent to ``amix normalize=0``) are
+        preserved exactly.
+        """
         target_duration = max(float(total_duration or 0.0), 0.1)
         if not chunks:
             self._write_silent_wav(destination, target_duration, sample_rate=44100)
             return
 
-        ffmpeg = self._ffmpeg()
-        delayed_streams = []
-        for chunk in chunks:
-            delay_ms = max(0, round(chunk.start * 1000))
-            delayed_streams.append(
-                ffmpeg.input(str(chunk.path))
-                .audio
-                .filter("adelay", delays=f"{delay_ms}|{delay_ms}")
-            )
+        import numpy as np
 
-        mixed = ffmpeg.filter(
-            delayed_streams,
-            "amix",
-            inputs=len(delayed_streams),
-            duration="longest",
-            normalize=0,
+        out_sample_rate = 44100
+        out_channels = 2
+        total_frames = math.ceil(target_duration * out_sample_rate)
+
+        # int32 accumulator avoids overflow when overlapping chunks are summed.
+        buffer = np.zeros((total_frames, out_channels), dtype=np.int32)
+        mixed_count = 0
+
+        for chunk in chunks:
+            # --- read chunk WAV ---
+            try:
+                with wave.open(str(chunk.path), "rb") as wav_file:
+                    chunk_sample_rate = wav_file.getframerate()
+                    chunk_channels = wav_file.getnchannels()
+                    sample_width = wav_file.getsampwidth()
+                    raw_bytes = wav_file.readframes(wav_file.getnframes())
+            except Exception:
+                logger.warning(
+                    "audio_mix.chunk_read_failed path=%s segment_id=%s",
+                    chunk.path,
+                    chunk.segment_id,
+                )
+                continue
+
+            # --- decode to int32 samples ---
+            if sample_width == 2:
+                samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.int32)
+            elif sample_width == 4:
+                samples = np.frombuffer(raw_bytes, dtype=np.int32).copy()
+            else:
+                logger.warning(
+                    "audio_mix.unsupported_sample_width path=%s width=%s",
+                    chunk.path,
+                    sample_width,
+                )
+                continue
+
+            if len(samples) == 0:
+                continue
+
+            # --- downmix to mono if multi-channel ---
+            if chunk_channels > 1:
+                samples = samples.reshape(-1, chunk_channels)[:, 0].copy()
+
+            # --- resample to output rate (linear interpolation) ---
+            if chunk_sample_rate != out_sample_rate:
+                resampled_length = max(1, round(len(samples) * out_sample_rate / chunk_sample_rate))
+                indices = np.linspace(0, len(samples) - 1, resampled_length)
+                samples = np.interp(
+                    indices,
+                    np.arange(len(samples)),
+                    samples.astype(np.float64),
+                ).astype(np.int32)
+
+            # --- place chunk at correct sample offset ---
+            sample_offset = max(0, round(chunk.start * out_sample_rate))
+            end_sample = min(total_frames, sample_offset + len(samples))
+            usable = end_sample - sample_offset
+            if usable <= 0:
+                continue
+
+            # Additive mix into both stereo channels (same as amix normalize=0).
+            buffer[sample_offset:end_sample, 0] += samples[:usable]
+            buffer[sample_offset:end_sample, 1] += samples[:usable]
+            mixed_count += 1
+
+        # --- clamp and write output WAV ---
+        buffer = np.clip(buffer, -32768, 32767).astype(np.int16)
+        with wave.open(str(destination), "wb") as wav_file:
+            wav_file.setnchannels(out_channels)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(out_sample_rate)
+            wav_file.writeframes(buffer.tobytes())
+
+        logger.info(
+            "audio_mix.completed destination=%s chunks=%s mixed=%s duration=%.2f frames=%s",
+            destination,
+            len(chunks),
+            mixed_count,
+            target_duration,
+            total_frames,
         )
-        if target_duration > 0.1:
-            mixed = mixed.filter("apad").filter("atrim", duration=target_duration)
-        command = ffmpeg.output(mixed, str(destination), ac=2, ar="44100", format="wav").overwrite_output()
-        self._run_ffmpeg_command(command, "audio_mix")
 
     def _render_video(
         self,

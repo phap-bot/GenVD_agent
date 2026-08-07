@@ -21,6 +21,7 @@ from utils.tts_voice import (
 )
 
 logger = logging.getLogger(__name__)
+MAX_NATURAL_TTS_SPEEDUP = 1.12
 
 
 def _ffmpeg():
@@ -95,6 +96,14 @@ class TTSService:
                     tracks.append(TTSAudioTrack(segment.id, final_path, segment.start, segment.end))
 
             return tracks
+        except Exception as exc:
+            if VRAMManager.is_cuda_error(exc):
+                VRAMManager.reset_after_cuda_error()
+                logger.exception("CUDA failure during TTS synthesis")
+                raise RuntimeError(
+                    "CUDA failed during TTS synthesis. Model cache was reset and VRAM cache was cleared."
+                ) from exc
+            raise
         finally:
             self.model = None
             self.voice = None
@@ -137,12 +146,14 @@ class TTSService:
             self._write_silent_wav(destination, target_duration)
             return
 
-        ratio = max(0.1, current_duration / target_duration)
+        natural_target = max(target_duration, 0.1)
+        ratio = max(0.1, current_duration / natural_target)
+        tempo = min(ratio, MAX_NATURAL_TTS_SPEEDUP) if current_duration > natural_target else 1.0
         stream = ffmpeg.input(str(source)).audio
-        for value in self._atempo_filters(ratio):
+        for value in self._atempo_filters(tempo):
             stream = stream.filter("atempo", value)
 
-        stream = stream.filter("apad").filter("atrim", duration=max(target_duration, 0.1))
+        stream = stream.filter("apad").filter("atrim", duration=natural_target)
         (
             ffmpeg.output(stream, str(destination), ac=1, ar="24000", format="wav")
             .overwrite_output()
