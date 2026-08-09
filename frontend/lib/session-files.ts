@@ -36,8 +36,15 @@ function runRequest<T>(mode: IDBTransactionMode, action: (store: IDBObjectStore)
 }
 
 export async function readSessionFile(key: string): Promise<File | null> {
-  const value = await runRequest<File | undefined>("readonly", (store) => store.get(key));
-  return value instanceof File ? value : null;
+  const value = await runRequest<File | Blob | undefined>("readonly", (store) => store.get(key));
+  if (value instanceof File) return value;
+  if (value instanceof Blob) {
+    return new File([value], "source-video.mp4", {
+      type: value.type || "video/mp4",
+      lastModified: Date.now(),
+    });
+  }
+  return null;
 }
 
 export async function writeSessionFile(key: string, file: File | null): Promise<void> {

@@ -1,4 +1,4 @@
-﻿"use client";
+"use client";
 
 import {
   AlertCircle,
@@ -28,6 +28,7 @@ import { deleteSessionFiles, readSessionFile, writeSessionFile } from '@/lib/ses
 const BACKEND_URL = "http://localhost:8000";
 const ANALYZE_URL = `${BACKEND_URL}/api/analyze-stream`;
 const RENDER_SCRIPT_URL = `${BACKEND_URL}/api/render-script`;
+const RENDER_SCRIPT_UPLOAD_URL = `${BACKEND_URL}/api/render-script-upload`;
 const VOICE_REFERENCE_URL = `${BACKEND_URL}/api/voice-reference`;
 const SHORTEN_TEXT_URL = `${BACKEND_URL}/api/shorten-text`;
 const TRANSLATION_MODELS_URL = `${BACKEND_URL}/api/translation/models`;
@@ -57,6 +58,7 @@ type StudioConfig = {
   ocrFallback: boolean;
   ocrForce: boolean;
   ocrModel: string;
+  vocalSeparation: boolean;
 };
 
 type ModelOption = {
@@ -486,6 +488,7 @@ export default function VideoDubbingStudio() {
     ocrFallback: true,
     ocrForce: false,
     ocrModel: DEFAULT_OCR_MODEL,
+    vocalSeparation: true,
   });
   const [translationModels, setTranslationModels] = useState<ModelOption[]>(fallbackTranslationModels);
   const [asrModels, setAsrModels] = useState<ModelOption[]>(fallbackAsrModelOptions);
@@ -810,6 +813,17 @@ export default function VideoDubbingStudio() {
     window.setTimeout(() => setToast(null), 5200);
   }
 
+  async function persistVideoFileForRetry(videoFile: File | null) {
+    if (!sessionIdRef.current || !videoFile) return;
+    try {
+      await writeSessionFile(`${sessionIdRef.current}:video`, videoFile);
+      lastStoredVideoFileRef.current = videoFile;
+      setSessionSaveStatus('saved');
+    } catch {
+      setSessionSaveStatus('error');
+    }
+  }
+
   async function startNewSession() {
     if ((file || sourceVideoUrl || segments.length > 0) && !window.confirm('Tạo session mới? Dữ liệu của session hiện tại sẽ bị xóa khỏi trình duyệt.')) {
       return;
@@ -841,6 +855,7 @@ export default function VideoDubbingStudio() {
       ocrFallback: true,
       ocrForce: false,
       ocrModel: DEFAULT_OCR_MODEL,
+      vocalSeparation: true,
     });
     setActiveStep(0);
     setCloneReferenceFile(null);
@@ -919,7 +934,16 @@ export default function VideoDubbingStudio() {
 
     if (previewUrl) URL.revokeObjectURL(previewUrl);
     setFile(nextFile);
+    void persistVideoFileForRetry(nextFile);
     setPreviewUrl(URL.createObjectURL(nextFile));
+    if (segments.length > 0) {
+      setSourceVideoUrl("");
+      setResultVideoUrl("");
+      setResultSubtitleUrl("");
+      resetProcessing("Đã khôi phục video gốc; script hiện tại được giữ nguyên", 0, "prepare");
+      showToast({ type: "success", message: "Đã khôi phục video gốc và giữ nguyên script hiện tại." });
+      return;
+    }
     setSourceVideoUrl("");
     setResultVideoUrl("");
     setResultSubtitleUrl("");
@@ -1093,6 +1117,7 @@ export default function VideoDubbingStudio() {
     formData.append("ocr_model", config.ocrModel);
     formData.append("ocr_interval_seconds", "0.75");
     formData.append("ocr_crop_bottom_ratio", "0.35");
+    formData.append("vocal_separation", String(config.vocalSeparation));
     appendCopyrightPreflight(formData);
 
     setIsAnalyzing(true);
@@ -1195,8 +1220,19 @@ export default function VideoDubbingStudio() {
     }
   }
 
+  async function httpErrorMessage(response: Response) {
+    const text = await response.text();
+    try {
+      const parsed = JSON.parse(text) as { detail?: unknown };
+      if (typeof parsed.detail === "string") return parsed.detail;
+    } catch {
+      // Use the raw body below when the backend does not return JSON.
+    }
+    return text || `HTTP ${response.status}`;
+  }
+
   async function readEventStream(response: Response) {
-    if (!response.ok) throw new Error(await response.text());
+    if (!response.ok) throw new Error(await httpErrorMessage(response));
     if (!response.body) throw new Error("Backend khong tra stream.");
 
     const reader = response.body.getReader();
@@ -1239,7 +1275,7 @@ export default function VideoDubbingStudio() {
       return;
     }
     if (!ensureCopyrightPreflight()) return;
-    if (segments.length === 0 || !sourceVideoUrl) {
+    if (segments.length === 0) {
       showToast({ type: "error", message: "Bấm Tách script trước để vào màn demo/review, rồi Lưu demo mới render được." });
       return;
     }
@@ -1258,7 +1294,7 @@ export default function VideoDubbingStudio() {
     setResultSubtitleUrl("");
 
     try {
-      if (segments.length > 0 && sourceVideoUrl) {
+      if (segments.length > 0) {
         const baseSegments = savedDemoSegments ?? [];
         if (config.voiceMode === "system" && baseSegments.some((segment) => !segment.voice_model?.trim())) {
           throw new Error("Mỗi đoạn thoại phải có một giọng hệ thống hợp lệ.");
@@ -1271,32 +1307,81 @@ export default function VideoDubbingStudio() {
           subtitle_style: normalizeSubtitleStyle(segment.subtitle_style),
           blur_style: normalizeBlurStyle(segment.blur_style),
         }));
-        const response = await fetch(RENDER_SCRIPT_URL, {
-          method: "POST",
-          headers: {
-            Accept: "text/event-stream",
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            source_video_path: sourceVideoUrl,
-            target_language: config.targetLanguage,
-            translation_provider: config.translationProvider,
-            translation_model: config.translationModel,
-            voice_model: systemVoiceModel,
-            voice_mode: config.voiceMode,
-            clone_reference_audio_path: cloneReferenceAudioPath,
-            tts_device: config.ttsDevice,
-            background_volume: 0,
-            tts_volume: 1,
-            burn_subtitles: savedTextLayerEnabled ?? true,
-            mock_tts: false,
-            copyright_confirmed: config.copyrightAcknowledged,
-            copyright_source: config.copyrightSource,
-            copyright_notes: config.copyrightNotes.trim(),
-            segments: renderSegments,
-          }),
-        });
-        await readEventStream(response);
+        const renderPayload = {
+          source_video_path: sourceVideoUrl || `/media/${sessionIdRef.current}_source.mp4`,
+          target_language: config.targetLanguage,
+          translation_provider: config.translationProvider,
+          translation_model: config.translationModel,
+          voice_model: systemVoiceModel,
+          voice_mode: config.voiceMode,
+          clone_reference_audio_path: cloneReferenceAudioPath,
+          tts_device: config.ttsDevice,
+          background_volume: 0,
+          tts_volume: 1,
+          burn_subtitles: savedTextLayerEnabled ?? true,
+          mock_tts: false,
+          copyright_confirmed: config.copyrightAcknowledged,
+          copyright_source: config.copyrightSource,
+          copyright_notes: config.copyrightNotes.trim(),
+          vocal_separation: config.vocalSeparation,
+          segments: renderSegments,
+        };
+
+        const readStoredVideoFile = async () => {
+          if (!sessionIdRef.current) return null;
+          try {
+            return await readSessionFile(`${sessionIdRef.current}:video`);
+          } catch {
+            return null;
+          }
+        };
+        const postRenderWithUpload = async (videoFile: File) => {
+          await persistVideoFileForRetry(videoFile);
+          const formData = new FormData();
+          formData.append("video", videoFile);
+          formData.append("payload", JSON.stringify(renderPayload));
+          return fetch(RENDER_SCRIPT_UPLOAD_URL, {
+            method: "POST",
+            headers: { Accept: "text/event-stream" },
+            body: formData,
+          });
+        };
+        const postRenderWithSourcePath = () =>
+          fetch(RENDER_SCRIPT_URL, {
+            method: "POST",
+            headers: {
+              Accept: "text/event-stream",
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(renderPayload),
+          });
+
+        const renderVideoFile = file || (await readStoredVideoFile());
+        if (renderVideoFile && renderVideoFile !== file) {
+          setFile(renderVideoFile);
+          if (!previewUrl) setPreviewUrl(URL.createObjectURL(renderVideoFile));
+        }
+
+        if (renderVideoFile) {
+          await readEventStream(await postRenderWithUpload(renderVideoFile));
+        } else {
+          try {
+            await readEventStream(await postRenderWithSourcePath());
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "";
+            const fallbackFile = message.includes("Source video not found")
+              ? await readStoredVideoFile()
+              : null;
+            if (!fallbackFile) {
+              throw new Error("Backend đã mất source video. Chọn lại video gốc để render lại pipeline và mix voice.");
+            }
+
+            setFile(fallbackFile);
+            if (!previewUrl) setPreviewUrl(URL.createObjectURL(fallbackFile));
+            setStatusText("File nguồn trên backend đã mất, đang gửi lại video gốc để render lại từ đầu...");
+            await readEventStream(await postRenderWithUpload(fallbackFile));
+          }
+        }
         setSavedDemoSegments(copyDemoSegments(renderSegments, systemVoiceModel));
       }
       showToast({ type: "success", message: "Đã xuất video hoàn chỉnh." });
@@ -1457,6 +1542,21 @@ export default function VideoDubbingStudio() {
                   className="mt-1 h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
                 />
                 <span>Ép dùng OCR cho video có chữ/phụ đề trên màn hình</span>
+              </label>
+            </fieldset>
+            <fieldset className="grid gap-3 rounded-md border border-purple-200 bg-purple-50/50 p-3">
+              <legend className="px-1 text-sm font-semibold text-purple-800">Vocal Separation (Tách giọng AI)</legend>
+              <label className="flex items-start gap-3 text-sm font-medium text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={config.vocalSeparation}
+                  onChange={(event) => setConfig((current) => ({ ...current, vocalSeparation: event.target.checked }))}
+                  className="mt-1 h-4 w-4 rounded border-purple-300 text-purple-600 focus:ring-purple-500"
+                />
+                <div>
+                  <span className="font-semibold text-purple-900">Tách giọng nói (giữ lại nhạc nền & âm thanh môi trường)</span>
+                  <p className="mt-0.5 text-xs text-purple-700">Tự động loại bỏ voice gốc bằng Demucs AI. Giữ nhạc nền & hiệu ứng âm thanh sống động.</p>
+                </div>
               </label>
             </fieldset>
             <fieldset className="grid gap-3 rounded-md border border-amber-200 bg-amber-50 p-3">
