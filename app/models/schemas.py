@@ -38,6 +38,7 @@ class PipelineConfig(BaseModel):
     translation_provider: Literal["9router", "google", "mock"] = "9router"
     translation_model: str = Field(default="ag/gemini-3-flash-agent", min_length=1, max_length=160)
     asr_model: str = Field(default="base", min_length=1, max_length=160)
+
     compute_type: Literal["int8", "float16"] = "int8"
     word_timestamps: bool = False
     voice_model: str = Field(default="Trúc Ly", min_length=1, max_length=64)
@@ -57,6 +58,7 @@ class PipelineConfig(BaseModel):
     ocr_model: str = Field(default="gemini/gemini-2.5-flash", min_length=1, max_length=160)
     ocr_interval_seconds: float = Field(default=0.75, ge=0.25, le=5.0)
     ocr_crop_bottom_ratio: float = Field(default=0.35, ge=0.12, le=0.85)
+    vocal_separation: bool = False
 
     @model_validator(mode="after")
     def require_selected_voice_source(self):
@@ -138,6 +140,7 @@ class RenderScriptRequest(BaseModel):
     copyright_confirmed: bool = False
     copyright_source: Literal["owned", "licensed", "public_domain", "permission", "platform_library", "unknown"] = "unknown"
     copyright_notes: str = Field(default="", max_length=500)
+    vocal_separation: bool = False
     segments: list[DubbingScriptSegment] = Field(min_length=1)
 
     @model_validator(mode="after")

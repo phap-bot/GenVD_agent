@@ -27,7 +27,10 @@ class DependencyService:
 
     def status(self) -> dict[str, bool | str | None]:
         cuda = self.cuda_status()
+        from utils.ninerouter import is_9router_running
+
         return {
+            "ninerouter_running": is_9router_running(),
             "ffmpeg_binary": self.check_binary("ffmpeg"),
             "ffprobe_binary": self.check_binary("ffprobe"),
             "ffmpeg_path": self.resolve_binary("ffmpeg"),
@@ -37,6 +40,7 @@ class DependencyService:
             "whisperx": self.check_python_module("whisperx"),
             "yt_dlp": self.check_python_module("yt_dlp"),
             "vieneu": self.check_python_module("vieneu"),
+            "demucs": self.check_python_module("demucs"),
             "cuda_available": cuda["available"],
             "cuda_device": cuda["device"],
         }

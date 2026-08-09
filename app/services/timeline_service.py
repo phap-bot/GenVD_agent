@@ -14,7 +14,7 @@ SEMANTIC_MAX_TEXT_CHARS = 120
 SEMANTIC_MAX_SEGMENTS = 3
 SEMANTIC_SHORT_CJK_SUFFIX_CHARS = 6
 SEMANTIC_SHORT_TEXT_SUFFIX_CHARS = 18
-TERMINAL_PUNCTUATION = set(".!?。！？；;")
+TERMINAL_PUNCTUATION = set(".!?;\u3002\uff01\uff1f\uff1b")
 
 
 class TimelineService:
@@ -89,23 +89,15 @@ class TimelineService:
         *,
         source_language: str | None,
     ) -> list[TranscriptSegment]:
-        merged: list[TranscriptSegment] = []
-        current: list[TranscriptSegment] = []
+        from app.services.semantic_stitching_service import SemanticStitchingService
 
-        for segment in segments:
-            if not current:
-                current = [segment]
-                continue
-            if self._should_merge_semantic(current, segment, source_language=source_language):
-                current.append(segment)
-                continue
-
-            merged.append(self._semantic_group_to_segment(len(merged), current))
-            current = [segment]
-
-        if current:
-            merged.append(self._semantic_group_to_segment(len(merged), current))
-        return merged
+        return SemanticStitchingService().stitch_transcript_segments(
+            segments,
+            source_language=source_language,
+            max_gap=1.0,
+            max_duration=12.0,
+            max_chars=260,
+        )
 
     def _should_merge_semantic(
         self,

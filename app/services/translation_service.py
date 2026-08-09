@@ -32,6 +32,7 @@ class TranslationService:
         else:
             translated_texts = translate_segments(
                 [segment.text for segment in segments],
+                target_durations=[max(0.1, segment.end - segment.start) for segment in segments],
                 source_language=self.config.source_language,
                 target_language=self.config.target_language,
                 provider=self.config.translation_provider,
@@ -46,5 +47,9 @@ class TranslationService:
                     update={"text": translated_text}
                 )
             )
-        logger.info("translation.stage.done segments=%s", len(translated))
+
+        # Source segmentation is already sentence-aware. Keep a strict 1:1
+        # mapping so original text, translated text, voice and timestamps can
+        # never drift to neighboring scenes.
+        logger.info("translation.stage.done segments=%s mapping=one_to_one", len(translated))
         return translated

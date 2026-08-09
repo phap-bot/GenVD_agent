@@ -42,10 +42,47 @@ class PipelineManager:
         with tempfile.TemporaryDirectory(prefix=f"dub_{request_id}_") as temp_root:
             work_dir = Path(temp_root)
             try:
+                accompaniment_path = None
+                asr_input = video_path
+                if config.vocal_separation:
+                    try:
+                        logger.info("Starting vocal separation stage for request %s", request_id)
+                        from app.services.vocal_separation_service import VocalSeparationService
+                        from app.services.dependency_service import DependencyService
+                        DependencyService().require_ffmpeg()
+                        import ffmpeg
+                        source_audio = work_dir / "source_audio.wav"
+                        (
+                            ffmpeg.input(str(video_path))
+                            .output(
+                                str(source_audio),
+                                ac=2,
+                                ar="44100",
+                                acodec="pcm_s16le",
+                                vn=None,
+                                format="wav",
+                            )
+                            .overwrite_output()
+                            .run(capture_stdout=True, capture_stderr=True)
+                        )
+                        sep_result = VocalSeparationService().separate(
+                            audio_path=source_audio,
+                            output_dir=work_dir / "separated",
+                            device="cpu",
+                        )
+                        asr_input = sep_result.vocals_path
+                        accompaniment_path = sep_result.accompaniment_path
+                    except Exception as exc:
+                        logger.exception("Vocal separation failed for request %s", request_id)
+                        raise RuntimeError(
+                            "Vocal separation is enabled but failed; pipeline stopped to prevent "
+                            f"original voice bleed. {exc}"
+                        ) from exc
+
                 logger.info("Starting ASR stage for request %s", request_id)
                 asr_service = ASRService(config)
                 segments = TimelineService().from_transcript(
-                    asr_service.transcribe(video_path, work_dir),
+                    asr_service.transcribe(asr_input, work_dir),
                     merge_semantic=True,
                     source_language=config.source_language,
                 )
@@ -71,6 +108,7 @@ class PipelineManager:
                     tts_tracks=tts_tracks,
                     work_dir=work_dir,
                     output_path=output_video_path,
+                    accompaniment_path=accompaniment_path,
                 )
                 shutil.copy2(temp_subtitle_path, output_subtitle_path)
 
@@ -107,6 +145,41 @@ class PipelineManager:
         with tempfile.TemporaryDirectory(prefix=f"dub_srt_{request_id}_") as temp_root:
             work_dir = Path(temp_root)
             try:
+                accompaniment_path = None
+                if config.vocal_separation:
+                    try:
+                        logger.info("Starting vocal separation stage for request %s", request_id)
+                        from app.services.vocal_separation_service import VocalSeparationService
+                        from app.services.dependency_service import DependencyService
+                        DependencyService().require_ffmpeg()
+                        import ffmpeg
+                        source_audio = work_dir / "source_audio.wav"
+                        (
+                            ffmpeg.input(str(video_path))
+                            .output(
+                                str(source_audio),
+                                ac=2,
+                                ar="44100",
+                                acodec="pcm_s16le",
+                                vn=None,
+                                format="wav",
+                            )
+                            .overwrite_output()
+                            .run(capture_stdout=True, capture_stderr=True)
+                        )
+                        sep_result = VocalSeparationService().separate(
+                            audio_path=source_audio,
+                            output_dir=work_dir / "separated",
+                            device="cpu",
+                        )
+                        accompaniment_path = sep_result.accompaniment_path
+                    except Exception as exc:
+                        logger.exception("Vocal separation failed for request %s", request_id)
+                        raise RuntimeError(
+                            "Vocal separation is enabled but failed; pipeline stopped to prevent "
+                            f"original voice bleed. {exc}"
+                        ) from exc
+
                 logger.info("Starting SRT parse stage for request %s", request_id)
                 segments = TimelineService().from_transcript(SubtitleService().parse_srt(subtitle_path))
                 if not segments:
@@ -131,6 +204,7 @@ class PipelineManager:
                     tts_tracks=tts_tracks,
                     work_dir=work_dir,
                     output_path=output_video_path,
+                    accompaniment_path=accompaniment_path,
                 )
                 shutil.copy2(temp_subtitle_path, output_subtitle_path)
 

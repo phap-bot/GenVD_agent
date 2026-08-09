@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import math
 import os
+import shutil
 import threading
 import time
 import wave
@@ -32,15 +34,29 @@ from utils.tts_voice import (
 
 logger = logging.getLogger(__name__)
 MODEL_CACHE_PATHS = configure_model_cache()
-MAX_SEGMENT_DURATION = 3.0
-MAX_CJK_SEGMENT_DURATION = 1.6
-MAX_SEGMENT_CHARS = 84
-MAX_CJK_SEGMENT_CHARS = 8
+MAX_SEGMENT_DURATION = 8.0
+MAX_CJK_SEGMENT_DURATION = 7.0
+MAX_SEGMENT_CHARS = 180
+MAX_CJK_SEGMENT_CHARS = 72
+HARD_MAX_SEGMENT_DURATION = 14.0
+HARD_MAX_SEGMENT_CHARS = 280
+HARD_MAX_CJK_SEGMENT_CHARS = 120
 MIN_SEGMENT_DURATION = 0.2
 PUNCTUATION = set(".!?;,\u3002\uff01\uff1f\uff1b\uff0c\u3001")
+SENTENCE_TERMINATORS = set(".!?;\u3002\uff01\uff1f\uff1b")
+CLAUSE_PUNCTUATION = set(",:\uff0c\u3001\uff1a")
 GPU_LOCK_POLL_SECONDS = 1.0
 GPU_LOCK_WAIT_TIMEOUT_SECONDS = 180.0
-MAX_NATURAL_TTS_SPEEDUP = 1.12
+TTS_CACHE_MAX_AGE_SECONDS = 2 * 24 * 3600  # 2 days
+AUDIO_STEM_CACHE_VERSION = "demucs-normalized-residual-v2"
+ACCOMPANIMENT_DEFAULT_VOLUME = 0.92
+ORIGINAL_FALLBACK_VOLUME = 0.12
+
+# ── TTS segment merging constants ──
+TTS_MERGE_MAX_GAP = 0.5           # max silence gap (seconds) between segments to merge
+TTS_MERGE_MAX_SEG_DURATION = 2.0  # only merge segments shorter than this (seconds)
+TTS_MERGE_MAX_GROUP_DURATION = 6.0  # max total duration of a merged group
+TTS_MERGE_MAX_CHARS = 160         # max total characters of merged text
 
 
 @dataclass(frozen=True)
@@ -49,6 +65,17 @@ class AudioChunk:
     path: Path
     start: float
     end: float
+
+
+@dataclass(frozen=True)
+class _TTSGroup:
+    """One or more adjacent short segments merged for a single TTS call."""
+    text: str
+    start: float
+    end: float
+    first_segment_id: int
+    segment_count: int
+    voice_model: str  # resolved voice key (empty for clone mode)
 
 
 class AutoDubbingPipeline:
@@ -154,11 +181,13 @@ class AutoDubbingPipeline:
             tts_mix_path = workspace.root / "tts_mix.wav"
             self._combine_audio_chunks(chunks, tts_mix_path, total_duration=video_duration)
             yield self._event("processing", "Muxing subtitles and audio...", phase="render", progress=96)
+            accompaniment_path = self._ensure_accompaniment_audio(workspace, workspace.input_video) if self.config.vocal_separation else None
             self._render_video(
                 video_path=workspace.input_video,
                 subtitle_path=subtitle_path,
                 tts_mix_path=tts_mix_path,
                 output_path=output_path,
+                accompaniment_path=accompaniment_path,
             )
             self._write_srt(translated_segments, output_subtitle_path, video_duration=video_duration)
 
@@ -344,9 +373,18 @@ class AutoDubbingPipeline:
             )
             self.dependencies.require_ffmpeg()
             self._raise_if_cancelled(workspace)
-            if not source_video_path.exists():
+            if not source_video_path.is_file() or source_video_path.stat().st_size <= 0:
                 raise FileNotFoundError(f"Source video not found: {source_video_path}")
-            video_duration = self._safe_probe_duration(source_video_path)
+            render_source_path = workspace.root / "render_source.mp4"
+            shutil.copy2(source_video_path, render_source_path)
+            logger.info(
+                "script_render.source_staged request_id=%s source=%s staged=%s bytes=%s",
+                workspace.request_id,
+                source_video_path,
+                render_source_path,
+                render_source_path.stat().st_size,
+            )
+            video_duration = self._safe_probe_duration(render_source_path)
             timeline_segments = self._clip_timeline_to_video(timeline_segments, video_duration)
 
             self._acquire_gpu_lock(workspace)
@@ -372,13 +410,14 @@ class AutoDubbingPipeline:
 
             yield self._event("processing", "Rendering final video...", phase="render", progress=84)
             subtitle_path = workspace.root / "edited_script.ass"
-            video_width, video_height = self._video_dimensions(source_video_path)
+            video_width, video_height = self._video_dimensions(render_source_path)
             self._write_ass(script_segments, subtitle_path, video_width=video_width, video_height=video_height, video_duration=video_duration)
             tts_mix_path = workspace.root / "tts_mix.wav"
             self._combine_audio_chunks(chunks, tts_mix_path, total_duration=video_duration)
             yield self._event("processing", "Muxing subtitles and audio...", phase="render", progress=94)
+            accompaniment_path = self._ensure_accompaniment_audio(workspace, render_source_path) if self.config.vocal_separation else None
             self._render_video(
-                video_path=source_video_path,
+                video_path=render_source_path,
                 subtitle_path=subtitle_path,
                 tts_mix_path=tts_mix_path,
                 output_path=output_path,
@@ -386,6 +425,7 @@ class AutoDubbingPipeline:
                 video_width=video_width,
                 video_height=video_height,
                 video_duration=video_duration,
+                accompaniment_path=accompaniment_path,
             )
             self._write_srt(timeline_segments, output_subtitle_path, video_duration=video_duration)
 
@@ -471,6 +511,111 @@ class AutoDubbingPipeline:
             for segment in ocr_segments
         ]
 
+    def _ensure_accompaniment_audio(self, workspace: Workspace, video_path: Path) -> Path | None:
+        if not self.config.vocal_separation:
+            return None
+        acc_path = workspace.root / "accompaniment.wav"
+        if acc_path.is_file() and acc_path.stat().st_size > 0:
+            return acc_path
+
+        if not self._has_audio_stream(video_path):
+            return None
+
+        try:
+            from app.services.vocal_separation_service import VocalSeparationService
+
+            cache_acc_path, cache_vocals_path = self._stem_cache_paths(video_path)
+            self._evict_stale_stem_cache(cache_acc_path.parent)
+            if cache_acc_path.is_file() and cache_acc_path.stat().st_size > 0:
+                shutil.copy2(cache_acc_path, acc_path)
+                if cache_vocals_path.is_file() and cache_vocals_path.stat().st_size > 0:
+                    sep_dir = workspace.root / "separated"
+                    sep_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(cache_vocals_path, sep_dir / "vocals.wav")
+                logger.info(
+                    "vocal_separation.cache_hit source=%s accompaniment=%s",
+                    video_path,
+                    cache_acc_path,
+                )
+                return acc_path
+
+            # Keep source separation independent from the 16 kHz mono ASR
+            # file. Demucs must receive stereo full-band audio.
+            source_audio = workspace.root / "separation_source.wav"
+            if not source_audio.is_file() or source_audio.stat().st_size <= 0:
+                ffmpeg = self._ffmpeg()
+                (
+                    ffmpeg.input(str(video_path))
+                    .output(
+                        str(source_audio),
+                        ac=2,
+                        ar="44100",
+                        acodec="pcm_s16le",
+                        vn=None,
+                        format="wav",
+                    )
+                    .overwrite_output()
+                    .run(capture_stdout=True, capture_stderr=True)
+                )
+            sep_dir = workspace.root / "separated"
+            device = os.environ.get("AUTODUB_DEMUCS_DEVICE", "cpu").strip().lower()
+            if device not in {"cpu", "cuda"}:
+                logger.warning("vocal_separation.invalid_device value=%s fallback=cpu", device)
+                device = "cpu"
+            logger.info("vocal_separation.ensure_start device=%s path=%s", device, source_audio)
+            sep_result = VocalSeparationService().separate(
+                audio_path=source_audio,
+                output_dir=sep_dir,
+                device=device,
+                cancel_event=self.cancel_event,
+            )
+            shutil.copy2(str(sep_result.accompaniment_path), str(acc_path))
+            try:
+                shutil.copy2(sep_result.accompaniment_path, cache_acc_path)
+                shutil.copy2(sep_result.vocals_path, cache_vocals_path)
+                logger.info(
+                    "vocal_separation.cache_saved accompaniment=%s vocals=%s",
+                    cache_acc_path,
+                    cache_vocals_path,
+                )
+            except OSError:
+                logger.warning("vocal_separation.cache_save_failed source=%s", video_path, exc_info=True)
+            return acc_path
+        except PipelineCancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("vocal_separation.ensure_failed error=%s", exc)
+            raise RuntimeError(
+                "Vocal separation is enabled but failed; render stopped to prevent original voice bleed. "
+                f"{exc}"
+            ) from exc
+
+    def _stem_cache_paths(self, video_path: Path) -> tuple[Path, Path]:
+        digest = hashlib.sha256()
+        digest.update(AUDIO_STEM_CACHE_VERSION.encode("ascii"))
+        stat = video_path.stat()
+        digest.update(str(stat.st_size).encode("ascii"))
+        sample_size = 2 * 1024 * 1024
+        with video_path.open("rb") as handle:
+            offsets = (0, max(0, stat.st_size // 2 - sample_size // 2), max(0, stat.st_size - sample_size))
+            for offset in offsets:
+                handle.seek(offset)
+                digest.update(handle.read(sample_size))
+
+        cache_dir = Path("audio_cache") / "stems"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        key = digest.hexdigest()[:24]
+        return cache_dir / f"{key}_accompaniment.wav", cache_dir / f"{key}_vocals.wav"
+
+    def _evict_stale_stem_cache(self, cache_dir: Path) -> None:
+        now = time.time()
+        try:
+            for entry in cache_dir.glob("*.wav"):
+                if now - entry.stat().st_mtime > TTS_CACHE_MAX_AGE_SECONDS:
+                    entry.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("vocal_separation.cache_eviction_failed dir=%s", cache_dir, exc_info=True)
+
     def _run_asr(self, workspace: Workspace) -> list[TranscriptSegment]:
         self._raise_if_cancelled(workspace)
         audio_path = workspace.root / "source_audio.wav"
@@ -486,6 +631,13 @@ class AutoDubbingPipeline:
             .overwrite_output()
             .run(capture_stdout=True, capture_stderr=True)
         )
+
+        if self.config.vocal_separation:
+            self._ensure_accompaniment_audio(workspace, workspace.input_video)
+            vocals_path = workspace.root / "separated" / "vocals.wav"
+            if vocals_path.is_file():
+                logger.info("asr.using_separated_vocals path=%s", vocals_path)
+                audio_path = vocals_path
 
         try:
             if remote_stt_enabled(self.config.asr_model):
@@ -673,6 +825,231 @@ class AutoDubbingPipeline:
         finally:
             VRAMManager.cleanup()
 
+    # ── TTS chunk cache helpers ──────────────────────────────────────────
+
+    def _tts_cache_dir(self) -> Path:
+        cache_dir = Path("tts_cache")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
+    def _clone_reference_cache_id(self, clone_ref: str | None) -> str:
+        if self.config.voice_mode != "clone":
+            return ""
+
+        clean_ref = (clone_ref or "").strip()
+        if not clean_ref:
+            return ""
+
+        path = Path(clean_ref)
+        try:
+            stat = path.stat()
+        except OSError:
+            logger.warning("tts_cache.clone_ref_stat_failed path=%s", clean_ref)
+            return clean_ref
+
+        signature = (str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+        cached_signature = getattr(self, "_clone_reference_cache_signature", None)
+        cached_id = getattr(self, "_clone_reference_cache_id_value", None)
+        if cached_signature == signature and isinstance(cached_id, str):
+            return cached_id
+
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            logger.warning("tts_cache.clone_ref_hash_failed path=%s", clean_ref)
+            return clean_ref
+
+        cache_id = f"sha256:{digest.hexdigest()}"
+        self._clone_reference_cache_signature = signature
+        self._clone_reference_cache_id_value = cache_id
+        logger.info(
+            "tts_cache.clone_ref_identity path=%s bytes=%s identity=%s",
+            clean_ref,
+            stat.st_size,
+            cache_id[:24],
+        )
+        return cache_id
+
+    def _tts_cache_key(
+        self,
+        text: str,
+        voice_mode: str,
+        voice_model: str,
+        clone_ref: str | None,
+        duration: float,
+    ) -> str:
+        payload = json.dumps(
+            {
+                "fit_version": 2,
+                "text": text.strip(),
+                "voice_mode": voice_mode,
+                "voice_model": voice_model,
+                "clone_ref": self._clone_reference_cache_id(clone_ref),
+                "duration": round(duration, 3),
+            },
+            sort_keys=True,
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+    def _evict_stale_tts_cache(self) -> None:
+        """Remove cached TTS chunks older than TTS_CACHE_MAX_AGE_SECONDS."""
+        cache_dir = self._tts_cache_dir()
+        now = time.time()
+        evicted = 0
+        try:
+            for entry in cache_dir.iterdir():
+                if entry.is_file() and entry.suffix == ".wav":
+                    age = now - entry.stat().st_mtime
+                    if age > TTS_CACHE_MAX_AGE_SECONDS:
+                        entry.unlink(missing_ok=True)
+                        evicted += 1
+        except Exception:
+            logger.exception("tts_cache.eviction.failed")
+        if evicted:
+            logger.info("tts_cache.evicted count=%d max_age_days=%.1f", evicted, TTS_CACHE_MAX_AGE_SECONDS / 86400)
+
+    def _tts_cache_lookup(
+        self,
+        segment: TranscriptSegment,
+        voice_segments: list[DubbingScriptSegment],
+        index: int,
+    ) -> Path | None:
+        """Return the cache path if a fitted WAV already exists for this segment."""
+        duration = max(segment.end - segment.start, 0.1)
+        voice_model = ""
+        if self.config.voice_mode == "system" and index < len(voice_segments):
+            voice_model = voice_segments[index].voice_model.strip()
+        cache_key = self._tts_cache_key(
+            segment.text,
+            self.config.voice_mode,
+            voice_model,
+            self.config.clone_reference_audio_path,
+            duration,
+        )
+        cache_path = self._tts_cache_dir() / f"{cache_key}.wav"
+        exists = cache_path.is_file() and cache_path.stat().st_size > 0
+        if index < 3 or not exists:
+            logger.info(
+                "tts_cache.lookup segment_id=%s index=%d key=%s duration=%.3f text_len=%d exists=%s",
+                segment.id, index, cache_key, duration, len(segment.text), exists,
+            )
+        if exists:
+            return cache_path
+        return None
+
+    def _tts_group_cache_key(self, group: _TTSGroup) -> str:
+        """Cache key for a merged TTS group."""
+        duration = max(group.end - group.start, 0.1)
+        return self._tts_cache_key(
+            group.text,
+            self.config.voice_mode,
+            group.voice_model,
+            self.config.clone_reference_audio_path,
+            duration,
+        )
+
+    def _tts_group_cache_lookup(self, group: _TTSGroup) -> Path | None:
+        """Return the cache path if a fitted WAV already exists for this group."""
+        cache_key = self._tts_group_cache_key(group)
+        cache_path = self._tts_cache_dir() / f"{cache_key}.wav"
+        if cache_path.is_file() and cache_path.stat().st_size > 0:
+            return cache_path
+        return None
+
+    # ── TTS segment merging ────────────────────────────────────────────
+
+    def _build_tts_groups(
+        self,
+        timeline_segments: list[TranscriptSegment],
+        voice_segments: list[DubbingScriptSegment],
+    ) -> list[_TTSGroup]:
+        """Merge adjacent short segments into groups for fewer TTS calls.
+
+        Rules:
+        - Only merge segments shorter than TTS_MERGE_MAX_SEG_DURATION.
+        - Gap between adjacent segments must be < TTS_MERGE_MAX_GAP.
+        - Total group duration must be < TTS_MERGE_MAX_GROUP_DURATION.
+        - Total group text length must be < TTS_MERGE_MAX_CHARS.
+        - In system voice mode, only merge segments with the same voice model.
+        """
+        if not timeline_segments:
+            return []
+
+        groups: list[_TTSGroup] = []
+        # Accumulator for current group being built.
+        cur_indices: list[int] = []
+        cur_texts: list[str] = []
+
+        def _voice_key(idx: int) -> str:
+            if self.config.voice_mode != "system":
+                return ""
+            if idx < len(voice_segments):
+                return voice_segments[idx].voice_model.strip()
+            return ""
+
+        def _flush() -> None:
+            if not cur_indices:
+                return
+            first_idx = cur_indices[0]
+            last_idx = cur_indices[-1]
+            first_seg = timeline_segments[first_idx]
+            last_seg = timeline_segments[last_idx]
+            merged_text = " ".join(cur_texts)
+            groups.append(_TTSGroup(
+                text=merged_text,
+                start=first_seg.start,
+                end=last_seg.end,
+                first_segment_id=first_seg.id,
+                segment_count=len(cur_indices),
+                voice_model=_voice_key(first_idx),
+            ))
+
+        for i, seg in enumerate(timeline_segments):
+            seg_dur = seg.end - seg.start
+            seg_text = seg.text.strip()
+
+            if not cur_indices:
+                # Start a new group.
+                cur_indices = [i]
+                cur_texts = [seg_text]
+                continue
+
+            prev_seg = timeline_segments[cur_indices[-1]]
+            gap = seg.start - prev_seg.end
+            group_start = timeline_segments[cur_indices[0]].start
+            merged_dur = seg.end - group_start
+            merged_text_len = sum(len(t) for t in cur_texts) + len(seg_text) + len(cur_texts)
+
+            can_merge = (
+                seg_dur <= TTS_MERGE_MAX_SEG_DURATION
+                and gap <= TTS_MERGE_MAX_GAP
+                and merged_dur <= TTS_MERGE_MAX_GROUP_DURATION
+                and merged_text_len <= TTS_MERGE_MAX_CHARS
+                and not self._ends_with_terminal_punctuation(prev_seg.text)
+                and _voice_key(i) == _voice_key(cur_indices[0])
+                # The segments already in the group must also be short.
+                and all(
+                    timeline_segments[j].end - timeline_segments[j].start <= TTS_MERGE_MAX_SEG_DURATION
+                    for j in cur_indices
+                )
+            )
+
+            if can_merge:
+                cur_indices.append(i)
+                cur_texts.append(seg_text)
+            else:
+                _flush()
+                cur_indices = [i]
+                cur_texts = [seg_text]
+
+        _flush()
+        return groups
+
+    # ── TTS generation with cache-first + merged groups ───────────────
+
     def _run_tts_from_script(
         self,
         script_segments: list[DubbingScriptSegment],
@@ -683,6 +1060,50 @@ class AutoDubbingPipeline:
         self._raise_if_cancelled(workspace)
         voice_segments = sorted(script_segments, key=lambda item: (item.start, item.end))
 
+        # Evict stale cache entries on each render.
+        self._evict_stale_tts_cache()
+
+        # Build merged TTS groups.
+        tts_groups = self._build_tts_groups(timeline_segments, voice_segments)
+        total_original = len(timeline_segments)
+        total_groups = len(tts_groups)
+        merged_count = sum(1 for g in tts_groups if g.segment_count > 1)
+        logger.info(
+            "tts_merge.summary request_id=%s original_segments=%d groups=%d merged_groups=%d",
+            workspace.request_id,
+            total_original,
+            total_groups,
+            merged_count,
+        )
+
+        # Fast path: if ALL groups are already cached, skip GPU entirely.
+        all_cached = all(
+            self._tts_group_cache_lookup(group) is not None
+            for group in tts_groups
+        )
+        if all_cached:
+            logger.info(
+                "tts_cache.full_hit request_id=%s groups=%d — skipping GPU model load",
+                workspace.request_id,
+                total_groups,
+            )
+            for gi, group in enumerate(tts_groups):
+                self._raise_if_cancelled(workspace)
+                final_path = workspace.chunks_dir / f"{group.first_segment_id:04d}.wav"
+                cached = self._tts_group_cache_lookup(group)
+                shutil.copy2(str(cached), str(final_path))
+                chunks.append(AudioChunk(group.first_segment_id, final_path, group.start, group.end))
+                progress = min(72, 18 + round(((gi + 1) / total_groups) * 54))
+                yield self._event(
+                    "processing",
+                    f"Đã tạo voice {gi + 1}/{total_groups} (cached)",
+                    phase="voice",
+                    progress=progress,
+                    stats={"chunks": len(chunks), "segments": total_original, "groups": total_groups, "cached": True},
+                )
+            return chunks
+
+        # Normal path: load model, but skip cached groups.
         try:
             cache_paths = configure_model_cache()
             logger.info(
@@ -712,59 +1133,88 @@ class AutoDubbingPipeline:
                 else:
                     character_voice_map = {}
 
-                total_segments = max(1, len(timeline_segments))
-                for index, segment in enumerate(timeline_segments):
+                cache_hits = 0
+                for gi, group in enumerate(tts_groups):
                     self._raise_if_cancelled(workspace)
-                    raw_path = workspace.chunks_dir / f"{segment.id:04d}_raw.wav"
-                    final_path = workspace.chunks_dir / f"{segment.id:04d}.wav"
-                    duration = max(segment.end - segment.start, 0.1)
+                    final_path = workspace.chunks_dir / f"{group.first_segment_id:04d}.wav"
+                    duration = max(group.end - group.start, 0.1)
+
+                    # ── Cache hit: copy and skip inference ──
+                    cached = self._tts_group_cache_lookup(group)
+                    if cached is not None:
+                        shutil.copy2(str(cached), str(final_path))
+                        chunks.append(AudioChunk(group.first_segment_id, final_path, group.start, group.end))
+                        cache_hits += 1
+                        progress = min(72, 18 + round(((gi + 1) / total_groups) * 54))
+                        yield self._event(
+                            "processing",
+                            f"Đã tạo voice {gi + 1}/{total_groups} (cached)",
+                            phase="voice",
+                            progress=progress,
+                            stats={"chunks": len(chunks), "segments": total_original, "groups": total_groups, "cached": True},
+                        )
+                        continue
+
+                    # ── Cache miss: run TTS inference ──
+                    raw_path = workspace.chunks_dir / f"{group.first_segment_id:04d}_raw.wav"
+                    segs_label = f"({group.segment_count} segs)" if group.segment_count > 1 else ""
                     logger.info(
-                        "legacy_pipeline.tts_script.segment.start request_id=%s segment_id=%s index=%s total=%s mode=%s chars=%s duration=%.3f",
+                        "legacy_pipeline.tts_script.group.start request_id=%s group=%s/%s segment_id=%s segs=%s mode=%s chars=%s duration=%.3f",
                         workspace.request_id,
-                        segment.id,
-                        index + 1,
-                        total_segments,
+                        gi + 1,
+                        total_groups,
+                        group.first_segment_id,
+                        group.segment_count,
                         self.config.voice_mode,
-                        len(segment.text),
+                        len(group.text),
                         duration,
                     )
 
                     if self.config.voice_mode == "clone":
-                        audio = infer_stable_cloned_vieneu_audio(model, segment.text, clone_voice_reference)
+                        audio = infer_stable_cloned_vieneu_audio(model, group.text, clone_voice_reference)
                     else:
-                        if index >= len(voice_segments) or not voice_segments[index].voice_model.strip():
-                            raise ValueError(f"System voice is missing for segment {segment.id}.")
-                        requested_voice = voice_segments[index].voice_model
-                        character_key = requested_voice.strip()
+                        character_key = group.voice_model
+                        if not character_key:
+                            raise ValueError(f"System voice is missing for segment {group.first_segment_id}.")
                         voice = character_voice_map.setdefault(
                             character_key,
                             resolve_vieneu_voice(model, character_key),
                         )
-                        logger.info(
-                            "legacy_pipeline.tts_script.segment request_id=%s segment_id=%s requested_voice=%s resolved_voice=%s duration=%.3f",
-                            workspace.request_id,
-                            index,
-                            requested_voice,
-                            voice,
-                            duration,
-                        )
-                        audio = infer_stable_vieneu_audio(model, segment.text, voice)
+                        audio = infer_stable_vieneu_audio(model, group.text, voice)
 
                     model.save(audio, str(raw_path))
-
                     self._fit_audio_duration(raw_path, final_path, duration)
-                    chunks.append(AudioChunk(segment.id, final_path, segment.start, segment.end))
-                    progress = min(72, 18 + round(((index + 1) / total_segments) * 54))
+
+                    # ── Save to cache ──
+                    cache_key = self._tts_group_cache_key(group)
+                    try:
+                        cache_dest = self._tts_cache_dir() / f"{cache_key}.wav"
+                        shutil.copy2(str(final_path), str(cache_dest))
+                    except Exception:
+                        logger.warning("tts_cache.save_failed segment_id=%s cache_key=%s", group.first_segment_id, cache_key)
+
+                    chunks.append(AudioChunk(group.first_segment_id, final_path, group.start, group.end))
+                    progress = min(72, 18 + round(((gi + 1) / total_groups) * 54))
                     yield self._event(
                         "processing",
-                        f"Đã tạo voice {index + 1}/{total_segments}",
+                        f"Đã tạo voice {gi + 1}/{total_groups} {segs_label}",
                         phase="voice",
                         progress=progress,
                         stats={
                             "chunks": len(chunks),
-                            "segments": total_segments,
-                            "segment_id": segment.id,
+                            "segments": total_original,
+                            "groups": total_groups,
+                            "segment_id": group.first_segment_id,
                         },
+                    )
+
+                if cache_hits:
+                    logger.info(
+                        "tts_cache.summary request_id=%s total_groups=%d hits=%d misses=%d",
+                        workspace.request_id,
+                        total_groups,
+                        cache_hits,
+                        total_groups - cache_hits,
                     )
 
             return chunks
@@ -772,6 +1222,9 @@ class AutoDubbingPipeline:
             VRAMManager.cleanup()
 
     def _fit_audio_duration(self, source: Path, destination: Path, target_duration: float) -> None:
+        if self._fit_audio_duration_with_numpy(source, destination, target_duration):
+            return
+
         ffmpeg = self._ffmpeg()
         current_duration = self._probe_duration(source)
         if current_duration <= 0:
@@ -781,7 +1234,15 @@ class AutoDubbingPipeline:
         try:
             natural_target = max(target_duration, 0.1)
             ratio = max(0.1, current_duration / natural_target)
-            tempo = min(ratio, MAX_NATURAL_TTS_SPEEDUP) if current_duration > natural_target else 1.0
+            tempo = ratio if current_duration > natural_target else 1.0
+            if tempo > 1.35:
+                logger.warning(
+                    "tts.audio_fit.high_speed source=%s raw_duration=%.3f target_duration=%.3f tempo=%.3f",
+                    source,
+                    current_duration,
+                    natural_target,
+                    tempo,
+                )
             stream = ffmpeg.input(str(source)).audio
             for value in self._atempo_filters(tempo):
                 stream = stream.filter("atempo", value)
@@ -797,6 +1258,49 @@ class AutoDubbingPipeline:
             return
         raise RuntimeError(f"Could not fit TTS audio to {target_duration:.3f}s")
 
+    def _fit_audio_duration_with_numpy(self, source: Path, destination: Path, target_duration: float) -> bool:
+        try:
+            with wave.open(str(source), "rb") as wf:
+                sample_rate = wf.getframerate()
+                channels = wf.getnchannels()
+                sample_width = wf.getsampwidth()
+                frames = wf.getnframes()
+                raw_bytes = wf.readframes(frames)
+
+            if frames == 0 or sample_rate <= 0:
+                self._write_silent_wav(destination, target_duration, sample_rate=sample_rate or 24000)
+                return True
+
+            import numpy as np
+
+            if sample_width == 2:
+                samples = np.frombuffer(raw_bytes, dtype=np.int16)
+            elif sample_width == 4:
+                samples = np.frombuffer(raw_bytes, dtype=np.int32)
+            else:
+                return False
+
+            current_duration = frames / float(sample_rate)
+            natural_target = max(target_duration, 0.1)
+            if current_duration > natural_target:
+                # Never truncate spoken audio. Let FFmpeg atempo compress the
+                # complete utterance while preserving pitch.
+                return False
+
+            target_samples = math.ceil(natural_target * sample_rate * channels)
+            if len(samples) < target_samples:
+                samples = np.pad(samples, (0, target_samples - len(samples)), mode="constant")
+
+            with wave.open(str(destination), "wb") as wf:
+                wf.setnchannels(channels)
+                wf.setsampwidth(sample_width)
+                wf.setframerate(sample_rate)
+                wf.writeframes(samples.tobytes())
+            return True
+        except Exception:
+            logger.exception("numpy audio duration fitting failed")
+            return False
+
     def _fit_audio_duration_with_pydub(self, source: Path, destination: Path, target_duration: float) -> bool:
         try:
             from pydub import AudioSegment
@@ -811,7 +1315,7 @@ class AutoDubbingPipeline:
                 return True
 
             speed = len(audio) / target_ms
-            natural_speed = min(speed, MAX_NATURAL_TTS_SPEEDUP) if len(audio) > target_ms else 1.0
+            natural_speed = speed if len(audio) > target_ms else 1.0
             fitted = audio
             if natural_speed > 1.0:
                 fitted = audio._spawn(
@@ -940,6 +1444,7 @@ class AutoDubbingPipeline:
         video_width: int | None = None,
         video_height: int | None = None,
         video_duration: float | None = None,
+        accompaniment_path: Path | None = None,
     ) -> None:
         ffmpeg = self._ffmpeg()
         video_input = ffmpeg.input(str(video_path))
@@ -961,10 +1466,37 @@ class AutoDubbingPipeline:
             video_stream = video_stream.filter("subtitles", subtitle_filter_path)
 
         tts_audio = tts_input.audio.filter("volume", self.config.tts_volume)
-        if self.config.background_volume > 0:
-            original_audio = video_input.audio.filter("volume", self.config.background_volume)
+        tts_split = tts_audio.filter_multi_output("asplit")
+        tts_sidechain = tts_split[0]
+        tts_for_mix = tts_split[1]
+        has_acc = accompaniment_path and accompaniment_path.is_file() and accompaniment_path.stat().st_size > 0
+        if self.config.vocal_separation and not has_acc:
+            raise RuntimeError(
+                "Vocal separation is enabled but no accompaniment track is available; "
+                "render stopped to prevent original voice bleed."
+            )
+        if has_acc:
+            bg_vol = self.config.background_volume if self.config.background_volume > 0 else ACCOMPANIMENT_DEFAULT_VOLUME
+            logger.info(
+                "legacy_pipeline.render.accompaniment_ducked path=%s volume=%.2f ratio=12 release_ms=320",
+                accompaniment_path,
+                bg_vol,
+            )
+            bg_audio = ffmpeg.input(str(accompaniment_path)).audio.filter("volume", bg_vol)
+            # Keep the original ambience near full level between speech, then
+            # duck it while dubbed speech is active. This masks residual vocal
+            # bleed without flattening music and environmental sound globally.
+            background_audio = ffmpeg.filter(
+                [bg_audio, tts_sidechain],
+                "sidechaincompress",
+                threshold=0.02,
+                ratio=12,
+                attack=10,
+                release=320,
+                makeup=1,
+            )
             mixed_audio = ffmpeg.filter(
-                [original_audio, tts_audio],
+                [background_audio, tts_for_mix],
                 "amix",
                 inputs=2,
                 duration="first",
@@ -972,8 +1504,31 @@ class AutoDubbingPipeline:
                 normalize=0,
             )
         else:
-            logger.info("legacy_pipeline.render.original_audio.muted video=%s", video_path)
-            mixed_audio = tts_audio
+            bg_vol = self.config.background_volume if self.config.background_volume > 0 else ORIGINAL_FALLBACK_VOLUME
+            logger.info(
+                "legacy_pipeline.render.original_audio_emergency_duck video=%s volume=%.2f ratio=20 release_ms=420",
+                video_path,
+                bg_vol,
+            )
+            original_audio = video_input.audio.filter("volume", bg_vol)
+            background_audio = ffmpeg.filter(
+                [original_audio, tts_sidechain],
+                "sidechaincompress",
+                threshold=0.01,
+                ratio=20,
+                attack=5,
+                release=420,
+                makeup=1,
+            )
+            mixed_audio = ffmpeg.filter(
+                [background_audio, tts_for_mix],
+                "amix",
+                inputs=2,
+                duration="first",
+                dropout_transition=0,
+                normalize=0,
+            )
+        mixed_audio = mixed_audio.filter("alimiter", limit=0.95)
 
         command = ffmpeg.output(
             video_stream,
@@ -1195,13 +1750,15 @@ class AutoDubbingPipeline:
         duration = max(0.0, segment.end - segment.start)
         text_limit = self._segment_text_limit(segment.text)
         duration_limit = self._segment_duration_limit(segment.text)
-        if duration <= duration_limit and len(segment.text) <= text_limit:
-            return [segment]
 
         if self._has_useful_word_timestamps(segment):
             split_by_words = self._split_segment_by_words(segment)
-            if len(split_by_words) > 1:
+            if split_by_words:
                 return split_by_words
+
+        has_multiple_sentences = sum(char in SENTENCE_TERMINATORS for char in segment.text) > 1
+        if duration <= duration_limit and len(segment.text) <= text_limit and not has_multiple_sentences:
+            return [segment]
 
         return self._split_segment_by_text(segment)
 
@@ -1235,15 +1792,33 @@ class AutoDubbingPipeline:
         current_words: list[WordTimestamp] = []
         text_limit = self._segment_text_limit(segment.text)
         duration_limit = self._segment_duration_limit(segment.text)
+        contains_cjk = self._contains_cjk(segment.text)
+        hard_text_limit = HARD_MAX_CJK_SEGMENT_CHARS if contains_cjk else HARD_MAX_SEGMENT_CHARS
 
         for word in segment.words:
+            if current_words:
+                projected_text = self._join_word_tokens([*[item.word for item in current_words], word.word])
+                projected_duration = max(0.0, word.end - current_words[0].start)
+                gap = max(0.0, word.start - current_words[-1].end)
+                if (
+                    (projected_duration >= duration_limit or len(projected_text) >= text_limit)
+                    and gap >= 0.3
+                ):
+                    chunks.append(self._segment_from_words(segment, current_words))
+                    current_words = []
+
             current_words.append(word)
             current_text = self._join_word_tokens([item.word for item in current_words])
             current_duration = max(0.0, current_words[-1].end - current_words[0].start)
+            reached_soft_limit = current_duration >= duration_limit or len(current_text) >= text_limit
+            reached_hard_limit = (
+                current_duration >= HARD_MAX_SEGMENT_DURATION
+                or len(current_text) >= hard_text_limit
+            )
             should_close = (
-                current_duration >= duration_limit
-                or len(current_text) >= text_limit
-                or self._ends_with_punctuation(word.word)
+                self._ends_with_terminal_punctuation(word.word)
+                or (reached_soft_limit and self._ends_with_clause_punctuation(word.word))
+                or reached_hard_limit
             )
             if should_close and current_duration >= MIN_SEGMENT_DURATION:
                 chunks.append(self._segment_from_words(segment, current_words))
@@ -1267,11 +1842,7 @@ class AutoDubbingPipeline:
         duration = max(segment.end - segment.start, MIN_SEGMENT_DURATION)
         total_chars = max(1, len(segment.text))
         text_limit = self._segment_text_limit(segment.text)
-        duration_limit = self._segment_duration_limit(segment.text)
-        chunk_count = max(1, math.ceil(duration / duration_limit), math.ceil(total_chars / text_limit))
-        minimum_chars = 3 if self._contains_cjk(segment.text) else 18
-        char_limit = max(minimum_chars, math.ceil(total_chars / chunk_count))
-        text_chunks = self._chunk_text(segment.text, char_limit)
+        text_chunks = self._chunk_text(segment.text, text_limit)
         if len(text_chunks) <= 1:
             return [segment]
 
@@ -1297,27 +1868,17 @@ class AutoDubbingPipeline:
         return self._merge_tiny_segments(chunks)
 
     def _chunk_text(self, text: str, char_limit: int) -> list[str]:
-        units = self._text_units(text, char_limit)
-        chunks: list[str] = []
-        current = ""
-        for unit in units:
-            separator = "" if self._contains_cjk(current + unit) else " "
-            candidate = f"{current}{separator}{unit}".strip() if current else unit
-            if current and len(candidate) > char_limit:
-                chunks.append(current.strip())
-                current = unit
-            else:
-                current = candidate
-        if current.strip():
-            chunks.append(current.strip())
-        return chunks
+        # Sentence punctuation is the primary boundary. Keeping each complete
+        # sentence independent gives translation and TTS the same semantic
+        # unit and avoids unnatural pauses inside a sentence.
+        return self._text_units(text, char_limit)
 
     def _text_units(self, text: str, char_limit: int) -> list[str]:
         units: list[str] = []
         current = ""
         for char in text:
             current += char
-            if char in PUNCTUATION:
+            if char in SENTENCE_TERMINATORS:
                 units.extend(self._hard_wrap(current.strip(), char_limit))
                 current = ""
         if current.strip():
@@ -1327,6 +1888,33 @@ class AutoDubbingPipeline:
     def _hard_wrap(self, text: str, char_limit: int) -> list[str]:
         if len(text) <= char_limit:
             return [text]
+
+        clause_units: list[str] = []
+        current_clause = ""
+        for char in text:
+            current_clause += char
+            if char in CLAUSE_PUNCTUATION or char in SENTENCE_TERMINATORS:
+                clause_units.append(current_clause.strip())
+                current_clause = ""
+        if current_clause.strip():
+            clause_units.append(current_clause.strip())
+
+        if len(clause_units) > 1:
+            chunks: list[str] = []
+            current = ""
+            for clause in clause_units:
+                separator = "" if self._contains_cjk(current + clause) else " "
+                candidate = f"{current}{separator}{clause}".strip() if current else clause
+                if current and len(candidate) > char_limit:
+                    chunks.append(current)
+                    current = clause
+                else:
+                    current = candidate
+            if current:
+                chunks.append(current)
+            if all(len(chunk) <= char_limit * 2 for chunk in chunks):
+                return chunks
+
         if not self._contains_cjk(text):
             chunks: list[str] = []
             current = ""
@@ -1385,9 +1973,13 @@ class AutoDubbingPipeline:
             or "\uac00" <= char <= "\ud7af"
         )
 
-    def _ends_with_punctuation(self, text: str) -> bool:
+    def _ends_with_terminal_punctuation(self, text: str) -> bool:
         clean_text = text.strip()
-        return bool(clean_text and clean_text[-1] in PUNCTUATION)
+        return bool(clean_text and clean_text[-1] in SENTENCE_TERMINATORS)
+
+    def _ends_with_clause_punctuation(self, text: str) -> bool:
+        clean_text = text.strip()
+        return bool(clean_text and clean_text[-1] in CLAUSE_PUNCTUATION)
 
     def _mock_segments(self) -> list[TranscriptSegment]:
         return [

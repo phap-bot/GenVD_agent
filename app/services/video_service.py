@@ -9,6 +9,8 @@ from app.services.timeline_service import TimelineService
 from app.services.tts_service import TTSAudioTrack
 
 logger = logging.getLogger(__name__)
+ACCOMPANIMENT_DEFAULT_VOLUME = 0.92
+ORIGINAL_FALLBACK_VOLUME = 0.12
 
 
 def _ffmpeg():
@@ -33,6 +35,7 @@ class VideoService:
         tts_tracks: list[TTSAudioTrack],
         work_dir: Path,
         output_path: Path,
+        accompaniment_path: Path | None = None,
     ) -> tuple[Path, Path]:
         segments = TimelineService().from_transcript(segments)
         subtitle_path = work_dir / "subtitles.srt"
@@ -42,7 +45,7 @@ class VideoService:
         if tts_tracks:
             self._build_aligned_tts_track(tts_tracks, tts_mix_path)
 
-        self._render_video(video_path, subtitle_path, tts_mix_path if tts_tracks else None, output_path)
+        self._render_video(video_path, subtitle_path, tts_mix_path if tts_tracks else None, output_path, accompaniment_path=accompaniment_path)
         return output_path, subtitle_path
 
     def generate_srt(self, segments: list[TranscriptSegment], destination: Path) -> Path:
@@ -86,6 +89,7 @@ class VideoService:
         subtitle_path: Path,
         tts_mix_path: Path | None,
         output_path: Path,
+        accompaniment_path: Path | None = None,
     ) -> None:
         ffmpeg = _ffmpeg()
         video_input = ffmpeg.input(str(video_path))
@@ -96,9 +100,10 @@ class VideoService:
             video_stream = video_stream.filter("subtitles", subtitle_filter_path)
 
         if tts_mix_path is None:
+            audio_stream = ffmpeg.input(str(accompaniment_path)).audio if (accompaniment_path and accompaniment_path.is_file()) else video_input.audio
             command = ffmpeg.output(
                 video_stream,
-                video_input.audio,
+                audio_stream,
                 str(output_path),
                 vcodec="libx264",
                 acodec="aac",
@@ -108,10 +113,30 @@ class VideoService:
 
         tts_input = ffmpeg.input(str(tts_mix_path))
         tts_audio = tts_input.audio.filter("volume", self.config.tts_volume)
-        if self.config.background_volume > 0:
-            original_audio = video_input.audio.filter("volume", self.config.background_volume)
+        tts_split = tts_audio.filter_multi_output("asplit")
+        tts_sidechain = tts_split[0]
+        tts_for_mix = tts_split[1]
+        has_acc = accompaniment_path and accompaniment_path.is_file() and accompaniment_path.stat().st_size > 0
+        if self.config.vocal_separation and not has_acc:
+            raise RuntimeError(
+                "Vocal separation is enabled but no accompaniment track is available; "
+                "render stopped to prevent original voice bleed."
+            )
+        if has_acc:
+            bg_vol = self.config.background_volume if self.config.background_volume > 0 else ACCOMPANIMENT_DEFAULT_VOLUME
+            logger.info("video_service.render.accompaniment_ducked path=%s volume=%.2f", accompaniment_path, bg_vol)
+            bg_audio = ffmpeg.input(str(accompaniment_path)).audio.filter("volume", bg_vol)
+            background_audio = ffmpeg.filter(
+                [bg_audio, tts_sidechain],
+                "sidechaincompress",
+                threshold=0.02,
+                ratio=12,
+                attack=10,
+                release=320,
+                makeup=1,
+            )
             mixed_audio = ffmpeg.filter(
-                [original_audio, tts_audio],
+                [background_audio, tts_for_mix],
                 "amix",
                 inputs=2,
                 duration="first",
@@ -119,8 +144,27 @@ class VideoService:
                 normalize=0,
             )
         else:
-            logger.info("video_service.render.original_audio.muted video=%s", video_path)
-            mixed_audio = tts_audio
+            bg_vol = self.config.background_volume if self.config.background_volume > 0 else ORIGINAL_FALLBACK_VOLUME
+            logger.info("video_service.render.original_audio_emergency_duck video=%s volume=%.2f", video_path, bg_vol)
+            original_audio = video_input.audio.filter("volume", bg_vol)
+            background_audio = ffmpeg.filter(
+                [original_audio, tts_sidechain],
+                "sidechaincompress",
+                threshold=0.01,
+                ratio=20,
+                attack=5,
+                release=420,
+                makeup=1,
+            )
+            mixed_audio = ffmpeg.filter(
+                [background_audio, tts_for_mix],
+                "amix",
+                inputs=2,
+                duration="first",
+                dropout_transition=0,
+                normalize=0,
+            )
+        mixed_audio = mixed_audio.filter("alimiter", limit=0.95)
 
         command = ffmpeg.output(
             video_stream,

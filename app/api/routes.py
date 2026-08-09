@@ -44,6 +44,7 @@ logger = logging.getLogger("auto_dubbing.routes")
 
 REMOTE_ASR_PROVIDERS = {"9router", "remote", "openai-compatible", "openai_compatible", "gemini"}
 VOICE_REFERENCE_SUFFIXES = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus"}
+SOURCE_MEDIA_DIR = Path("temp") / "source_media"
 
 
 def _first_config_value(value: str | None, env_names: tuple[str, ...], fallback: str) -> str:
@@ -82,10 +83,59 @@ def _fallback_asr_model(value: str | None) -> str:
     clean_value = (value or "").strip()
     if clean_value:
         return clean_value
+
+
     provider = os.environ.get("AUTODUB_ASR_PROVIDER", "whisperx").strip().lower()
     if provider in REMOTE_ASR_PROVIDERS:
         return _first_config_value(None, ("AUTODUB_STT_MODEL",), "gemini/gemini-2.5-flash")
     return _first_config_value(None, ("AUTODUB_ASR_MODEL",), "base")
+
+
+def _media_name(media_path: str, field_name: str) -> str:
+    raw = media_path.strip()
+    if raw.startswith("http://") or raw.startswith("https://"):
+        from urllib.parse import urlparse
+
+        raw = urlparse(raw).path
+
+    name = Path(raw).name
+    if not name:
+        raise HTTPException(status_code=422, detail=f"Invalid {field_name}")
+    return name
+
+
+def _source_media_cache_path(media_path: str) -> Path:
+    name = _media_name(media_path, "source_video_path")
+    cache_root = SOURCE_MEDIA_DIR.resolve()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    path = (cache_root / name).resolve()
+    if path.parent != cache_root:
+        raise HTTPException(status_code=403, detail="source_video_path must point to cached source media")
+    return path
+
+
+def _cache_source_media(source_path: Path, media_path: str) -> None:
+    try:
+        destination = _source_media_cache_path(media_path)
+        source_resolved = source_path.resolve()
+        if source_resolved == destination:
+            return
+        shutil.copy2(source_path, destination)
+        logger.info(
+            "source_media.cached source=%s destination=%s size=%s",
+            source_path,
+            destination,
+            destination.stat().st_size,
+        )
+    except Exception:
+        logger.warning("source_media.cache_failed source=%s media_path=%s", source_path, media_path, exc_info=True)
+
+
+def _is_nonempty_file(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def _config_from_form(
@@ -111,6 +161,7 @@ def _config_from_form(
     copyright_confirmed: bool = False,
     copyright_source: str = "unknown",
     copyright_notes: str = "",
+    vocal_separation: bool = False,
 ) -> PipelineConfig:
     resolved_translation_provider = _first_config_value(
         translation_provider,
@@ -142,7 +193,7 @@ def _config_from_form(
         tts_volume=tts_volume,
         burn_subtitles=burn_subtitles,
         mock_translation=mock_translation,
-        mock_tts=False,
+        mock_tts=mock_tts,
         copyright_confirmed=copyright_confirmed,
         copyright_source=copyright_source,
         copyright_notes=copyright_notes,
@@ -151,6 +202,7 @@ def _config_from_form(
         ocr_model=resolved_ocr_model,
         ocr_interval_seconds=ocr_interval_seconds,
         ocr_crop_bottom_ratio=ocr_crop_bottom_ratio,
+        vocal_separation=vocal_separation,
     )
 
 
@@ -279,6 +331,7 @@ async def stream_dub_video(
     copyright_confirmed: bool = Form(default=False),
     copyright_source: str = Form(default="unknown"),
     copyright_notes: str = Form(default=""),
+    vocal_separation: bool = Form(default=False),
 ) -> StreamingResponse:
     """SSE endpoint for the Next.js client.
 
@@ -309,6 +362,7 @@ async def stream_dub_video(
         copyright_confirmed=copyright_confirmed,
         copyright_source=copyright_source,
         copyright_notes=copyright_notes,
+        vocal_separation=vocal_separation,
     )
     _require_copyright_preflight(config)
 
@@ -346,6 +400,7 @@ async def analyze_video_script(
     copyright_confirmed: bool = Form(default=False),
     copyright_source: str = Form(default="unknown"),
     copyright_notes: str = Form(default=""),
+    vocal_separation: bool = Form(default=False),
 ) -> AnalyzeResponse:
     config = _config_from_form(
         None if source_language == "auto" else source_language,
@@ -370,6 +425,7 @@ async def analyze_video_script(
         copyright_confirmed=copyright_confirmed,
         copyright_source=copyright_source,
         copyright_notes=copyright_notes,
+        vocal_separation=vocal_separation,
     )
     config.word_timestamps = True
     _require_copyright_preflight(config)
@@ -380,6 +436,7 @@ async def analyze_video_script(
         await workspace_manager.save_upload(video, workspace.input_video)
         preview_path = workspace.output_dir / f"{workspace.request_id}_source.mp4"
         shutil.copy2(workspace.input_video, preview_path)
+        _cache_source_media(workspace.input_video, preview_path.name)
         segments = AutoDubbingPipeline(config).analyze(workspace)
         return AnalyzeResponse(
             request_id=workspace.request_id,
@@ -417,6 +474,7 @@ async def analyze_video_script_stream(
     copyright_confirmed: bool = Form(default=False),
     copyright_source: str = Form(default="unknown"),
     copyright_notes: str = Form(default=""),
+    vocal_separation: bool = Form(default=False),
 ) -> StreamingResponse:
     config = _config_from_form(
         None if source_language == "auto" else source_language,
@@ -441,6 +499,7 @@ async def analyze_video_script_stream(
         copyright_confirmed=copyright_confirmed,
         copyright_source=copyright_source,
         copyright_notes=copyright_notes,
+        vocal_separation=vocal_separation,
     )
     config.word_timestamps = word_timestamps
     _require_copyright_preflight(config)
@@ -451,6 +510,7 @@ async def analyze_video_script_stream(
         await workspace_manager.save_upload(video, workspace.input_video)
         preview_path = workspace.output_dir / f"{workspace.request_id}_source.mp4"
         shutil.copy2(workspace.input_video, preview_path)
+        _cache_source_media(workspace.input_video, preview_path.name)
     except Exception:
         workspace_manager.cleanup(workspace)
         raise
@@ -461,22 +521,47 @@ async def analyze_video_script_stream(
         workspace,
         lambda cancel_event: AutoDubbingPipeline(config, cancel_event=cancel_event).analyze_stream(workspace),
     )
+
+
 def _output_media_path(media_path: str, field_name: str = "source_video_path") -> Path:
-    raw = media_path.strip()
-    if raw.startswith("http://") or raw.startswith("https://"):
-        from urllib.parse import urlparse
-
-        raw = urlparse(raw).path
-
-    name = Path(raw).name
-    if not name:
-        raise HTTPException(status_code=422, detail=f"Invalid {field_name}")
-
+    name = _media_name(media_path, field_name)
     output_root = Path("output").resolve()
     path = (output_root / name).resolve()
     if path.parent != output_root:
         raise HTTPException(status_code=403, detail=f"{field_name} must point to output media")
+    if field_name == "source_video_path" and not _is_nonempty_file(path):
+        cached_path = _source_media_cache_path(name)
+        if _is_nonempty_file(cached_path):
+            logger.info("source_media.cache_hit name=%s cached_path=%s", name, cached_path)
+            return cached_path
+        raise HTTPException(
+            status_code=404,
+            detail=f"Source video not found: {path}. Re-upload the source video to rerun render.",
+        )
     return path
+
+
+def _render_config(payload: RenderScriptRequest, clone_reference_audio_path: Path | None) -> PipelineConfig:
+    return PipelineConfig(
+        target_language=payload.target_language,
+        translation_provider=payload.translation_provider,
+        translation_model=payload.translation_model,
+        voice_model=payload.voice_model,
+        voice_mode=payload.voice_mode,
+        clone_reference_audio_path=(
+            str(clone_reference_audio_path) if clone_reference_audio_path is not None else None
+        ),
+        tts_device="cuda",
+        background_volume=payload.background_volume,
+        tts_volume=payload.tts_volume,
+        burn_subtitles=payload.burn_subtitles,
+        mock_translation=False,
+        mock_tts=False,
+        copyright_confirmed=payload.copyright_confirmed,
+        copyright_source=payload.copyright_source,
+        copyright_notes=payload.copyright_notes,
+        vocal_separation=payload.vocal_separation,
+    )
 
 
 def _shorten_text_response(request: ShortenTextRequest) -> ShortenTextResponse:
@@ -545,25 +630,7 @@ async def render_edited_script(request: Request, payload: RenderScriptRequest) -
         if not clone_reference_audio_path.is_file():
             raise HTTPException(status_code=404, detail="Clone reference audio not found.")
 
-    config = PipelineConfig(
-        target_language=payload.target_language,
-        translation_provider=payload.translation_provider,
-        translation_model=payload.translation_model,
-        voice_model=payload.voice_model,
-        voice_mode=payload.voice_mode,
-        clone_reference_audio_path=(
-            str(clone_reference_audio_path) if clone_reference_audio_path is not None else None
-        ),
-        tts_device="cuda",
-        background_volume=payload.background_volume,
-        tts_volume=payload.tts_volume,
-        burn_subtitles=payload.burn_subtitles,
-        mock_translation=False,
-        mock_tts=False,
-        copyright_confirmed=payload.copyright_confirmed,
-        copyright_source=payload.copyright_source,
-        copyright_notes=payload.copyright_notes,
-    )
+    config = _render_config(payload, clone_reference_audio_path)
     _require_copyright_preflight(config)
     source_video_path = _output_media_path(payload.source_video_path)
     workspace_manager = WorkspaceManager()
@@ -577,6 +644,58 @@ async def render_edited_script(request: Request, payload: RenderScriptRequest) -
             workspace=workspace,
             source_video_path=source_video_path,
             script_segments=payload.segments,
+        ),
+    )
+
+
+@stream_router.post("/render-script-upload")
+async def render_edited_script_with_video(
+    request: Request,
+    video: UploadFile = File(...),
+    payload: str = Form(...),
+) -> StreamingResponse:
+    try:
+        render_payload = RenderScriptRequest.model_validate_json(payload)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid render payload: {exc}") from exc
+
+    clone_reference_audio_path: Path | None = None
+    if render_payload.voice_mode == "clone":
+        clone_reference_audio_path = _output_media_path(
+            render_payload.clone_reference_audio_path or "",
+            field_name="clone_reference_audio_path",
+        )
+        if not clone_reference_audio_path.is_file():
+            raise HTTPException(status_code=404, detail="Clone reference audio not found.")
+
+    config = _render_config(render_payload, clone_reference_audio_path)
+    _require_copyright_preflight(config)
+
+    workspace_manager = WorkspaceManager()
+    workspace = workspace_manager.create()
+    try:
+        await workspace_manager.save_upload(video, workspace.input_video)
+        if not _is_nonempty_file(workspace.input_video):
+            raise HTTPException(status_code=422, detail="Source video upload is empty.")
+        _cache_source_media(workspace.input_video, render_payload.source_video_path)
+        logger.info(
+            "script_render.upload_fallback_received request_id=%s source_video_path=%s bytes=%s",
+            workspace.request_id,
+            render_payload.source_video_path,
+            workspace.input_video.stat().st_size,
+        )
+    except Exception:
+        workspace_manager.cleanup(workspace)
+        raise
+
+    return _streaming_pipeline_response(
+        request,
+        workspace_manager,
+        workspace,
+        lambda cancel_event: AutoDubbingPipeline(config, cancel_event=cancel_event).render_script(
+            workspace=workspace,
+            source_video_path=workspace.input_video,
+            script_segments=render_payload.segments,
         ),
     )
 
@@ -606,6 +725,7 @@ async def dub_video(
     copyright_confirmed: bool = Form(default=False),
     copyright_source: str = Form(default="unknown"),
     copyright_notes: str = Form(default=""),
+    vocal_separation: bool = Form(default=False),
 ) -> DubbingResponse:
     try:
         config = _config_from_form(
@@ -626,6 +746,7 @@ async def dub_video(
             copyright_confirmed=copyright_confirmed,
             copyright_source=copyright_source,
             copyright_notes=copyright_notes,
+            vocal_separation=vocal_separation,
         )
     except HTTPException:
         raise
@@ -666,6 +787,7 @@ async def dub_video_with_srt(
     copyright_confirmed: bool = Form(default=False),
     copyright_source: str = Form(default="unknown"),
     copyright_notes: str = Form(default=""),
+    vocal_separation: bool = Form(default=False),
 ) -> DubbingResponse:
     try:
         config = _config_from_form(
@@ -686,6 +808,7 @@ async def dub_video_with_srt(
             copyright_confirmed=copyright_confirmed,
             copyright_source=copyright_source,
             copyright_notes=copyright_notes,
+            vocal_separation=vocal_separation,
         )
     except HTTPException:
         raise
@@ -729,6 +852,7 @@ async def batch_dub_videos(
     copyright_confirmed: bool = Form(default=False),
     copyright_source: str = Form(default="unknown"),
     copyright_notes: str = Form(default=""),
+    vocal_separation: bool = Form(default=False),
 ) -> BatchDubbingResponse:
     try:
         config = _config_from_form(
@@ -749,6 +873,7 @@ async def batch_dub_videos(
             copyright_confirmed=copyright_confirmed,
             copyright_source=copyright_source,
             copyright_notes=copyright_notes,
+            vocal_separation=vocal_separation,
         )
     except HTTPException:
         raise
@@ -787,6 +912,7 @@ def process_douyin(request: DouyinRequest) -> BatchDubbingResponse:
 @router.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
 
 
 @router.get("/health/dependencies")

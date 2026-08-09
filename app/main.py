@@ -15,6 +15,7 @@ from app.api.genvideo_flow_routes import router as genvideo_flow_router
 from app.api.routes import compat_router, router as dubbing_router, stream_router
 from utils.model_cache import configure_model_cache
 from utils.model_registry import model_registry
+from utils.ninerouter import ensure_9router_running
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,6 +50,11 @@ Path("temp").mkdir(parents=True, exist_ok=True)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    logger.info("startup.ninerouter.begin")
+    if ensure_9router_running():
+        logger.info("startup.ninerouter.ready")
+    else:
+        logger.warning("startup.ninerouter.unreachable_or_failed")
     logger.info("startup.model_registry.begin")
     model_registry.startup()
     logger.info("startup.model_registry.ready stats=%s", model_registry.stats())

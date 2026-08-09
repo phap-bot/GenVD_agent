@@ -21,7 +21,6 @@ from utils.tts_voice import (
 )
 
 logger = logging.getLogger(__name__)
-MAX_NATURAL_TTS_SPEEDUP = 1.12
 
 
 def _ffmpeg():
@@ -148,7 +147,15 @@ class TTSService:
 
         natural_target = max(target_duration, 0.1)
         ratio = max(0.1, current_duration / natural_target)
-        tempo = min(ratio, MAX_NATURAL_TTS_SPEEDUP) if current_duration > natural_target else 1.0
+        tempo = ratio if current_duration > natural_target else 1.0
+        if tempo > 1.35:
+            logger.warning(
+                "tts_service.audio_fit.high_speed source=%s raw_duration=%.3f target_duration=%.3f tempo=%.3f",
+                source,
+                current_duration,
+                natural_target,
+                tempo,
+            )
         stream = ffmpeg.input(str(source)).audio
         for value in self._atempo_filters(tempo):
             stream = stream.filter("atempo", value)
