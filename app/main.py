@@ -116,7 +116,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["X-Request-ID"],
+    expose_headers=["X-Request-ID", "X-Render-Job-ID"],
 )
 
 app.include_router(dubbing_router)

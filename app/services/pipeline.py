@@ -51,6 +51,11 @@ TTS_CACHE_MAX_AGE_SECONDS = 2 * 24 * 3600  # 2 days
 AUDIO_STEM_CACHE_VERSION = "demucs-normalized-residual-v2"
 ACCOMPANIMENT_DEFAULT_VOLUME = 0.92
 ORIGINAL_FALLBACK_VOLUME = 0.12
+DEFAULT_X264_PRESET = "superfast"
+DEFAULT_X264_CRF = 22
+VALID_X264_PRESETS = frozenset(
+    {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}
+)
 
 # ── TTS segment merging constants ──
 TTS_MERGE_MAX_GAP = 0.5           # max silence gap (seconds) between segments to merge
@@ -376,14 +381,23 @@ class AutoDubbingPipeline:
             if not source_video_path.is_file() or source_video_path.stat().st_size <= 0:
                 raise FileNotFoundError(f"Source video not found: {source_video_path}")
             render_source_path = workspace.root / "render_source.mp4"
-            shutil.copy2(source_video_path, render_source_path)
-            logger.info(
-                "script_render.source_staged request_id=%s source=%s staged=%s bytes=%s",
-                workspace.request_id,
-                source_video_path,
-                render_source_path,
-                render_source_path.stat().st_size,
-            )
+            source_size = source_video_path.stat().st_size
+            if render_source_path.is_file() and render_source_path.stat().st_size == source_size:
+                logger.info(
+                    "script_render.source_checkpoint_hit request_id=%s staged=%s bytes=%s",
+                    workspace.request_id,
+                    render_source_path,
+                    source_size,
+                )
+            else:
+                self._atomic_copy_file(source_video_path, render_source_path)
+                logger.info(
+                    "script_render.source_staged request_id=%s source=%s staged=%s bytes=%s",
+                    workspace.request_id,
+                    source_video_path,
+                    render_source_path,
+                    render_source_path.stat().st_size,
+                )
             video_duration = self._safe_probe_duration(render_source_path)
             timeline_segments = self._clip_timeline_to_video(timeline_segments, video_duration)
 
@@ -1189,7 +1203,7 @@ class AutoDubbingPipeline:
                     cache_key = self._tts_group_cache_key(group)
                     try:
                         cache_dest = self._tts_cache_dir() / f"{cache_key}.wav"
-                        shutil.copy2(str(final_path), str(cache_dest))
+                        self._atomic_copy_file(final_path, cache_dest)
                     except Exception:
                         logger.warning("tts_cache.save_failed segment_id=%s cache_key=%s", group.first_segment_id, cache_key)
 
@@ -1220,6 +1234,18 @@ class AutoDubbingPipeline:
             return chunks
         finally:
             VRAMManager.cleanup()
+
+    @staticmethod
+    def _atomic_copy_file(source: Path, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(
+            f".{destination.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
+        try:
+            shutil.copy2(source, temporary)
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _fit_audio_duration(self, source: Path, destination: Path, target_duration: float) -> None:
         if self._fit_audio_duration_with_numpy(source, destination, target_duration):
@@ -1530,12 +1556,35 @@ class AutoDubbingPipeline:
             )
         mixed_audio = mixed_audio.filter("alimiter", limit=0.95)
 
+        x264_preset = os.environ.get("AUTODUB_X264_PRESET", DEFAULT_X264_PRESET).strip().lower()
+        if x264_preset not in VALID_X264_PRESETS:
+            logger.warning(
+                "legacy_pipeline.render.invalid_x264_preset value=%s fallback=%s",
+                x264_preset,
+                DEFAULT_X264_PRESET,
+            )
+            x264_preset = DEFAULT_X264_PRESET
+        try:
+            x264_crf = int(os.environ.get("AUTODUB_X264_CRF", str(DEFAULT_X264_CRF)))
+        except ValueError:
+            x264_crf = DEFAULT_X264_CRF
+        x264_crf = min(51, max(0, x264_crf))
+        logger.info(
+            "legacy_pipeline.render.encoder codec=libx264 preset=%s crf=%s",
+            x264_preset,
+            x264_crf,
+        )
+
         command = ffmpeg.output(
             video_stream,
             mixed_audio,
             str(output_path),
             vcodec="libx264",
             acodec="aac",
+            preset=x264_preset,
+            crf=x264_crf,
+            pix_fmt="yuv420p",
+            movflags="+faststart",
         ).overwrite_output()
         self._run_ffmpeg_command(command, "render")
 

@@ -28,6 +28,7 @@ from app.models.schemas import (
 from app.services.dependency_service import DependencyService
 from app.services.pipeline import AutoDubbingPipeline
 from app.services.pipeline_manager import PipelineManager
+from app.services.render_job_service import RenderJobDispatcher, RenderJobSubmission
 from app.utils.cancel import PipelineCancelledError
 from app.utils.files import safe_filename, save_upload_file
 from app.utils.vram import VRAMManager
@@ -40,6 +41,7 @@ router = APIRouter(prefix="/api/v1", tags=["dubbing"])
 compat_router = APIRouter(prefix="/api", tags=["dubbing-compat"])
 stream_router = APIRouter(prefix="/api", tags=["dubbing-stream"])
 logger = logging.getLogger("auto_dubbing.routes")
+STREAM_WORKER_JOIN_TIMEOUT_SECONDS = 5.0
 
 
 REMOTE_ASR_PROVIDERS = {"9router", "remote", "openai-compatible", "openai_compatible", "gemini"}
@@ -291,19 +293,79 @@ def _streaming_pipeline_response(request: Request, workspace_manager: WorkspaceM
                 ) + "\n\n"
         finally:
             cancel_event.set()
-            thread.join(timeout=5.0)
+            thread.join(timeout=STREAM_WORKER_JOIN_TIMEOUT_SECONDS)
             if thread.is_alive():
                 logger.warning(
                     "stream.worker.still_running_after_cancel request_id=%s cause=blocking_external_call hint=wait_for_timeout_or_check_9router_ffmpeg_tts",
                     request_id,
                 )
-            workspace_manager.cleanup(workspace)
-            logger.info("stream.workspace.cleaned request_id=%s", request_id)
+                def cleanup_after_worker() -> None:
+                    thread.join()
+                    workspace_manager.cleanup(workspace)
+                    logger.info("stream.workspace.cleaned_after_worker request_id=%s", request_id)
+
+                threading.Thread(
+                    target=cleanup_after_worker,
+                    daemon=True,
+                    name=f"autodub-cleanup-{request_id}",
+                ).start()
+            else:
+                workspace_manager.cleanup(workspace)
+                logger.info("stream.workspace.cleaned request_id=%s", request_id)
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+def _render_job_streaming_response(
+    request: Request,
+    dispatcher: RenderJobDispatcher,
+    submission: RenderJobSubmission,
+) -> StreamingResponse:
+    async def event_stream():
+        index = 0
+        while True:
+            events = await asyncio.to_thread(
+                dispatcher.store.read_events,
+                submission.job_id,
+                submission.attempt,
+            )
+            while index < len(events):
+                event = events[index]
+                index += 1
+                yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+
+            manifest = await asyncio.to_thread(dispatcher.store.read_manifest, submission.job_id)
+            terminal = manifest.get("status") in {"complete", "failed"}
+            if terminal:
+                latest_events = await asyncio.to_thread(
+                    dispatcher.store.read_events,
+                    submission.job_id,
+                    submission.attempt,
+                )
+                if len(latest_events) > index:
+                    continue
+                break
+            if await request.is_disconnected():
+                logger.info(
+                    "render_job.stream_disconnected job_id=%s attempt=%d worker_continues=true",
+                    submission.job_id,
+                    submission.attempt,
+                )
+                break
+            await asyncio.sleep(0.2)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Render-Job-ID": submission.job_id,
+        },
     )
 @stream_router.post("/dub")
 async def stream_dub_video(
@@ -633,19 +695,19 @@ async def render_edited_script(request: Request, payload: RenderScriptRequest) -
     config = _render_config(payload, clone_reference_audio_path)
     _require_copyright_preflight(config)
     source_video_path = _output_media_path(payload.source_video_path)
-    workspace_manager = WorkspaceManager()
-    workspace = workspace_manager.create()
-
-    return _streaming_pipeline_response(
-        request,
-        workspace_manager,
-        workspace,
-        lambda cancel_event: AutoDubbingPipeline(config, cancel_event=cancel_event).render_script(
-            workspace=workspace,
-            source_video_path=source_video_path,
-            script_segments=payload.segments,
-        ),
-    )
+    dispatcher = RenderJobDispatcher()
+    try:
+        submission = await asyncio.to_thread(
+            dispatcher.submit,
+            payload,
+            config,
+            source_video_path,
+            clone_reference_audio_path,
+        )
+    except Exception as exc:
+        logger.exception("render_job.submit_failed source=%s", source_video_path)
+        raise HTTPException(status_code=503, detail=f"Unable to queue render job: {exc}") from exc
+    return _render_job_streaming_response(request, dispatcher, submission)
 
 
 @stream_router.post("/render-script-upload")
@@ -684,20 +746,66 @@ async def render_edited_script_with_video(
             render_payload.source_video_path,
             workspace.input_video.stat().st_size,
         )
-    except Exception:
+        dispatcher = RenderJobDispatcher()
+        submission = await asyncio.to_thread(
+            dispatcher.submit,
+            render_payload,
+            config,
+            workspace.input_video,
+            clone_reference_audio_path,
+        )
+    except Exception as exc:
         workspace_manager.cleanup(workspace)
-        raise
+        if isinstance(exc, HTTPException):
+            raise
+        logger.exception("render_job.upload_submit_failed request_id=%s", workspace.request_id)
+        raise HTTPException(status_code=503, detail=f"Unable to queue render job: {exc}") from exc
 
-    return _streaming_pipeline_response(
-        request,
-        workspace_manager,
-        workspace,
-        lambda cancel_event: AutoDubbingPipeline(config, cancel_event=cancel_event).render_script(
-            workspace=workspace,
-            source_video_path=workspace.input_video,
-            script_segments=render_payload.segments,
-        ),
+    workspace_manager.cleanup(workspace)
+    return _render_job_streaming_response(request, dispatcher, submission)
+
+
+@stream_router.get("/render-jobs/{job_id}")
+async def render_job_status(job_id: str) -> dict[str, object]:
+    try:
+        UUID(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid render job ID.") from exc
+    dispatcher = RenderJobDispatcher()
+    try:
+        manifest = await asyncio.to_thread(dispatcher.store.read_manifest, job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    try:
+        auto_retry_attempts = max(1, int(os.environ.get("AUTODUB_RENDER_AUTO_ATTEMPTS", "3")))
+    except ValueError:
+        auto_retry_attempts = 3
+    should_resume = manifest.get("status") in {"pending", "queued", "running"} or (
+        manifest.get("status") == "failed"
+        and int(manifest.get("attempt", 0) or 0) < auto_retry_attempts
     )
+    if should_resume:
+        try:
+            submission = await asyncio.to_thread(dispatcher.resume, job_id)
+            if submission.enqueued:
+                logger.warning(
+                    "render_job.orphan_requeued job_id=%s attempt=%d",
+                    job_id,
+                    submission.attempt,
+                )
+            manifest = await asyncio.to_thread(dispatcher.store.read_manifest, job_id)
+        except Exception:
+            logger.exception("render_job.recovery_failed job_id=%s", job_id)
+            manifest = await asyncio.to_thread(dispatcher.store.read_manifest, job_id)
+    output_available = dispatcher.store.output_path(job_id).is_file()
+    if manifest.get("status") == "complete" and not output_available:
+        manifest = {
+            **manifest,
+            "status": "failed",
+            "phase": "error",
+            "error": "Rendered output is missing; submit the same render again to resume.",
+        }
+    return {**manifest, "output_available": output_available}
 
 
 @router.post("/shorten-text", response_model=ShortenTextResponse)

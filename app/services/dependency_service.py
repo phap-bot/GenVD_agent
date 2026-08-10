@@ -29,6 +29,8 @@ class DependencyService:
         cuda = self.cuda_status()
         from utils.ninerouter import is_9router_running
 
+        queue_backend = os.environ.get("AUTODUB_QUEUE_BACKEND", "local").strip().lower()
+
         return {
             "ninerouter_running": is_9router_running(),
             "ffmpeg_binary": self.check_binary("ffmpeg"),
@@ -41,6 +43,10 @@ class DependencyService:
             "yt_dlp": self.check_python_module("yt_dlp"),
             "vieneu": self.check_python_module("vieneu"),
             "demucs": self.check_python_module("demucs"),
+            "queue_backend": queue_backend,
+            "celery": self.check_python_module("celery"),
+            "redis_python": self.check_python_module("redis"),
+            "redis_reachable": self.redis_status() if queue_backend == "celery" else None,
             "cuda_available": cuda["available"],
             "cuda_device": cuda["device"],
         }
@@ -56,6 +62,19 @@ class DependencyService:
             }
         except Exception:
             return {"available": False, "device": None}
+
+    def redis_status(self) -> bool:
+        try:
+            import redis
+
+            client = redis.Redis.from_url(
+                os.environ.get("AUTODUB_REDIS_URL", "redis://127.0.0.1:6379/0"),
+                socket_connect_timeout=0.5,
+                socket_timeout=0.5,
+            )
+            return bool(client.ping())
+        except Exception:
+            return False
 
     def require_cuda(self) -> None:
         status = self.cuda_status()

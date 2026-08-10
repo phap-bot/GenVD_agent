@@ -197,3 +197,31 @@ class DouyinRequest(BaseModel):
     mode: Literal["single", "user"] = "single"
     max_items: int = Field(default=10, ge=1, le=100)
     config: PipelineConfig = Field(default_factory=PipelineConfig)
+
+
+class ShortVideoProfile(BaseModel):
+    """Backend-resolved processing profile for the additive Short Video workflow."""
+
+    name: Literal["micro", "short", "short_extended", "long"]
+    route: Literal["short_video", "clone_video"]
+    duration_seconds: float = Field(ge=0)
+    max_short_seconds: float = Field(default=300, gt=0)
+    asr_model: str
+    source_mode: Literal["auto", "voice", "subtitle", "hybrid"] = "auto"
+    vocal_separation_default: bool = False
+
+
+class ShortVideoInspectResponse(BaseModel):
+    media_id: str
+    filename: str
+    input_url: str
+    duration_seconds: float = Field(ge=0)
+    has_audio: bool
+    width: int | None = Field(default=None, ge=1)
+    height: int | None = Field(default=None, ge=1)
+    profile: ShortVideoProfile
+
+
+class ShortVideoProfilesResponse(BaseModel):
+    profiles: list[ShortVideoProfile]
+    short_video_max_seconds: float = Field(gt=0)

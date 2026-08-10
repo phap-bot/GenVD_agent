@@ -116,23 +116,29 @@ class VocalSeparationService:
                         overlap=0.5,
                         progress=False,
                     )
-                sources = sources * reference_std + reference_mean
+                source_scale = reference_std.to(sources.device)
+                source_offset = reference_mean.to(sources.device)
+                sources.mul_(source_scale).add_(source_offset)
 
                 # Map source names
                 source_names = model.sources
 
                 # Extract vocals tensor [2, time]
                 vocals_idx = source_names.index("vocals") if "vocals" in source_names else -1
-                if vocals_idx >= 0:
-                    vocals_tensor = sources[0, vocals_idx].cpu()
-                else:
-                    vocals_tensor = sources[0, -1].cpu()
+                vocals_source = sources[0, vocals_idx if vocals_idx >= 0 else -1].detach()
+                vocals_tensor = vocals_source.clone() if vocals_source.device.type == "cpu" else vocals_source.cpu()
+
+                # A full 19-minute four-stem result can retain well over 1 GB
+                # on CPU. Keep only vocals before allocating the residual.
+                del vocals_source, sources, normalized_wav, reference, source_scale, source_offset
+                if device == "cuda":
+                    torch.cuda.empty_cache()
 
                 # Preserve the original ambience, stereo image and transients.
-                # The residual is more faithful than re-summing independently
-                # estimated stems and removes the model's complete vocal stem.
-                acc_tensor = original_wav.cpu() - vocals_tensor
-                acc_tensor = acc_tensor.clamp(-1.0, 1.0)
+                # Reuse the original audio buffer for the residual to avoid two
+                # additional full-duration allocations.
+                acc_tensor = original_wav.cpu()
+                acc_tensor.sub_(vocals_tensor).clamp_(-1.0, 1.0)
 
                 # Save wav files
                 torchaudio.save(str(vocals_path), vocals_tensor, sr)
