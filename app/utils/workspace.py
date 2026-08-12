@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 import shutil
 import threading
 import time
@@ -104,10 +106,74 @@ class WorkspaceManager:
             logger.info("workspace.cleanup removed=%s root=%s max_age_s=%s", removed, root, max_age_seconds)
         return removed
 
+    def evict_stale_output(self, max_age_seconds: float = 12 * 3600) -> int:
+        """Remove expired generated media while preserving active requests/jobs.
+
+        Output files are intentionally flat because they are served by the
+        ``/media`` mount.  Files belonging to an active workspace or queued
+        render job are protected even when their mtime is old.
+        """
+        root = self.output_root.resolve()
+        if not root.is_dir():
+            return 0
+        cutoff = time.time() - max(1.0, float(max_age_seconds))
+        protected_prefixes = self._active_output_prefixes()
+        removed = 0
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            return 0
+        for entry in entries:
+            try:
+                if not entry.is_file() or entry.name.startswith("."):
+                    continue
+                if any(entry.name.startswith(prefix) for prefix in protected_prefixes):
+                    continue
+                if entry.stat().st_mtime >= cutoff:
+                    continue
+                entry.unlink()
+                removed += 1
+            except (OSError, RuntimeError):
+                # A render/download may replace the file concurrently.
+                continue
+        if removed:
+            logger.info("output.cleanup removed=%s root=%s max_age_s=%s", removed, root, max_age_seconds)
+        return removed
+
     @classmethod
-    def evict_stale_all(cls, max_age_seconds: float = 24 * 3600) -> dict[str, int]:
+    def _active_output_prefixes(cls) -> set[str]:
+        prefixes = set()
+        with cls._active_lock:
+            prefixes.update(f"{root.name}_" for root in cls._active_workspaces)
+
+        # Render jobs do not use WorkspaceManager.create(), so inspect their
+        # durable manifests to avoid deleting a queued/running job's output.
+        render_root = Path(os.environ.get("AUTODUB_RENDER_JOB_ROOT", "render_jobs"))
+        try:
+            for manifest_path in render_root.glob("*/manifest.json"):
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    if manifest.get("status") in {"pending", "queued", "running"}:
+                        job_id = str(manifest.get("job_id") or manifest_path.parent.name)
+                        prefixes.add(f"{job_id}_")
+                except (OSError, ValueError, TypeError):
+                    continue
+        except OSError:
+            pass
+        return prefixes
+
+    @classmethod
+    def evict_stale_all(
+        cls,
+        max_age_seconds: float = 24 * 3600,
+        output_max_age_seconds: float = 12 * 3600,
+    ) -> dict[str, int]:
         """Sweep request workspaces and other bounded temporary media roots."""
-        removed = {"temp_workspace": cls().evict_stale(max_age_seconds)}
+        manager = cls()
+        removed = {
+            "temp_workspace": manager.evict_stale(max_age_seconds),
+            "output": manager.evict_stale_output(output_max_age_seconds),
+        }
         # Short Video uploads and source previews are durable only for the
         # current processing window; they must not accumulate indefinitely.
         for name, path in (

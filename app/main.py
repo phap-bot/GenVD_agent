@@ -71,15 +71,23 @@ def _hours_env(name: str, default: float) -> float:
 async def _temp_cleanup_loop() -> None:
     retention_hours = _hours_env("AUTODUB_TEMP_CLEANUP_MAX_AGE_HOURS", 24.0)
     interval_hours = _hours_env("AUTODUB_TEMP_CLEANUP_INTERVAL_HOURS", 24.0)
+    output_retention_hours = _hours_env("AUTODUB_OUTPUT_CLEANUP_MAX_AGE_HOURS", 12.0)
+    output_interval_hours = _hours_env("AUTODUB_OUTPUT_CLEANUP_INTERVAL_HOURS", 1.0)
     retention_seconds = retention_hours * 3600.0
+    output_retention_seconds = output_retention_hours * 3600.0
+    sweep_interval_seconds = min(interval_hours, output_interval_hours) * 3600.0
     while True:
         try:
-            await asyncio.to_thread(WorkspaceManager.evict_stale_all, retention_seconds)
+            await asyncio.to_thread(
+                WorkspaceManager.evict_stale_all,
+                retention_seconds,
+                output_retention_seconds,
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("temp.cleanup.failed")
-        await asyncio.sleep(interval_hours * 3600.0)
+        await asyncio.sleep(sweep_interval_seconds)
 
 
 @asynccontextmanager

@@ -24,6 +24,7 @@ import {
   Workflow,
 } from "lucide-react";
 import { DragEvent, PointerEvent, useEffect, useRef, useState } from "react";
+import { downloadUrlToDestination } from "@/lib/download-destination";
 
 const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 const FLOW_ID = process.env.NEXT_PUBLIC_GENVIDEO_FLOW_ID || "main";
@@ -285,6 +286,18 @@ export default function GenVideoPipeline() {
     }
   }
 
+  async function downloadGeneratedVideo() {
+    if (!generatedVideoUrl) return;
+    try {
+      const { savedInFolder } = await downloadUrlToDestination(generatedVideoUrl, "video", "gen_video.mp4");
+      if (savedInFolder) {
+        setRunMessage("Đã lưu video vào thư mục đã cấu hình.");
+      }
+    } catch (caught) {
+      setRunMessage(caught instanceof Error ? caught.message : "Không tải được video.");
+    }
+  }
+
   return (
     <section className="min-h-[calc(100vh-64px)] bg-[#f4f7fb] text-slate-950">
       <div className="mx-auto max-w-[1680px] px-5 py-6 lg:px-8">
@@ -346,7 +359,7 @@ export default function GenVideoPipeline() {
             {selectedNode ? <NodeInspector node={selectedNode} provider={provider} entry={catalogByKind.get(selectedNode.kind)} onSettingChange={updateSelectedSetting} onDelete={deleteSelected} /> : <div className="flex h-full min-h-64 flex-col items-center justify-center text-center text-slate-400"><Settings2 size={28} /><p className="mt-3 text-sm font-semibold">Chọn một node để chỉnh</p></div>}
           </aside>
 
-          {generatedVideoUrl && <section className="col-span-full rounded-2xl border border-emerald-200 bg-emerald-50 p-4 shadow-soft"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-[11px] font-bold uppercase tracking-[0.18em] text-emerald-700">Video output</p><h3 className="mt-1 text-base font-semibold">Backend đã tạo xong MP4</h3></div><a href={generatedVideoUrl} download className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-700"><Download size={14} /> Tải MP4</a></div><video className="mt-4 max-h-[520px] w-full rounded-xl bg-slate-950 object-contain" src={generatedVideoUrl} controls /></section>}
+          {generatedVideoUrl && <section className="col-span-full rounded-2xl border border-emerald-200 bg-emerald-50 p-4 shadow-soft"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-[11px] font-bold uppercase tracking-[0.18em] text-emerald-700">Video output</p><h3 className="mt-1 text-base font-semibold">Backend đã tạo xong MP4</h3></div><button type="button" onClick={() => void downloadGeneratedVideo()} className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-700"><Download size={14} /> Tải MP4</button></div><video className="mt-4 max-h-[520px] w-full rounded-xl bg-slate-950 object-contain" src={generatedVideoUrl} controls /></section>}
         </section>
       </div>
     </section>

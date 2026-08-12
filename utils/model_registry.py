@@ -7,6 +7,7 @@ import sys
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from utils.model_cache import (
@@ -18,6 +19,32 @@ from utils.model_cache import (
 logger = logging.getLogger("auto_dubbing.model_registry")
 
 ModelMover = Callable[[Any, str], None]
+
+
+def _load_cached_demucs_model(model_name: str) -> Any | None:
+    """Load a complete Demucs Hugging Face snapshot without a network probe."""
+    try:
+        import yaml
+        from demucs.apply import BagOfModels
+        from demucs.hf import DEFAULT_NAMESPACE, hf_repo_name, load_safetensors_model
+        from huggingface_hub import snapshot_download
+
+        repo_id = f"{DEFAULT_NAMESPACE}/{hf_repo_name(model_name)}"
+        snapshot = Path(snapshot_download(repo_id, local_files_only=True))
+        definition_path = snapshot / f"{model_name}.yaml"
+        if not definition_path.is_file():
+            return None
+        with definition_path.open("r", encoding="utf-8") as handle:
+            bag = yaml.safe_load(handle)
+        model_paths = [snapshot / f"{signature}.safetensors" for signature in bag["models"]]
+        if not all(path.is_file() for path in model_paths):
+            return None
+        models = [load_safetensors_model(path) for path in model_paths]
+        logger.info("model_registry.demucs.local_cache_hit model=%s snapshot=%s", model_name, snapshot)
+        return BagOfModels(models, bag.get("weights"), bag.get("segment"))
+    except Exception:
+        logger.debug("model_registry.demucs.local_cache_miss model=%s", model_name, exc_info=True)
+        return None
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -214,8 +241,11 @@ class ModelRegistry:
         device: str,
         compute_type: str,
         language: str | None,
+        beam_size: int = 5,
     ) -> Iterator[Any]:
-        key = ("whisperx-asr", whisper_arch, device, compute_type)
+        normalized_beam_size = max(1, min(10, int(beam_size)))
+        normalized_language = (language or "auto").strip().lower()
+        key = ("whisperx-asr", whisper_arch, device, compute_type, normalized_beam_size, normalized_language)
 
         def loader() -> Any:
             return load_whisperx_model(
@@ -223,7 +253,8 @@ class ModelRegistry:
                 whisper_arch,
                 device=device,
                 compute_type=compute_type,
-                language=None,
+                language=None if normalized_language == "auto" else normalized_language,
+                asr_options={"beam_size": normalized_beam_size},
             )
 
         def prepare(model: Any) -> None:
@@ -269,10 +300,59 @@ class ModelRegistry:
             except ImportError as exc:
                 raise RuntimeError("VieNeu-TTS is not installed. Install it with `pip install vieneu`.") from exc
 
-            return Vieneu(mode="v3turbo", device=device, backend=backend)
+            # Prefer an explicitly downloaded local checkpoint so deployment
+            # never silently re-downloads a gated/large model from Hugging Face.
+            backbone_repo = (
+                os.environ.get("AUTODUB_VIENEU_BACKBONE_REPO")
+                or os.environ.get("AUTODUB_VIENEU_MODEL_DIR")
+                or "pnnbao-ump/VieNeu-TTS-v3-Turbo"
+            )
+            kwargs: dict[str, Any] = {
+                "device": device,
+                "backend": backend,
+                "backbone_repo": backbone_repo,
+            }
+            model_subfolder = os.environ.get("AUTODUB_VIENEU_MODEL_SUBFOLDER")
+            if model_subfolder:
+                kwargs["model_subfolder"] = model_subfolder
+            onnx_dir = os.environ.get("AUTODUB_VIENEU_ONNX_DIR")
+            if onnx_dir:
+                kwargs["onnx_dir"] = onnx_dir
+            return Vieneu(mode="v3turbo", **kwargs)
 
         handle = self._handle(key, loader, _move_vieneu_model)
         with handle.acquire(device=device, prepare=_prepare_vieneu_for_cuda) as model:
+            yield model
+
+    @contextmanager
+    def acquire_demucs(
+        self,
+        *,
+        model_name: str = "htdemucs",
+        device: str = "cpu",
+    ) -> Iterator[Any]:
+        key = ("demucs", model_name)
+
+        def loader() -> Any:
+            # This loader is also used by PipelineManager without importing the
+            # legacy pipeline module first. Pin the cache here so Demucs never
+            # falls back to the user profile or redownloads model weights.
+            configure_model_cache()
+            try:
+                from demucs.pretrained import get_model
+            except ImportError as exc:
+                raise RuntimeError("Demucs is required for vocal separation. Install demucs: `pip install demucs`") from exc
+            model = _load_cached_demucs_model(model_name)
+            if model is None:
+                model = get_model(model_name)
+            model.eval()
+            return model
+
+        def mover(model: Any, target_device: str) -> None:
+            _move_torch_object(model, target_device)
+
+        handle = self._handle(key, loader, mover)
+        with handle.acquire(device=device) as model:
             yield model
 
     def startup(self) -> None:

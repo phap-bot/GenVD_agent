@@ -55,12 +55,21 @@ def extract_video_ocr_segments(
     max_frames: int = 80,
     batch_size: int = 6,
     timeout: float = 45.0,
+    adaptive: bool = True,
+    scene_threshold: float = 0.28,
     cancel_event: Event | None = None,
 ) -> list[OcrTextSegment]:
     selected_model = (model or os.environ.get("AUTODUB_OCR_MODEL") or DEFAULT_OCR_MODEL).strip()
     interval = min(5.0, max(0.25, interval_seconds))
     crop_ratio = min(0.85, max(0.12, crop_bottom_ratio))
-    frames, duration = _capture_subtitle_frames(video_path, interval, crop_ratio, max_frames)
+    frames, duration = _capture_subtitle_frames(
+        video_path,
+        interval,
+        crop_ratio,
+        max_frames,
+        adaptive=adaptive,
+        scene_threshold=scene_threshold,
+    )
     if not frames:
         logger.warning("ocr.frames.empty video=%s", video_path)
         return []
@@ -102,6 +111,9 @@ def _capture_subtitle_frames(
     interval_seconds: float,
     crop_bottom_ratio: float,
     max_frames: int,
+    *,
+    adaptive: bool = True,
+    scene_threshold: float = 0.28,
 ) -> tuple[list[OcrFrame], float]:
     try:
         import cv2
@@ -119,6 +131,15 @@ def _capture_subtitle_frames(
         duration = _probe_duration_with_cv2(capture, interval_seconds)
 
     timestamps = _sample_timestamps(duration, interval_seconds, max_frames)
+    if adaptive and duration > interval_seconds * 2 and len(timestamps) < max_frames:
+        timestamps = _adaptive_scene_timestamps(
+            video_path,
+            timestamps,
+            duration=duration,
+            interval_seconds=interval_seconds,
+            max_frames=max_frames,
+            threshold=scene_threshold,
+        )
     frames: list[OcrFrame] = []
     try:
         for index, timestamp in enumerate(timestamps):
@@ -171,6 +192,51 @@ def _sample_timestamps(duration: float, interval_seconds: float, max_frames: int
         interval_seconds = duration / max_frames
         count = max_frames
     return [min(duration, round(index * interval_seconds, 3)) for index in range(count)]
+
+
+def _adaptive_scene_timestamps(
+    video_path: Path,
+    base_timestamps: list[float],
+    *,
+    duration: float,
+    interval_seconds: float,
+    max_frames: int,
+    threshold: float,
+) -> list[float]:
+    """Add likely subtitle/scene transitions while staying within frame budget."""
+    try:
+        import cv2
+        import numpy as np
+
+        capture = cv2.VideoCapture(str(video_path))
+        if not capture.isOpened():
+            return base_timestamps
+        candidates = _sample_timestamps(duration, max(interval_seconds * 1.75, 0.5), max_frames * 2)
+        previous = None
+        scene_points: list[float] = []
+        for timestamp in candidates:
+            capture.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000)
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                continue
+            gray = cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (64, 36))
+            current = gray.astype(np.float32)
+            if previous is not None:
+                delta = float(np.mean(np.abs(current - previous)) / 255.0)
+                if delta >= max(0.02, min(1.0, threshold)):
+                    scene_points.append(timestamp)
+            previous = current
+        capture.release()
+        merged = sorted({round(float(value), 3) for value in [*base_timestamps, *scene_points]})
+        if len(merged) > max_frames:
+            # Preserve uniform coverage first, then fill with the strongest
+            # transitions (the candidate list is already chronological).
+            stride = len(merged) / max_frames
+            merged = [merged[min(len(merged) - 1, int(index * stride))] for index in range(max_frames)]
+        return merged
+    except Exception:
+        logger.warning("ocr.adaptive_sampling.failed video=%s", video_path, exc_info=True)
+        return base_timestamps
 
 
 def _ocr_frames_with_9router(

@@ -21,14 +21,18 @@ import {
   X,
 } from "lucide-react";
 import { ChangeEvent, DragEvent, PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import AudioClipSelector, { PreparedAudioClip } from "./audio-clip-selector";
+import AudioClipSelector, { PreparedAudioClip, VOICE_REFERENCE_SECONDS } from "./audio-clip-selector";
 import GenVideoPipeline from "./genvideo-pipeline";
+import ShortVideoWorkspace from "./short-video-workspace";
+import DownloadSetup from "./download-setup";
 import { deleteSessionFiles, readSessionFile, writeSessionFile } from '@/lib/session-files';
+import { downloadUrlToDestination } from '@/lib/download-destination';
 
-const BACKEND_URL = "http://localhost:8000";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8000";
 const ANALYZE_URL = `${BACKEND_URL}/api/analyze-stream`;
 const RENDER_SCRIPT_URL = `${BACKEND_URL}/api/render-script`;
 const RENDER_SCRIPT_UPLOAD_URL = `${BACKEND_URL}/api/render-script-upload`;
+const RENDER_JOB_URL = `${BACKEND_URL}/api/render-jobs`;
 const VOICE_REFERENCE_URL = `${BACKEND_URL}/api/voice-reference`;
 const SHORTEN_TEXT_URL = `${BACKEND_URL}/api/shorten-text`;
 const TRANSLATION_MODELS_URL = `${BACKEND_URL}/api/translation/models`;
@@ -115,6 +119,7 @@ type ToastState = {
 
 type ProcessingStats = {
   segments?: number;
+  groups?: number;
   speech_duration?: number;
   video_duration?: number;
   characters?: number;
@@ -136,7 +141,7 @@ type ProcessingActivity = {
 type StudioSessionSnapshot = {
   version: number;
   sessionId: string;
-  activeWorkspace: 'clone' | 'gen';
+  activeWorkspace: 'clone' | 'short' | 'gen' | 'setup';
   sourceVideoUrl: string;
   segments: ScriptSegment[];
   config: StudioConfig;
@@ -150,6 +155,7 @@ type StudioSessionSnapshot = {
   processingActivities: ProcessingActivity[];
   resultVideoUrl: string;
   resultSubtitleUrl: string;
+  renderJobId: string;
   textLayerEnabled: boolean;
   savedDemoSegments: ScriptSegment[] | null;
   savedTextLayerEnabled: boolean | null;
@@ -193,7 +199,11 @@ const fallbackTranslationModels: ModelOption[] = [
 ];
 
 const fallbackAsrModelOptions: ModelOption[] = [
+  { label: "WhisperX local (tiny int8)", value: "tiny" },
   { label: "WhisperX local (base int8)", value: "base" },
+  { label: "WhisperX local (small int8)", value: "small" },
+  { label: "WhisperX local (medium int8)", value: "medium" },
+  { label: "WhisperX local (large-v3 float16)", value: "large-v3" },
   { label: "Gemini 2.5 Flash STT qua 9Router", value: "gemini/gemini-2.5-flash" },
   { label: "Gemini 2.5 Flash Lite STT qua 9Router", value: "gemini/gemini-2.5-flash-lite" },
   { label: "Gemini 2.5 Pro STT qua 9Router", value: "gemini/gemini-2.5-pro" },
@@ -413,9 +423,10 @@ function phaseLabel(phase: string) {
 }
 
 function segmentProgress(stats: ProcessingStats | null) {
-  if (!stats || typeof stats.chunks !== "number" || typeof stats.segments !== "number" || stats.segments <= 0) return null;
-  const done = Math.min(stats.segments, Math.max(0, stats.chunks));
-  return { done, total: stats.segments, percent: clampProgress((done / stats.segments) * 100) };
+  const total = stats?.groups ?? stats?.segments;
+  if (!stats || typeof stats.chunks !== "number" || typeof total !== "number" || total <= 0) return null;
+  const done = Math.min(total, Math.max(0, stats.chunks));
+  return { done, total, percent: clampProgress((done / total) * 100) };
 }
 
 function statsSummary(stats: ProcessingStats | null) {
@@ -468,7 +479,8 @@ export default function VideoDubbingStudio() {
   const lastStoredVideoFileRef = useRef<File | null>(null);
   const lastStoredCloneFileRef = useRef<File | null>(null);
   const pendingFileSavesRef = useRef(0);
-  const [activeWorkspace, setActiveWorkspace] = useState<"clone" | "gen">("clone");
+  const cloneSelectionRevisionRef = useRef(0);
+  const [activeWorkspace, setActiveWorkspace] = useState<"clone" | "short" | "gen" | "setup">("clone");
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
   const [sourceVideoUrl, setSourceVideoUrl] = useState("");
@@ -508,6 +520,7 @@ export default function VideoDubbingStudio() {
   const [processingActivities, setProcessingActivities] = useState<ProcessingActivity[]>([]);
   const [resultVideoUrl, setResultVideoUrl] = useState("");
   const [resultSubtitleUrl, setResultSubtitleUrl] = useState("");
+  const [renderJobId, setRenderJobId] = useState("");
   const [textLayerEnabled, setTextLayerEnabled] = useState(true);
   const [savedDemoSegments, setSavedDemoSegments] = useState<ScriptSegment[] | null>(null);
   const [savedTextLayerEnabled, setSavedTextLayerEnabled] = useState<boolean | null>(null);
@@ -519,6 +532,13 @@ export default function VideoDubbingStudio() {
     setToast({ type: "error", message });
     window.setTimeout(() => setToast(null), 5200);
   }, []);
+
+  const handleCloneClipReady = useCallback((clip: PreparedAudioClip | null) => {
+    cloneSelectionRevisionRef.current += 1;
+    setPreparedCloneClip(clip);
+  }, []);
+
+  const voiceControlsLocked = isAnalyzing || isRendering;
 
   const totalDuration = useMemo(() => {
     if (segments.length === 0) return 0;
@@ -557,6 +577,7 @@ export default function VideoDubbingStudio() {
     processingActivities,
     resultVideoUrl: resultVideoUrl.startsWith('blob:') ? '' : resultVideoUrl,
     resultSubtitleUrl: resultSubtitleUrl.startsWith('blob:') ? '' : resultSubtitleUrl,
+    renderJobId,
     textLayerEnabled,
     savedDemoSegments,
     savedTextLayerEnabled,
@@ -582,6 +603,7 @@ export default function VideoDubbingStudio() {
     progress,
     resultSubtitleUrl,
     resultVideoUrl,
+    renderJobId,
     savedDemoSegments,
     savedTextLayerEnabled,
     segments,
@@ -622,7 +644,7 @@ export default function VideoDubbingStudio() {
           : null;
 
         translationModelTouchedRef.current = Boolean(snapshot.config?.translationModel);
-        setActiveWorkspace(snapshot.activeWorkspace === 'gen' ? 'gen' : 'clone');
+        setActiveWorkspace(snapshot.activeWorkspace === 'gen' ? 'gen' : snapshot.activeWorkspace === 'short' ? 'short' : snapshot.activeWorkspace === 'setup' ? 'setup' : 'clone');
         setSourceVideoUrl(snapshot.sourceVideoUrl || '');
         setSegments(restoredSegments);
         setConfig(restoredConfig);
@@ -636,6 +658,7 @@ export default function VideoDubbingStudio() {
         setProcessingActivities(Array.isArray(snapshot.processingActivities) ? snapshot.processingActivities : []);
         setResultVideoUrl(snapshot.resultVideoUrl || '');
         setResultSubtitleUrl(snapshot.resultSubtitleUrl || '');
+        setRenderJobId(snapshot.renderJobId || '');
         setTextLayerEnabled(snapshot.textLayerEnabled ?? true);
         setSavedDemoSegments(restoredSavedSegments);
         setSavedTextLayerEnabled(snapshot.savedTextLayerEnabled ?? null);
@@ -698,6 +721,85 @@ export default function VideoDubbingStudio() {
       window.removeEventListener('pagehide', persistSnapshot);
     };
   }, [sessionSnapshot]);
+
+  useEffect(() => {
+    if (!sessionHydrated || !renderJobId) return;
+    let cancelled = false;
+    let timer: number | null = null;
+
+    const poll = async () => {
+      if (cancelled) return;
+      try {
+        const response = await fetch(`${RENDER_JOB_URL}/${renderJobId}`, { cache: "no-store" });
+        if (response.status === 404) {
+          setRenderJobId("");
+          return;
+        }
+        if (!response.ok) throw new Error(await response.text());
+        const job = (await response.json()) as {
+          status?: string;
+          phase?: string;
+          progress?: number;
+          error?: string;
+          output_video_url?: string;
+          output_subtitle_url?: string;
+          completed_groups?: number;
+          total_groups?: number;
+        };
+        const jobProgress = typeof job.progress === "number" ? clampProgress(job.progress) : null;
+        const completedGroups = typeof job.completed_groups === "number" ? Math.max(0, job.completed_groups) : null;
+        const totalGroups = typeof job.total_groups === "number" && job.total_groups > 0 ? job.total_groups : null;
+        const voiceStats: ProcessingStats | null = completedGroups !== null && totalGroups !== null
+          ? { chunks: Math.min(completedGroups, totalGroups), groups: totalGroups }
+          : null;
+        const voiceDetail = voiceStats ? statsSummary(voiceStats) : "";
+
+        if (jobProgress !== null) setProgress((current) => Math.max(current, jobProgress));
+        if (job.phase) {
+          setProcessingPhase(job.phase);
+          const nextStep = phaseToStep(job.phase);
+          if (nextStep !== null) setActiveStep(nextStep);
+        }
+        if (voiceStats) {
+          setProcessingStats((current) => ({ ...current, ...voiceStats }));
+          setProcessingDetail(job.phase === "render" ? `${voiceDetail} \u00b7 \u0110ang d\u1ef1ng video` : voiceDetail);
+          pushProcessingActivity("voice", phaseLabel("voice"), voiceDetail, segmentProgress(voiceStats)?.percent ?? 0, voiceStats);
+        }
+        if (job.phase && job.phase !== "voice" && jobProgress !== null) {
+          const phaseDetail = job.phase === "render" ? "\u0110ang tr\u1ed9n \u00e2m thanh v\u00e0 d\u1ef1ng video" : phaseLabel(job.phase);
+          pushProcessingActivity(job.phase, phaseLabel(job.phase), phaseDetail, jobProgress, null);
+        }
+        if (job.status === "complete") {
+          setIsRendering(false);
+          setActiveStep(4);
+          setProgress(100);
+          setStatusText("Ho\u00e0n t\u1ea5t - xem demo tr\u01b0\u1edbc khi t\u1ea3i xu\u1ed1ng");
+          if (job.output_video_url) setResultVideoUrl(mediaUrl(job.output_video_url));
+          if (job.output_subtitle_url) setResultSubtitleUrl(mediaUrl(job.output_subtitle_url));
+          return;
+        }
+        if (job.status === "failed") {
+          setIsRendering(false);
+          setStatusText("Render th\u1ea5t b\u1ea1i");
+          setProcessingDetail(job.error || "Render worker failed");
+          return;
+        }
+        if (job.status === "queued" || job.status === "running") {
+          setIsRendering(true);
+          setStatusText(job.status === "queued" ? "Render \u0111ang ch\u1edd worker" : phaseLabel(job.phase || ""));
+        }
+      } catch {
+        // A transient API restart must not discard the durable job ID.
+      }
+      timer = window.setTimeout(poll, 2000);
+    };
+
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [renderJobId, sessionHydrated]);
 
   useEffect(() => {
     if (!persistenceReadyRef.current || !sessionIdRef.current || file === lastStoredVideoFileRef.current) return;
@@ -859,6 +961,7 @@ export default function VideoDubbingStudio() {
     });
     setActiveStep(0);
     setCloneReferenceFile(null);
+    cloneSelectionRevisionRef.current += 1;
     setPreparedCloneClip(null);
     setInitialCloneSelection(null);
     setSelectedSegmentId(null);
@@ -1158,6 +1261,8 @@ export default function VideoDubbingStudio() {
       if (!message || message === "[DONE]") continue;
 
       const parsed = JSON.parse(message) as Record<string, unknown>;
+      const parsedJobId = typeof parsed.job_id === "string" ? parsed.job_id : "";
+      if (parsedJobId) setRenderJobId(parsedJobId);
       const error = typeof parsed.error === "string" ? parsed.error : "";
       if (error) throw new Error(error);
 
@@ -1234,6 +1339,8 @@ export default function VideoDubbingStudio() {
   async function readEventStream(response: Response) {
     if (!response.ok) throw new Error(await httpErrorMessage(response));
     if (!response.body) throw new Error("Backend khong tra stream.");
+    const responseJobId = response.headers.get("X-Render-Job-ID");
+    if (responseJobId) setRenderJobId(responseJobId);
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -1250,14 +1357,24 @@ export default function VideoDubbingStudio() {
     if (buffer.trim()) await handleStreamEvent(buffer);
   }
 
-  async function uploadCloneReference(): Promise<string | null> {
+  function assertCloneSelectionUnchanged(expectedRevision: number) {
+    if (cloneSelectionRevisionRef.current !== expectedRevision) {
+      throw new Error("Đoạn giọng mẫu đã thay đổi trong lúc tải lên. Hãy render lại với đoạn 3 giây mới.");
+    }
+  }
+
+  async function uploadCloneReference(expectedRevision: number): Promise<string | null> {
     if (config.voiceMode === "system") return null;
+    assertCloneSelectionUnchanged(expectedRevision);
     if (!preparedCloneClip) {
       throw new Error("Đã chọn luồng clone nhưng chưa có đoạn giọng mẫu hợp lệ.");
     }
 
     const formData = new FormData();
     formData.append("audio", preparedCloneClip.file);
+    formData.append("clip_duration_seconds", String(VOICE_REFERENCE_SECONDS));
+    formData.append("selection_start_seconds", preparedCloneClip.start.toFixed(6));
+    formData.append("selection_end_seconds", preparedCloneClip.end.toFixed(6));
     const response = await fetch(VOICE_REFERENCE_URL, {
       method: "POST",
       body: formData,
@@ -1266,6 +1383,7 @@ export default function VideoDubbingStudio() {
 
     const payload = (await response.json()) as { path?: string };
     if (!payload.path) throw new Error("Backend không trả đường dẫn giọng mẫu.");
+    assertCloneSelectionUnchanged(expectedRevision);
     return payload.path;
   }
 
@@ -1288,6 +1406,7 @@ export default function VideoDubbingStudio() {
       return;
     }
     setIsRendering(true);
+    setRenderJobId("");
     setActiveStep(3);
     resetProcessing("Đang bắt đầu render bản demo...", 5, "voice");
     setResultVideoUrl("");
@@ -1300,7 +1419,9 @@ export default function VideoDubbingStudio() {
           throw new Error("Mỗi đoạn thoại phải có một giọng hệ thống hợp lệ.");
         }
         const systemVoiceModel = scriptDefaultVoice();
-        const cloneReferenceAudioPath = await uploadCloneReference();
+        const cloneSelectionRevision = cloneSelectionRevisionRef.current;
+        const cloneReferenceAudioPath = await uploadCloneReference(cloneSelectionRevision);
+        assertCloneSelectionUnchanged(cloneSelectionRevision);
         const renderSegments = baseSegments.map((segment) => ({
           ...segment,
           voice_model: segment.voice_model,
@@ -1396,26 +1517,27 @@ export default function VideoDubbingStudio() {
     }
   }
 
-  async function downloadResultSubtitle() {
-    if (!resultSubtitleUrl) return;
+  async function downloadResultFile(url: string, kind: "video" | "subtitle", fallbackName: string, successLabel: string) {
+    if (!url) return;
     try {
-      const response = await fetch(resultSubtitleUrl);
-      if (!response.ok) throw new Error("Kh\u00f4ng t\u1ea3i \u0111\u01b0\u1ee3c file SRT.");
-      const blobUrl = URL.createObjectURL(await response.blob());
-      const link = document.createElement("a");
-      const pathname = new URL(resultSubtitleUrl).pathname;
-      link.href = blobUrl;
-      link.download = decodeURIComponent(pathname.split("/").pop() || "capcut_subtitles.srt");
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      URL.revokeObjectURL(blobUrl);
+      const { savedInFolder } = await downloadUrlToDestination(url, kind, fallbackName);
+      if (savedInFolder) {
+        showToast({ type: "success", message: `${successLabel} vào thư mục đã cấu hình.` });
+      }
     } catch (error) {
       showToast({
         type: "error",
-        message: error instanceof Error ? error.message : "Kh\u00f4ng t\u1ea3i \u0111\u01b0\u1ee3c file SRT.",
+        message: error instanceof Error ? error.message : `Không tải được file ${kind === "video" ? "video" : "SRT"}.`,
       });
     }
+  }
+
+  async function downloadResultSubtitle() {
+    await downloadResultFile(resultSubtitleUrl, "subtitle", "capcut_subtitles.srt", "Đã lưu SRT");
+  }
+
+  async function downloadResultVideo() {
+    await downloadResultFile(resultVideoUrl, "video", "dubbed_video.mp4", "Đã lưu video");
   }
 
   return (
@@ -1433,9 +1555,9 @@ export default function VideoDubbingStudio() {
 
         <nav className="hidden items-center gap-2 text-sm font-medium text-slate-600 lg:flex" aria-label="Chức năng chính">
           <button type="button" onClick={() => setActiveWorkspace("clone")} className={`rounded-md px-4 py-2 ${activeWorkspace === "clone" ? "border border-blue-200 bg-blue-50 text-blue-700" : "hover:bg-slate-100"}`}>Clone Video</button>
+          <button type="button" onClick={() => setActiveWorkspace("short")} className={`rounded-md px-4 py-2 ${activeWorkspace === "short" ? "border border-blue-200 bg-blue-50 text-blue-700" : "hover:bg-slate-100"}`}>Short Video</button>
           <button type="button" onClick={() => setActiveWorkspace("gen")} className={`rounded-md px-4 py-2 ${activeWorkspace === "gen" ? "border border-blue-200 bg-blue-50 text-blue-700" : "hover:bg-slate-100"}`}>Gen Video</button>
-          <button className="rounded-md px-4 py-2 hover:bg-slate-100">Clone Hàng loạt</button>
-          <button className="rounded-md px-4 py-2 hover:bg-slate-100">Download Video</button>
+          <button type="button" onClick={() => setActiveWorkspace("setup")} className={`rounded-md px-4 py-2 ${activeWorkspace === "setup" ? "border border-blue-200 bg-blue-50 text-blue-700" : "hover:bg-slate-100"}`}>Thiết lập tải</button>
           <button className="rounded-md px-4 py-2 hover:bg-slate-100">Hướng Dẫn</button>
         </nav>
 
@@ -1459,8 +1581,12 @@ export default function VideoDubbingStudio() {
         </p>
       </header>
 
-      {activeWorkspace === "gen" ? (
+      {activeWorkspace === "setup" ? (
+        <DownloadSetup onBack={() => setActiveWorkspace("clone")} />
+      ) : activeWorkspace === "gen" ? (
         <GenVideoPipeline />
+      ) : activeWorkspace === "short" ? (
+        <ShortVideoWorkspace onOpenClone={() => setActiveWorkspace("clone")} />
       ) : (
         <section className="grid min-h-[calc(100vh-64px)] min-w-0 lg:grid-cols-[360px_minmax(0,1fr)]" aria-label="Không gian làm việc lồng tiếng video">
         <aside className="min-w-0 overflow-hidden border-r border-slate-200 bg-white p-5">
@@ -1583,25 +1709,27 @@ export default function VideoDubbingStudio() {
             <fieldset className="grid gap-3 rounded-md border border-blue-200 bg-blue-50/50 p-3">
               <legend className="px-1 text-sm font-semibold text-blue-800">Nguồn giọng TTS</legend>
               <div className="grid grid-cols-2 gap-2">
-                <label className={`cursor-pointer rounded-md border px-3 py-2 text-sm font-semibold ${config.voiceMode === "system" ? "border-blue-400 bg-white text-blue-700" : "border-slate-200 bg-slate-50 text-slate-600"}`}>
+                <label className={`${voiceControlsLocked ? "cursor-not-allowed opacity-60" : "cursor-pointer"} rounded-md border px-3 py-2 text-sm font-semibold ${config.voiceMode === "system" ? "border-blue-400 bg-white text-blue-700" : "border-slate-200 bg-slate-50 text-slate-600"}`}>
                   <input
                     type="radio"
                     name="voice-mode"
                     value="system"
                     checked={config.voiceMode === "system"}
+                    disabled={voiceControlsLocked}
                     onChange={() => setConfig((current) => ({ ...current, voiceMode: "system" }))}
-                    className="mr-2"
+                    className="mr-2 disabled:cursor-not-allowed"
                   />
                   Giọng hệ thống
                 </label>
-                <label className={`cursor-pointer rounded-md border px-3 py-2 text-sm font-semibold ${config.voiceMode === "clone" ? "border-blue-400 bg-white text-blue-700" : "border-slate-200 bg-slate-50 text-slate-600"}`}>
+                <label className={`${voiceControlsLocked ? "cursor-not-allowed opacity-60" : "cursor-pointer"} rounded-md border px-3 py-2 text-sm font-semibold ${config.voiceMode === "clone" ? "border-blue-400 bg-white text-blue-700" : "border-slate-200 bg-slate-50 text-slate-600"}`}>
                   <input
                     type="radio"
                     name="voice-mode"
                     value="clone"
                     checked={config.voiceMode === "clone"}
+                    disabled={voiceControlsLocked}
                     onChange={() => setConfig((current) => ({ ...current, voiceMode: "clone" }))}
-                    className="mr-2"
+                    className="mr-2 disabled:cursor-not-allowed"
                   />
                   Giọng clone
                 </label>
@@ -1609,29 +1737,32 @@ export default function VideoDubbingStudio() {
               {config.voiceMode === "clone" && (
                 <div className="grid gap-2 text-sm font-medium text-slate-700">
                   <label className="grid gap-2">
-                    File giọng mẫu (chọn file dài, sau đó cắt đoạn sạch 3–10 giây)
+                    File giọng mẫu (chọn file dài ít nhất 3 giây, sau đó chọn đúng một đoạn sạch 3 giây)
                     <input
                       type="file"
                       accept="audio/*,.wav,.flac,.mp3,.m4a,.ogg,.opus"
+                      disabled={voiceControlsLocked}
                       onChange={(event) => {
+                        cloneSelectionRevisionRef.current += 1;
                         setCloneReferenceFile(event.target.files?.[0] ?? null);
                         setPreparedCloneClip(null);
                         setInitialCloneSelection(null);
                       }}
-                      className="block w-full rounded-md border border-blue-200 bg-white px-3 py-2 text-sm file:mr-3 file:rounded file:border-0 file:bg-blue-50 file:px-3 file:py-1 file:font-semibold file:text-blue-700"
+                      className="block w-full rounded-md border border-blue-200 bg-white px-3 py-2 text-sm file:mr-3 file:rounded file:border-0 file:bg-blue-50 file:px-3 file:py-1 file:font-semibold file:text-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
                     />
                   </label>
                   {cloneReferenceFile && (
                     <AudioClipSelector
                       file={cloneReferenceFile}
                       initialSelection={initialCloneSelection}
-                      onClipReady={setPreparedCloneClip}
+                      disabled={voiceControlsLocked}
+                      onClipReady={handleCloneClipReady}
                       onError={handleCloneClipError}
                     />
                   )}
                   <span className="text-xs text-slate-500">
                     {preparedCloneClip
-                      ? `Sẽ dùng đoạn ${preparedCloneClip.start.toFixed(1)}–${preparedCloneClip.end.toFixed(1)} giây từ ${cloneReferenceFile?.name}.`
+                      ? `Chỉ gửi đoạn ${preparedCloneClip.start.toFixed(2)}–${preparedCloneClip.end.toFixed(2)} giây từ ${cloneReferenceFile?.name}; không gửi toàn bộ file.`
                       : cloneReferenceFile
                         ? "Đang chuẩn bị đoạn âm thanh đã chọn..."
                         : "Bắt buộc chọn file. Nếu clone lỗi, tác vụ sẽ dừng; không đổi sang giọng hệ thống."}
@@ -1695,10 +1826,10 @@ export default function VideoDubbingStudio() {
                 {formatTime(totalDuration)}
               </time>
               {resultVideoUrl && (
-                <a href={resultVideoUrl} download className="inline-flex h-10 items-center gap-2 rounded-md bg-slate-950 px-4 text-sm font-semibold text-white">
+                <button type="button" onClick={() => void downloadResultVideo()} className="inline-flex h-10 items-center gap-2 rounded-md bg-slate-950 px-4 text-sm font-semibold text-white">
                   <Download size={16} aria-hidden="true" />
                   Tải video
-                </a>
+                </button>
               )}
               {resultSubtitleUrl && (
                 <button
@@ -1824,10 +1955,10 @@ export default function VideoDubbingStudio() {
                     {isRendering ? <Loader2 className="animate-spin" size={16} /> : <RefreshCw size={16} />}
                     Render lại bản đã lưu
                   </button>
-                  <a href={resultVideoUrl} download className="inline-flex h-10 items-center gap-2 rounded-md bg-slate-950 px-4 text-sm font-semibold text-white">
+                  <button type="button" onClick={() => void downloadResultVideo()} className="inline-flex h-10 items-center gap-2 rounded-md bg-slate-950 px-4 text-sm font-semibold text-white">
                     <Download size={16} aria-hidden="true" />
                     Tải xuống
-                  </a>
+                  </button>
                   {resultSubtitleUrl && (
                     <button
                       type="button"

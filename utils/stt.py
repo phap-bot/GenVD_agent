@@ -21,6 +21,8 @@ LOCAL_ASR_MODELS = [
     ("tiny", "WhisperX local (tiny int8)"),
     ("base", "WhisperX local (base int8)"),
     ("small", "WhisperX local (small int8)"),
+    ("medium", "WhisperX local (medium int8)"),
+    ("large-v3", "WhisperX local (large-v3 float16)"),
 ]
 LOCAL_ASR_MODEL_IDS = {model_id for model_id, _label in LOCAL_ASR_MODELS}
 FALLBACK_STT_MODELS = [

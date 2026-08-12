@@ -132,11 +132,15 @@ def translate_segments(
     texts: list[str],
     *,
     target_language: str,
+    target_durations: list[float] | None = None,
     source_language: str | None = None,
     provider: str | None = None,
     model: str | None = None,
     timeout: float = 45.0,
     cancel_event: Event | None = None,
+    batch_size: int | None = None,
+    context: str | None = None,
+    cps_budget: float | None = None,
 ) -> list[str]:
     if not texts:
         return []
@@ -146,6 +150,9 @@ def translate_segments(
     selected_provider = (provider or _config_value("AUTODUB_TRANSLATION_PROVIDER") or "9router").strip().lower()
     selected_model = _selected_translation_model(model)
     clean_texts = [text.strip() for text in texts]
+    clean_durations = [max(0.1, float(value)) for value in (target_durations or [])]
+    if len(clean_durations) != len(clean_texts):
+        clean_durations = [0.0] * len(clean_texts)
     failed_models: set[str] = set()
 
     if selected_provider in {"mock", "none", "off"}:
@@ -170,12 +177,16 @@ def translate_segments(
         ]
 
     translated: list[str] = []
-    for batch in _translation_batches(clean_texts):
+    batch_offset = 0
+    for batch in _translation_batches(clean_texts, max_items=batch_size):
         _raise_if_cancelled(cancel_event)
+        batch_durations = tuple(clean_durations[batch_offset : batch_offset + len(batch)])
+        batch_offset += len(batch)
         try:
             translated.extend(
                 _translate_9router_segments_with_model_fallback(
                     tuple(batch),
+                    target_durations=batch_durations,
                     source=source,
                     target=target,
                     selected_model=selected_model,
@@ -184,6 +195,8 @@ def translate_segments(
                     timeout=timeout,
                     cancel_event=cancel_event,
                     failed_models=failed_models,
+                    context=context or "",
+                    cps_budget=cps_budget or 12.5,
                 )
             )
         except Exception as exc:
@@ -262,7 +275,17 @@ def list_translation_models(timeout: float = 2.0) -> dict[str, object]:
             models = _dedupe_models([_gateway_model_id(model) for model in [*FALLBACK_TRANSLATION_MODELS, *fetched_models]])
             source = "9router"
     except (OSError, TimeoutError, URLError) as exc:
-        logger.warning("translation.models.unavailable base_url=%s error=%s", base_url, exc)
+        try:
+            from utils.ninerouter import ensure_9router_running
+            if ensure_9router_running(base_url, wait_timeout=5.0):
+                fetched_models = _list_9router_models(base_url, api_key, timeout=timeout)
+                if fetched_models:
+                    models = _dedupe_models([_gateway_model_id(model) for model in [*FALLBACK_TRANSLATION_MODELS, *fetched_models]])
+                    source = "9router"
+            else:
+                logger.warning("translation.models.unavailable base_url=%s error=%s", base_url, exc)
+        except Exception:
+            logger.warning("translation.models.unavailable base_url=%s error=%s", base_url, exc)
     except Exception:
         logger.warning("translation.models.fetch_failed base_url=%s", base_url, exc_info=True)
 
@@ -346,6 +369,103 @@ def shorten_text_for_duration(
     return _shorten_heuristic(clean_text, word_limit), word_limit, selected_provider, selected_model
 
 
+def shorten_segments_for_duration(
+    texts: list[str],
+    *,
+    target_durations: list[float],
+    target_language: str = "vi",
+    source_texts: list[str] | None = None,
+    context: str | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    max_words: list[int] | None = None,
+    timeout: float = 45.0,
+    batch_size: int = 40,
+    cancel_event: Event | None = None,
+) -> list[str]:
+    """Review timing-constrained lines in bounded batches, never one request per line."""
+    if not texts:
+        return []
+    if len(target_durations) != len(texts):
+        raise ValueError("target_durations must match texts")
+    clean_texts = [text.strip() for text in texts]
+    clean_sources = [text.strip() for text in (source_texts or texts)]
+    if len(clean_sources) != len(clean_texts):
+        raise ValueError("source_texts must match texts")
+    limits = list(max_words or [
+        _shorten_word_limit(duration, None) for duration in target_durations
+    ])
+    if len(limits) != len(clean_texts):
+        raise ValueError("max_words must match texts")
+    limits = [max(1, int(value)) for value in limits]
+
+    selected_provider = (provider or _config_value("AUTODUB_TRANSLATION_PROVIDER") or "9router").strip().lower()
+    selected_model = _selected_translation_model(model)
+    target = _normalize_language(target_language, fallback="vi")
+    if selected_provider not in {"9router", "ninerouter", "openai-compatible", "openai_compatible"}:
+        return [_shorten_heuristic(text, limit) for text, limit in zip(clean_texts, limits)]
+
+    results: list[str] = []
+    offset = 0
+    batches = _translation_batches(clean_texts, max_items=batch_size)
+    logger.info(
+        "shorten.batch_plan segments=%s batches=%s max_items=%s",
+        len(clean_texts),
+        len(batches),
+        batch_size,
+    )
+    for batch_number, batch in enumerate(batches, start=1):
+        _raise_if_cancelled(cancel_event)
+        size = len(batch)
+        logger.info(
+            "shorten.batch_start batch=%s/%s segments=%s",
+            batch_number,
+            len(batches),
+            size,
+        )
+        batch_durations = tuple(max(0.1, float(value)) for value in target_durations[offset : offset + size])
+        batch_sources = tuple(clean_sources[offset : offset + size])
+        batch_limits = tuple(limits[offset : offset + size])
+        try:
+            shortened = _shorten_9router_segments_cached(
+                tuple(batch),
+                batch_sources,
+                batch_durations,
+                batch_limits,
+                target,
+                selected_model,
+                _nine_router_base_url(),
+                _nine_router_api_key() or "",
+                _translation_attempt_timeout(timeout),
+                context or "",
+            )
+            results.extend(
+                _enforce_shortened_text(value, original, limit)
+                for value, original, limit in zip(shortened, batch, batch_limits)
+            )
+            logger.info(
+                "shorten.batch_done batch=%s/%s segments=%s",
+                batch_number,
+                len(batches),
+                size,
+            )
+        except Exception as exc:
+            logger.warning(
+                "shorten.batch_failed provider=%s model=%s target=%s batch_size=%s fallback=heuristic error=%s",
+                selected_provider,
+                selected_model,
+                target,
+                size,
+                exc,
+            )
+            results.extend(
+                _shorten_heuristic(original, limit)
+                for original, limit in zip(batch, batch_limits)
+            )
+        offset += size
+    return results
+
+
 def _translate_9router_text_with_model_fallback(
     text: str,
     *,
@@ -392,6 +512,7 @@ def _translate_9router_text_with_model_fallback(
 def _translate_9router_segments_with_model_fallback(
     texts: tuple[str, ...],
     *,
+    target_durations: tuple[float, ...],
     source: str,
     target: str,
     selected_model: str,
@@ -400,6 +521,8 @@ def _translate_9router_segments_with_model_fallback(
     timeout: float,
     cancel_event: Event | None = None,
     failed_models: set[str] | None = None,
+    context: str = "",
+    cps_budget: float = 12.5,
 ) -> list[str]:
     last_error: Exception | None = None
     _raise_if_cancelled(cancel_event)
@@ -412,12 +535,15 @@ def _translate_9router_segments_with_model_fallback(
             return _with_connection_refused_retries(
                 lambda: _translate_9router_segments_cached(
                     texts,
+                    target_durations,
                     source,
                     target,
                     model,
                     base_url,
                     api_key,
                     attempt_timeout,
+                    context,
+                    float(cps_budget),
                 ),
                 model=model,
                 source=source,
@@ -449,6 +575,7 @@ def _translate_9router_segments_with_model_fallback(
         return [
             *_translate_9router_segments_with_model_fallback(
                 texts[:midpoint],
+                target_durations=target_durations[:midpoint],
                 source=source,
                 target=target,
                 selected_model=selected_model,
@@ -457,9 +584,12 @@ def _translate_9router_segments_with_model_fallback(
                 timeout=timeout,
                 cancel_event=cancel_event,
                 failed_models=failed_models,
+                context=context,
+                cps_budget=cps_budget,
             ),
             *_translate_9router_segments_with_model_fallback(
                 texts[midpoint:],
+                target_durations=target_durations[midpoint:],
                 source=source,
                 target=target,
                 selected_model=selected_model,
@@ -468,6 +598,8 @@ def _translate_9router_segments_with_model_fallback(
                 timeout=timeout,
                 cancel_event=cancel_event,
                 failed_models=failed_models,
+                context=context,
+                cps_budget=cps_budget,
             ),
         ]
     if last_error is not None:
@@ -672,14 +804,102 @@ def _shorten_9router_cached(
 
 
 @lru_cache(maxsize=256)
+def _shorten_9router_segments_cached(
+    texts: tuple[str, ...],
+    source_texts: tuple[str, ...],
+    target_durations: tuple[float, ...],
+    max_words: tuple[int, ...],
+    target: str,
+    model: str,
+    base_url: str,
+    api_key: str,
+    timeout: float,
+    context: str = "",
+) -> list[str]:
+    payload = {
+        "model": model,
+        "temperature": 0.1,
+        "stream": False,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "You are a professional dubbing script editor. Shorten every numbered translated "
+                    "segment only enough to fit its timing budget while preserving meaning, names, "
+                    "numbers, negation, tone, and the main action. Return only valid JSON. Do not skip, "
+                    "merge, split, or reorder ids."
+                    + (f" Continuity context (do not repeat it): {context}" if context else "")
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "target_language": _language_name(target),
+                        "response_schema": {"segments": [{"id": 0, "text": "shortened segment 0"}]},
+                        "rules": [
+                            "Return exactly one object for every input id and no extra ids.",
+                            "Never exceed max_spoken_words for each segment.",
+                            "Preserve the key meaning; remove filler and repetition first.",
+                            "Use natural complete spoken phrasing; never cut a word or end on a dangling conjunction.",
+                        ],
+                        "segments": [
+                            {
+                                "id": index,
+                                "source_text": source_texts[index],
+                                "current_translation": text,
+                                "target_duration_seconds": round(target_durations[index], 3),
+                                "max_spoken_words": max_words[index],
+                            }
+                            for index, text in enumerate(texts)
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        ],
+    }
+    request = Request(
+        _api_url(base_url, "chat/completions"),
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=_openai_compatible_headers(api_key),
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+            content_type = response.headers.get("Content-Type", "")
+    except HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"9Router batch shorten request failed with HTTP {exc.code}: {detail}") from exc
+
+    content = _parse_chat_completion_body(body, content_type).strip()
+    shortened = _parse_translation_response(content, expected_count=len(texts))
+    if len(shortened) != len(texts):
+        raise ValueError(f"Expected {len(texts)} shortened segments, got {len(shortened)}")
+    logger.info(
+        "shorten.done provider=9router_batch model=%s target=%s segments=%s input_words=%s output_words=%s",
+        model,
+        target,
+        len(texts),
+        sum(_count_words(text) for text in texts),
+        sum(_count_words(text) for text in shortened),
+    )
+    return shortened
+
+
+@lru_cache(maxsize=256)
 def _translate_9router_segments_cached(
     texts: tuple[str, ...],
+    target_durations: tuple[float, ...],
     source: str,
     target: str,
     model: str,
     base_url: str,
     api_key: str,
     timeout: float,
+    context: str = "",
+    cps_budget: float = 12.5,
 ) -> list[str]:
     payload = {
         "model": model,
@@ -699,6 +919,7 @@ def _translate_9router_segments_cached(
                     "expert opinions not implied by the source. Return only valid JSON, with no "
                     "markdown, notes, romanization, pinyin, or source-language text unless it is a "
                     "proper name."
+                    + (f" Continuity context (do not repeat it): {context}" if context else "")
                 ),
             },
             {
@@ -717,10 +938,29 @@ def _translate_9router_segments_cached(
                             "Return one translation object for every input id. Do not skip, merge, split, or reorder ids.",
                             "The JSON must contain exactly the same ids as input and no extra ids.",
                             "Each text value must contain only that segment's translation.",
+                            "Write complete spoken sentences; never end on a dangling conjunction or split a word.",
+                            "Respect max_spoken_words for timing. Prefer concise natural phrasing over literal verbosity.",
                             *_translation_rules(target),
                         ],
                         "segments": [
-                            {"id": index, "text": text}
+                            {
+                                "id": index,
+                                "text": text,
+                                "target_duration_seconds": round(target_durations[index], 3),
+                                "max_spoken_words": (
+                                    max(1, int(min(
+                                        target_durations[index] * SHORTEN_WORDS_PER_SECOND,
+                                        target_durations[index] * float(cps_budget) / 4.0,
+                                    )))
+                                    if target_durations[index] > 0
+                                    else None
+                                ),
+                                "max_characters": (
+                                    max(1, int(target_durations[index] * float(cps_budget)))
+                                    if target_durations[index] > 0
+                                    else None
+                                ),
+                            }
                             for index, text in enumerate(texts)
                         ],
                     },
@@ -906,8 +1146,9 @@ def _translate_google_gtx_cached(text: str, source: str, target: str, timeout: f
     return translated.strip() or text
 
 
-def _translation_batches(texts: list[str]) -> list[list[str]]:
-    max_items = _env_int("AUTODUB_TRANSLATION_BATCH_SIZE", 6, minimum=1, maximum=80)
+def _translation_batches(texts: list[str], *, max_items: int | None = None) -> list[list[str]]:
+    max_items = max_items or _env_int("AUTODUB_TRANSLATION_BATCH_SIZE", 6, minimum=1, maximum=80)
+    max_items = max(1, min(80, int(max_items)))
     max_chars = _env_int("AUTODUB_TRANSLATION_BATCH_CHARS", 900, minimum=120, maximum=20000)
     batches: list[list[str]] = []
     current: list[str] = []
@@ -1101,7 +1342,7 @@ def _with_connection_refused_retries(
             logger.warning(
                 "translation.connection_refused_retry cause=9router_unreachable base_url=%s hint=%s model=%s source=%s target=%s batch_size=%s attempt=%s retries=%s delay=%.2f error=%s",
                 _nine_router_base_url(),
-                "Start 9Router/local gateway or switch AUTODUB_TRANSLATION_PROVIDER=google/mock.",
+                "Auto-starting 9Router gateway...",
                 model,
                 source,
                 target,
@@ -1111,6 +1352,11 @@ def _with_connection_refused_retries(
                 delay,
                 exc,
             )
+            try:
+                from utils.ninerouter import ensure_9router_running
+                ensure_9router_running(_nine_router_base_url())
+            except Exception as auto_err:
+                logger.warning("translation.autostart_9router_failed error=%s", auto_err)
             deadline = time.monotonic() + delay
             while True:
                 _raise_if_cancelled(cancel_event)
@@ -1384,12 +1630,6 @@ def _language_name(language: str) -> str:
         "es": "Spanish",
     }
     return names.get(language, language)
-
-
-
-
-
-
 
 
 

@@ -1,11 +1,10 @@
 "use client";
 
-import { GripVertical, Loader2, Pause, Play, Scissors } from "lucide-react";
-import { PointerEvent, useEffect, useRef, useState } from "react";
+import { Loader2, Pause, Play, Scissors } from "lucide-react";
+import { PointerEvent, useCallback, useEffect, useRef, useState } from "react";
 
-const MIN_CLIP_SECONDS = 3;
-const MAX_CLIP_SECONDS = 10;
-const MIN_DRAG_SECONDS = 0.1;
+export const VOICE_REFERENCE_SECONDS = 3;
+const MIN_SOURCE_TOLERANCE_SECONDS = 0.001;
 
 type Selection = {
   start: number;
@@ -22,12 +21,13 @@ export type PreparedAudioClip = {
 type AudioClipSelectorProps = {
   file: File;
   initialSelection?: Selection | null;
+  disabled?: boolean;
   onClipReady: (clip: PreparedAudioClip | null) => void;
   onError: (message: string) => void;
 };
 
 type DragState = {
-  mode: "start" | "end" | "move" | "new";
+  mode: "move" | "new";
   anchorTime: number;
   initial: Selection;
 };
@@ -44,27 +44,26 @@ function formatTime(value: number) {
 }
 
 function normalizedSelection(selection: Selection, duration: number): Selection {
-  const maxLength = Math.min(MAX_CLIP_SECONDS, duration);
-  const minLength = Math.min(MIN_CLIP_SECONDS, duration);
-  let start = clamp(Math.min(selection.start, selection.end), 0, duration);
-  let end = clamp(Math.max(selection.start, selection.end), 0, duration);
-  let length = end - start;
+  if (duration < VOICE_REFERENCE_SECONDS) return { start: 0, end: duration };
+  const start = clamp(Math.min(selection.start, selection.end), 0, duration - VOICE_REFERENCE_SECONDS);
+  return { start, end: start + VOICE_REFERENCE_SECONDS };
+}
 
-  if (length > maxLength) {
-    end = start + maxLength;
-    length = maxLength;
-  }
-  if (length < minLength) {
-    end = Math.min(duration, start + minLength);
-    start = Math.max(0, end - minLength);
-  }
-  return { start, end };
+function centeredSelection(center: number, duration: number): Selection {
+  return normalizedSelection(
+    {
+      start: center - VOICE_REFERENCE_SECONDS / 2,
+      end: center + VOICE_REFERENCE_SECONDS / 2,
+    },
+    duration,
+  );
 }
 
 function encodeSelectionAsWav(buffer: AudioBuffer, selection: Selection) {
-  const startFrame = Math.floor(selection.start * buffer.sampleRate);
-  const endFrame = Math.min(buffer.length, Math.ceil(selection.end * buffer.sampleRate));
-  const frameCount = Math.max(1, endFrame - startFrame);
+  const frameCount = Math.round(VOICE_REFERENCE_SECONDS * buffer.sampleRate);
+  const maxStartFrame = Math.max(0, buffer.length - frameCount);
+  const startFrame = Math.round(clamp(selection.start * buffer.sampleRate, 0, maxStartFrame));
+  const endFrame = startFrame + frameCount;
   const wav = new ArrayBuffer(44 + frameCount * 2);
   const view = new DataView(wav);
 
@@ -129,22 +128,38 @@ function drawWaveform(canvas: HTMLCanvasElement, buffer: AudioBuffer) {
   }
 }
 
-export default function AudioClipSelector({ file, initialSelection, onClipReady, onError }: AudioClipSelectorProps) {
+export default function AudioClipSelector({ file, initialSelection, disabled = false, onClipReady, onError }: AudioClipSelectorProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const stopTimerRef = useRef<number | null>(null);
+  const playAttemptRef = useRef(0);
   const dragRef = useRef<DragState | null>(null);
-  const objectUrlRef = useRef("");
   const [buffer, setBuffer] = useState<AudioBuffer | null>(null);
   const [selection, setSelection] = useState<Selection>({ start: 0, end: 0 });
+  const [clipPreviewUrl, setClipPreviewUrl] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [loadError, setLoadError] = useState("");
+
+  const clearStopTimer = useCallback(() => {
+    if (stopTimerRef.current !== null) window.clearTimeout(stopTimerRef.current);
+    stopTimerRef.current = null;
+  }, []);
+
+  const stopPreview = useCallback(() => {
+    playAttemptRef.current += 1;
+    clearStopTimer();
+    audioRef.current?.pause();
+    setIsPlaying(false);
+  }, [clearStopTimer]);
 
   useEffect(() => {
     let cancelled = false;
     setIsLoading(true);
     setBuffer(null);
+    setClipPreviewUrl("");
+    setLoadError("");
     onClipReady(null);
 
     const decode = async () => {
@@ -153,16 +168,24 @@ export default function AudioClipSelector({ file, initialSelection, onClipReady,
       try {
         const decoded = await context.decodeAudioData(await file.arrayBuffer());
         if (cancelled) return;
+        if (decoded.duration + MIN_SOURCE_TOLERANCE_SECONDS < VOICE_REFERENCE_SECONDS) {
+          const message = `File giọng mẫu phải dài ít nhất ${VOICE_REFERENCE_SECONDS} giây để cắt đúng đoạn yêu cầu.`;
+          setLoadError(message);
+          onError(message);
+          return;
+        }
         const nextSelection = normalizedSelection(
-          initialSelection ?? { start: 0, end: Math.min(MAX_CLIP_SECONDS, decoded.duration) },
+          initialSelection ?? { start: 0, end: VOICE_REFERENCE_SECONDS },
           decoded.duration,
         );
         setBuffer(decoded);
         setSelection(nextSelection);
-        objectUrlRef.current = URL.createObjectURL(file);
-        if (audioRef.current) audioRef.current.src = objectUrlRef.current;
       } catch {
-        if (!cancelled) onError("Không đọc được file âm thanh này. Hãy thử WAV, MP3, M4A hoặc FLAC khác.");
+        if (!cancelled) {
+          const message = "Không đọc được file âm thanh này. Hãy thử WAV, MP3, M4A hoặc FLAC khác.";
+          setLoadError(message);
+          onError(message);
+        }
       } finally {
         await context.close();
         if (!cancelled) setIsLoading(false);
@@ -172,14 +195,10 @@ export default function AudioClipSelector({ file, initialSelection, onClipReady,
     void decode();
     return () => {
       cancelled = true;
-      if (objectUrlRef.current) URL.revokeObjectURL(objectUrlRef.current);
-      objectUrlRef.current = "";
     };
   }, [file, initialSelection, onClipReady, onError]);
 
   useEffect(() => {
-    if (audioRef.current && objectUrlRef.current) audioRef.current.src = objectUrlRef.current;
-
     const canvas = canvasRef.current;
     if (!canvas || !buffer) return;
     const render = () => drawWaveform(canvas, buffer);
@@ -191,10 +210,19 @@ export default function AudioClipSelector({ file, initialSelection, onClipReady,
 
   useEffect(() => {
     if (!buffer || selection.end <= selection.start) return;
+    // Invalidate the previously encoded file immediately. Without this, a
+    // user can move the window and click Analyze/Render during the debounce,
+    // which would upload the prior three-second region.
+    stopPreview();
+    setClipPreviewUrl("");
+    onClipReady(null);
+    let generatedPreviewUrl = "";
     const timeout = window.setTimeout(() => {
       const blob = encodeSelectionAsWav(buffer, selection);
       const baseName = file.name.replace(/\.[^.]+$/, "") || "voice-reference";
       const preparedFile = new File([blob], `${baseName}-cut.wav`, { type: "audio/wav" });
+      generatedPreviewUrl = URL.createObjectURL(preparedFile);
+      setClipPreviewUrl(generatedPreviewUrl);
       onClipReady({
         file: preparedFile,
         start: selection.start,
@@ -202,32 +230,43 @@ export default function AudioClipSelector({ file, initialSelection, onClipReady,
         sourceDuration: buffer.duration,
       });
     }, 120);
-    return () => window.clearTimeout(timeout);
-  }, [buffer, file.name, onClipReady, selection]);
+    return () => {
+      window.clearTimeout(timeout);
+      if (generatedPreviewUrl) URL.revokeObjectURL(generatedPreviewUrl);
+    };
+  }, [buffer, file.name, onClipReady, selection, stopPreview]);
+
+  useEffect(() => {
+    if (disabled) {
+      dragRef.current = null;
+      stopPreview();
+    }
+  }, [disabled, stopPreview]);
 
   useEffect(() => () => {
-    if (stopTimerRef.current !== null) window.clearTimeout(stopTimerRef.current);
-  }, []);
-
-  const stopPreview = () => {
-    if (stopTimerRef.current !== null) window.clearTimeout(stopTimerRef.current);
-    stopTimerRef.current = null;
+    playAttemptRef.current += 1;
+    clearStopTimer();
     audioRef.current?.pause();
-    setIsPlaying(false);
-  };
+  }, [clearStopTimer]);
 
   const togglePreview = async () => {
     const audio = audioRef.current;
-    if (!audio || !buffer) return;
+    if (!audio || !buffer || !clipPreviewUrl || disabled) return;
     if (isPlaying) {
       stopPreview();
       return;
     }
-    audio.currentTime = selection.start;
+    stopPreview();
+    const playAttempt = playAttemptRef.current;
+    audio.currentTime = 0;
     try {
       await audio.play();
+      if (playAttempt !== playAttemptRef.current) {
+        audio.pause();
+        return;
+      }
       setIsPlaying(true);
-      stopTimerRef.current = window.setTimeout(stopPreview, Math.max(0, selection.end - selection.start) * 1000);
+      stopTimerRef.current = window.setTimeout(stopPreview, VOICE_REFERENCE_SECONDS * 1000);
     } catch {
       onError("Trình duyệt không thể phát đoạn âm thanh đã chọn.");
     }
@@ -240,18 +279,25 @@ export default function AudioClipSelector({ file, initialSelection, onClipReady,
   };
 
   const handlePointerDown = (event: PointerEvent<HTMLDivElement>) => {
-    if (!buffer) return;
+    if (!buffer || disabled) return;
     event.preventDefault();
     stopPreview();
     event.currentTarget.setPointerCapture(event.pointerId);
     const target = event.target as HTMLElement;
     const mode = (target.closest<HTMLElement>("[data-drag-mode]")?.dataset.dragMode || "new") as DragState["mode"];
-    dragRef.current = { mode, anchorTime: timeFromPointer(event), initial: selection };
+    const pointerTime = timeFromPointer(event);
+    if (mode === "new") {
+      const nextSelection = centeredSelection(pointerTime, buffer.duration);
+      setSelection(nextSelection);
+      dragRef.current = { mode, anchorTime: pointerTime, initial: nextSelection };
+      return;
+    }
+    dragRef.current = { mode, anchorTime: pointerTime, initial: selection };
   };
 
   const handlePointerMove = (event: PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
-    if (!drag || !buffer) return;
+    if (!drag || !buffer || disabled) return;
     const pointerTime = timeFromPointer(event);
 
     if (drag.mode === "move") {
@@ -260,28 +306,11 @@ export default function AudioClipSelector({ file, initialSelection, onClipReady,
       setSelection({ start, end: start + length });
       return;
     }
-    if (drag.mode === "start") {
-      setSelection((current) => ({
-        start: clamp(pointerTime, Math.max(0, current.end - MAX_CLIP_SECONDS), current.end - MIN_DRAG_SECONDS),
-        end: current.end,
-      }));
-      return;
-    }
-    if (drag.mode === "end") {
-      setSelection((current) => ({
-        start: current.start,
-        end: clamp(pointerTime, current.start + MIN_DRAG_SECONDS, Math.min(buffer.duration, current.start + MAX_CLIP_SECONDS)),
-      }));
-      return;
-    }
-
-    const start = Math.min(drag.anchorTime, pointerTime);
-    const end = Math.max(drag.anchorTime, pointerTime);
-    setSelection({ start, end: Math.min(buffer.duration, Math.min(end, start + MAX_CLIP_SECONDS)) });
+    setSelection(centeredSelection(pointerTime, buffer.duration));
   };
 
   const handlePointerUp = (event: PointerEvent<HTMLDivElement>) => {
-    if (!dragRef.current || !buffer) return;
+    if (!dragRef.current || !buffer || disabled) return;
     dragRef.current = null;
     event.currentTarget.releasePointerCapture(event.pointerId);
     setSelection((current) => normalizedSelection(current, buffer.duration));
@@ -296,7 +325,13 @@ export default function AudioClipSelector({ file, initialSelection, onClipReady,
     );
   }
 
-  if (!buffer) return null;
+  if (!buffer) {
+    return loadError ? (
+      <p className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-semibold text-rose-700">
+        {loadError}
+      </p>
+    ) : null;
+  }
 
   const startPercent = (selection.start / buffer.duration) * 100;
   const endPercent = (selection.end / buffer.duration) * 100;
@@ -306,14 +341,15 @@ export default function AudioClipSelector({ file, initialSelection, onClipReady,
     <section className="grid gap-2 rounded-md border border-blue-200 bg-white p-3" aria-label="Cắt đoạn giọng mẫu">
       <div className="flex items-center justify-between gap-2 text-xs">
         <span className="inline-flex items-center gap-1 font-semibold text-blue-800">
-          <Scissors className="h-3.5 w-3.5" /> Cắt đoạn giọng phù hợp
+          <Scissors className="h-3.5 w-3.5" /> Chọn đúng đoạn giọng 3 giây
         </span>
         <span className="tabular-nums text-slate-500">Tổng {formatTime(buffer.duration)}</span>
       </div>
 
       <div
         ref={timelineRef}
-        className="relative h-24 touch-none select-none overflow-hidden rounded border border-slate-200 bg-slate-50 cursor-crosshair"
+        className={`relative h-24 touch-none select-none overflow-hidden rounded border border-slate-200 bg-slate-50 ${disabled ? "cursor-not-allowed opacity-60" : "cursor-crosshair"}`}
+        aria-disabled={disabled}
         onPointerDown={handlePointerDown}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
@@ -324,26 +360,34 @@ export default function AudioClipSelector({ file, initialSelection, onClipReady,
         <div className="pointer-events-none absolute inset-y-0 right-0 bg-slate-900/40" style={{ width: `${100 - endPercent}%` }} />
         <div
           data-drag-mode="move"
-          className="absolute inset-y-0 cursor-grab border-y-2 border-blue-500 bg-blue-400/20 active:cursor-grabbing"
+          className="absolute inset-y-0 cursor-grab border-2 border-blue-500 bg-blue-400/20 shadow-[0_0_0_1px_rgba(255,255,255,0.8)] active:cursor-grabbing"
           style={{ left: `${startPercent}%`, width: `${endPercent - startPercent}%` }}
-          title="Kéo để di chuyển cả đoạn đã chọn"
+          title="Kéo khung để chọn vị trí của đoạn 3 giây"
         >
-          <div
-            data-drag-mode="start"
-            className="absolute inset-y-0 left-0 flex w-5 -translate-x-1/2 cursor-ew-resize items-center justify-center rounded-sm bg-blue-600 text-white shadow"
-            title="Kéo điểm bắt đầu"
-          >
-            <GripVertical className="h-4 w-4" />
-          </div>
-          <div
-            data-drag-mode="end"
-            className="absolute inset-y-0 right-0 flex w-5 translate-x-1/2 cursor-ew-resize items-center justify-center rounded-sm bg-blue-600 text-white shadow"
-            title="Kéo điểm kết thúc"
-          >
-            <GripVertical className="h-4 w-4" />
-          </div>
+          <span className="pointer-events-none absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded bg-blue-600/90 px-2 py-1 text-[10px] font-bold text-white shadow">
+            3,0 GIÂY
+          </span>
         </div>
       </div>
+
+      <label className="grid gap-1 text-[11px] font-semibold text-slate-600">
+        Điều chỉnh vị trí bắt đầu
+        <input
+          type="range"
+          min={0}
+          max={Math.max(0, buffer.duration - VOICE_REFERENCE_SECONDS)}
+          step={0.01}
+          value={selection.start}
+          disabled={disabled}
+          onChange={(event) => {
+            stopPreview();
+            const start = Number(event.target.value);
+            setSelection(normalizedSelection({ start, end: start + VOICE_REFERENCE_SECONDS }, buffer.duration));
+          }}
+          className="accent-blue-600 disabled:cursor-not-allowed disabled:opacity-60"
+          aria-label="Vị trí bắt đầu đoạn giọng 3 giây"
+        />
+      </label>
 
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2 text-xs tabular-nums text-slate-700">
@@ -355,16 +399,17 @@ export default function AudioClipSelector({ file, initialSelection, onClipReady,
         <button
           type="button"
           onClick={() => void togglePreview()}
-          className="inline-flex items-center gap-1.5 rounded border border-blue-200 bg-blue-50 px-2.5 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-100"
+          disabled={disabled || !clipPreviewUrl}
+          className="inline-flex items-center gap-1.5 rounded border border-blue-200 bg-blue-50 px-2.5 py-1.5 text-xs font-semibold text-blue-700 hover:bg-blue-100 disabled:cursor-not-allowed disabled:opacity-60"
         >
           {isPlaying ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
           {isPlaying ? "Dừng nghe" : "Nghe đoạn chọn"}
         </button>
       </div>
       <p className="text-[11px] leading-4 text-slate-500">
-        Kéo hai tay nắm để cắt, hoặc kéo vùng màu xanh để đổi vị trí. Độ dài được giữ trong khoảng 3–10 giây khi file cho phép.
+        Kéo khung xanh hoặc thanh vị trí để chọn nội dung mong muốn. Chỉ file WAV chứa đúng 3 giây trong khung được gửi xuống backend; file gốc không được upload.
       </p>
-      <audio ref={audioRef} onEnded={() => setIsPlaying(false)} className="hidden" />
+      <audio ref={audioRef} src={clipPreviewUrl || undefined} onEnded={stopPreview} className="hidden" />
     </section>
   );
 }
