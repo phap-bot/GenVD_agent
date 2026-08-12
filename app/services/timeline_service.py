@@ -36,6 +36,8 @@ class TimelineService:
                 end=max(0.0, float(segment.end)),
                 text=self.normalize_text(segment.text),
                 words=segment.words,
+                language=segment.language,
+                language_probability=segment.language_probability,
             )
             for index, segment in enumerate(sorted(segments, key=lambda item: (item.start, item.end)))
             if self.normalize_text(segment.text)
@@ -79,6 +81,8 @@ class TimelineService:
                     end=end,
                     text=segment.text,
                     words=segment.words,
+                    language=segment.language,
+                    language_probability=segment.language_probability,
                 )
             )
         return fixed
@@ -111,6 +115,8 @@ class TimelineService:
         candidate_text = candidate.text.strip()
         if not previous_text or not candidate_text:
             return False
+        if previous.language and candidate.language and previous.language != candidate.language:
+            return False
         if self._ends_sentence(previous_text):
             return False
 
@@ -142,6 +148,11 @@ class TimelineService:
             end=max(item.end for item in group),
             text=self._join_text_chunks([item.text for item in group]),
             words=[word for item in group for word in item.words],
+            language=group[0].language if all(item.language == group[0].language for item in group) else None,
+            language_probability=min(
+                (item.language_probability for item in group if item.language_probability is not None),
+                default=None,
+            ),
         )
 
     def _join_text_chunks(self, chunks: list[str]) -> str:

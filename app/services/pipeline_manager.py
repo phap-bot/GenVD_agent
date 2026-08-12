@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import tempfile
 import threading
 from pathlib import Path
 
-from app.models.schemas import BatchPipelineResult, PipelineConfig, PipelineResult
+from app.models.schemas import BatchPipelineResult, PipelineConfig, PipelineResult, TranscriptSegment
 from app.services.asr_service import ASRService
 from app.services.downloader_service import DownloaderService
 from app.services.subtitle_service import SubtitleService
 from app.services.timeline_service import TimelineService
 from app.services.translation_service import TranslationService
+from app.services.checkpoint_service import CheckpointStore
 from app.services.tts_service import TTSService
 from app.services.video_service import VideoService
 from app.utils.files import ensure_output_dir, make_request_id
@@ -42,6 +44,11 @@ class PipelineManager:
         with tempfile.TemporaryDirectory(prefix=f"dub_{request_id}_") as temp_root:
             work_dir = Path(temp_root)
             try:
+                checkpoint = CheckpointStore(
+                    video_path,
+                    root=config.checkpoint_root,
+                    enabled=config.checkpoint_enabled,
+                )
                 accompaniment_path = None
                 asr_input = video_path
                 if config.vocal_separation:
@@ -68,7 +75,7 @@ class PipelineManager:
                         sep_result = VocalSeparationService().separate(
                             audio_path=source_audio,
                             output_dir=work_dir / "separated",
-                            device="cpu",
+                            device=os.environ.get("AUTODUB_DEMUCS_DEVICE", "auto"),
                         )
                         asr_input = sep_result.vocals_path
                         accompaniment_path = sep_result.accompaniment_path
@@ -80,19 +87,41 @@ class PipelineManager:
                         ) from exc
 
                 logger.info("Starting ASR stage for request %s", request_id)
-                asr_service = ASRService(config)
-                segments = TimelineService().from_transcript(
-                    asr_service.transcribe(asr_input, work_dir),
-                    merge_semantic=True,
-                    source_language=config.source_language,
-                )
-                del asr_service
+                asr_service = None
+                asr_payload = {"stage": "asr", **config.model_dump(mode="json", exclude={"clone_reference_audio_path"})}
+                cached_asr = checkpoint.load("asr", asr_payload)
+                if isinstance(cached_asr, list):
+                    segments = [TranscriptSegment.model_validate(item) for item in cached_asr]
+                    logger.info("checkpoint.hit manager stage=asr request_id=%s segments=%s", request_id, len(segments))
+                else:
+                    asr_service = ASRService(config)
+                    segments = TimelineService().from_transcript(
+                        asr_service.transcribe(asr_input, work_dir),
+                        merge_semantic=True,
+                        source_language=config.source_language,
+                    )
+                    checkpoint.save("asr", asr_payload, [item.model_dump(mode="json") for item in segments])
+                if asr_service is not None:
+                    del asr_service
                 VRAMManager.cleanup()
 
                 logger.info("Starting translation stage for request %s", request_id)
-                translation_service = TranslationService(config)
-                translated_segments = TimelineService().from_transcript(translation_service.translate(segments))
-                del translation_service
+                translation_service = None
+                translation_payload = {
+                    "stage": "translation",
+                    **config.model_dump(mode="json", exclude={"clone_reference_audio_path"}),
+                    "segments": [item.model_dump(mode="json") for item in segments],
+                }
+                cached_translation = checkpoint.load("translation", translation_payload)
+                if isinstance(cached_translation, list):
+                    translated_segments = [TranscriptSegment.model_validate(item) for item in cached_translation]
+                    logger.info("checkpoint.hit manager stage=translation request_id=%s segments=%s", request_id, len(translated_segments))
+                else:
+                    translation_service = TranslationService(config)
+                    translated_segments = TimelineService().from_transcript(translation_service.translate(segments))
+                    checkpoint.save("translation", translation_payload, [item.model_dump(mode="json") for item in translated_segments])
+                if translation_service is not None:
+                    del translation_service
                 VRAMManager.cleanup()
 
                 logger.info("Starting TTS stage for request %s", request_id)
@@ -170,7 +199,7 @@ class PipelineManager:
                         sep_result = VocalSeparationService().separate(
                             audio_path=source_audio,
                             output_dir=work_dir / "separated",
-                            device="cpu",
+                            device=os.environ.get("AUTODUB_DEMUCS_DEVICE", "auto"),
                         )
                         accompaniment_path = sep_result.accompaniment_path
                     except Exception as exc:

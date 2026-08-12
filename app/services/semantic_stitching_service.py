@@ -116,6 +116,8 @@ class SemanticStitchingService:
                         end=next_seg.end,
                         text=merged_text,
                         words=merged_words,
+                        language=current.language if current.language == next_seg.language else None,
+                        language_probability=current.language_probability,
                     )
                 )
                 skip_next = True
@@ -159,6 +161,8 @@ class SemanticStitchingService:
                             end=next_seg.end,
                             text=joined_text,
                             words=[*current.words, *next_seg.words],
+                            language=current.language if current.language == next_seg.language else None,
+                            language_probability=current.language_probability,
                         )
                     )
                     skip_next = True
@@ -185,6 +189,8 @@ class SemanticStitchingService:
         cand_text = candidate.text.strip()
 
         if not prev_text or not cand_text:
+            return False
+        if prev.language and candidate.language and prev.language != candidate.language:
             return False
 
         # If previous segment clearly ends a sentence with terminal punctuation, do not merge
@@ -282,6 +288,11 @@ class SemanticStitchingService:
             end=max(item.end for item in group),
             text=self._join_texts([item.text for item in group]),
             words=[word for item in group for word in item.words],
+            language=group[0].language if all(item.language == group[0].language for item in group) else None,
+            language_probability=min(
+                (item.language_probability for item in group if item.language_probability is not None),
+                default=None,
+            ),
         )
 
     def _join_texts(self, chunks: list[str]) -> str:

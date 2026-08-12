@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import queue
 import shutil
@@ -29,8 +30,13 @@ from app.services.dependency_service import DependencyService
 from app.services.pipeline import AutoDubbingPipeline
 from app.services.pipeline_manager import PipelineManager
 from app.services.render_job_service import RenderJobDispatcher, RenderJobSubmission
+from app.services.voice_reference_service import (
+    VOICE_REFERENCE_SECONDS,
+    VoiceReferenceService,
+    VoiceReferenceValidationError,
+)
 from app.utils.cancel import PipelineCancelledError
-from app.utils.files import safe_filename, save_upload_file
+from app.utils.files import UploadSizeLimitError, safe_filename, save_upload_file, save_upload_file_limited
 from app.utils.vram import VRAMManager
 from app.utils.workspace import WorkspaceManager
 from utils.model_registry import model_registry
@@ -45,7 +51,9 @@ STREAM_WORKER_JOIN_TIMEOUT_SECONDS = 5.0
 
 
 REMOTE_ASR_PROVIDERS = {"9router", "remote", "openai-compatible", "openai_compatible", "gemini"}
-VOICE_REFERENCE_SUFFIXES = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".opus"}
+VOICE_REFERENCE_SUFFIXES = {".wav"}
+VOICE_REFERENCE_DIR = Path("output")
+DEFAULT_VOICE_REFERENCE_MAX_BYTES = 16 * 1024 * 1024
 SOURCE_MEDIA_DIR = Path("temp") / "source_media"
 
 
@@ -83,14 +91,36 @@ def _dotenv_value(name: str) -> str | None:
 
 def _fallback_asr_model(value: str | None) -> str:
     clean_value = (value or "").strip()
-    if clean_value:
+    if clean_value and clean_value.lower() != "auto":
         return clean_value
 
 
     provider = os.environ.get("AUTODUB_ASR_PROVIDER", "whisperx").strip().lower()
     if provider in REMOTE_ASR_PROVIDERS:
         return _first_config_value(None, ("AUTODUB_STT_MODEL",), "gemini/gemini-2.5-flash")
-    return _first_config_value(None, ("AUTODUB_ASR_MODEL",), "base")
+    configured = _first_config_value(None, ("AUTODUB_ASR_MODEL",), "base")
+    return "base" if configured.lower() == "auto" else configured
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    try:
+        return max(minimum, min(maximum, int(os.environ.get(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        return max(minimum, min(maximum, float(os.environ.get(name, str(default)))))
+    except (TypeError, ValueError):
+        return default
 
 
 def _media_name(media_path: str, field_name: str) -> str:
@@ -205,6 +235,28 @@ def _config_from_form(
         ocr_interval_seconds=ocr_interval_seconds,
         ocr_crop_bottom_ratio=ocr_crop_bottom_ratio,
         vocal_separation=vocal_separation,
+        asr_engine=(_first_config_value(None, ("ASR_ENGINE", "AUTODUB_ASR_ENGINE"), "auto").strip().lower() if _first_config_value(None, ("ASR_ENGINE", "AUTODUB_ASR_ENGINE"), "auto").strip().lower() in {"auto", "whisper", "paraformer"} else "auto"),
+        whisper_model=_first_config_value(None, ("WHISPER_MODEL", "AUTODUB_WHISPER_MODEL"), "auto"),
+        whisper_beam_size=_env_int("WHISPER_BEAM_SIZE", _env_int("AUTODUB_WHISPER_BEAM_SIZE", 5, 1, 10), 1, 10),
+        default_source_language=_first_config_value(None, ("DEFAULT_SOURCE_LANG", "AUTODUB_DEFAULT_SOURCE_LANG"), "zh-CN"),
+        ocr_adaptive=_env_bool("AUTODUB_OCR_ADAPTIVE", True),
+        ocr_scene_threshold=_env_float("AUTODUB_OCR_SCENE_THRESHOLD", 0.28, 0.02, 1.0),
+        translate_batch_size=_env_int("TRANSLATE_BATCH_SIZE", 40, 1, 80),
+        translate_analysis=_env_bool("TRANSLATE_ANALYSIS", True),
+        translate_review=_env_bool("TRANSLATE_REVIEW", True),
+        translate_cps_budget=_env_float("TRANSLATE_CPS_BUDGET", 12.5, 1, 80),
+        video_speed=_env_float("VIDEO_SPEED", 1.0, 0.25, 2.0),
+        voice_speed=_env_float("VOICE_SPEED", 1.0, 0.5, 2.0),
+        soft_timing_fit=_env_bool("SOFT_TIMING_FIT", True),
+        timing_max_drift_s=_env_float("TIMING_MAX_DRIFT_S", 1.5, 0, 10),
+        timing_min_gap_s=_env_float("TIMING_MIN_GAP_S", 0.12, 0, 2),
+        timing_max_atempo=_env_float("TIMING_MAX_ATEMPO", 1.1, 0.5, 2),
+        hq_background=_env_bool("HQ_BACKGROUND", True),
+        voice_postprocess=_env_bool("VOICE_POSTPROCESS", True),
+        voice_target_lufs=_env_float("VOICE_TARGET_LUFS", -16.0, -40, -1),
+        bg_duck_voice_db=_env_float("BG_DUCK_VOICE_DB", -7.0, -30, 0),
+        checkpoint_enabled=_env_bool("AUTODUB_CHECKPOINT_ENABLED", True),
+        checkpoint_root=_first_config_value(None, ("AUTODUB_CHECKPOINT_ROOT",), "temp/checkpoints"),
     )
 
 
@@ -603,6 +655,17 @@ def _output_media_path(media_path: str, field_name: str = "source_video_path") -
     return path
 
 
+def _voice_reference_media_path(media_path: str) -> Path:
+    path = _output_media_path(media_path, field_name="clone_reference_audio_path")
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Clone reference audio not found.")
+    try:
+        VoiceReferenceService().validate_canonical(path)
+    except VoiceReferenceValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return path
+
+
 def _render_config(payload: RenderScriptRequest, clone_reference_audio_path: Path | None) -> PipelineConfig:
     return PipelineConfig(
         target_language=payload.target_language,
@@ -623,6 +686,24 @@ def _render_config(payload: RenderScriptRequest, clone_reference_audio_path: Pat
         copyright_source=payload.copyright_source,
         copyright_notes=payload.copyright_notes,
         vocal_separation=payload.vocal_separation,
+        asr_engine=payload.asr_engine,
+        whisper_model=payload.whisper_model,
+        whisper_beam_size=payload.whisper_beam_size,
+        segment_language_detection=payload.segment_language_detection,
+        translate_batch_size=payload.translate_batch_size,
+        translate_analysis=payload.translate_analysis,
+        translate_review=payload.translate_review,
+        translate_cps_budget=payload.translate_cps_budget,
+        video_speed=payload.video_speed,
+        voice_speed=payload.voice_speed,
+        soft_timing_fit=payload.soft_timing_fit,
+        timing_max_drift_s=payload.timing_max_drift_s,
+        timing_min_gap_s=payload.timing_min_gap_s,
+        timing_max_atempo=payload.timing_max_atempo,
+        hq_background=payload.hq_background,
+        voice_postprocess=payload.voice_postprocess,
+        voice_target_lufs=payload.voice_target_lufs,
+        bg_duck_voice_db=payload.bg_duck_voice_db,
     )
 
 
@@ -656,7 +737,31 @@ def shorten_text(request: ShortenTextRequest) -> ShortenTextResponse:
 
 
 @stream_router.post("/voice-reference")
-async def upload_voice_reference(audio: UploadFile = File(...)) -> dict[str, str]:
+async def upload_voice_reference(
+    audio: UploadFile = File(...),
+    clip_duration_seconds: float = Form(default=VOICE_REFERENCE_SECONDS),
+    selection_start_seconds: float | None = Form(default=None),
+    selection_end_seconds: float | None = Form(default=None),
+) -> dict[str, object]:
+    if not math.isfinite(clip_duration_seconds) or not math.isclose(
+        clip_duration_seconds,
+        VOICE_REFERENCE_SECONDS,
+        rel_tol=0,
+        abs_tol=0.001,
+    ):
+        raise HTTPException(status_code=422, detail="Clone reference clip duration must be exactly 3 seconds.")
+    if (selection_start_seconds is None) != (selection_end_seconds is None):
+        raise HTTPException(status_code=422, detail="Both clone selection boundaries are required together.")
+    if selection_start_seconds is not None and selection_end_seconds is not None:
+        selection_duration = selection_end_seconds - selection_start_seconds
+        if (
+            not math.isfinite(selection_start_seconds)
+            or not math.isfinite(selection_end_seconds)
+            or selection_start_seconds < 0
+            or not math.isclose(selection_duration, VOICE_REFERENCE_SECONDS, rel_tol=0, abs_tol=0.002)
+        ):
+            raise HTTPException(status_code=422, detail="Clone selection must identify one exact 3-second window.")
+
     safe_name = safe_filename(audio.filename, fallback_suffix=".wav")
     suffix = Path(safe_name).suffix.lower()
     if suffix not in VOICE_REFERENCE_SUFFIXES:
@@ -667,17 +772,45 @@ async def upload_voice_reference(audio: UploadFile = File(...)) -> dict[str, str
     ):
         raise HTTPException(status_code=422, detail="The clone reference must be an audio file.")
 
-    output_root = Path("output")
+    try:
+        max_bytes = int(os.environ.get("AUTODUB_VOICE_REFERENCE_MAX_BYTES", DEFAULT_VOICE_REFERENCE_MAX_BYTES))
+    except (TypeError, ValueError):
+        max_bytes = DEFAULT_VOICE_REFERENCE_MAX_BYTES
+    max_bytes = max(1, max_bytes)
+
+    output_root = VOICE_REFERENCE_DIR
     output_root.mkdir(parents=True, exist_ok=True)
-    destination = output_root / f"{uuid4().hex}_voice_reference{suffix}"
-    await save_upload_file(audio, destination)
-    if destination.stat().st_size <= 0:
+    destination = output_root / f"{uuid4().hex}_voice_reference.wav"
+    Path("temp").mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(prefix="voice_reference_", dir="temp") as upload_dir:
+            staged_upload = Path(upload_dir) / f"selected_clip{suffix}"
+            try:
+                await save_upload_file_limited(audio, staged_upload, max_bytes=max_bytes)
+            except UploadSizeLimitError as exc:
+                raise HTTPException(status_code=413, detail=f"Clone reference upload is too large (max {max_bytes} bytes).") from exc
+
+            metadata = await asyncio.to_thread(
+                VoiceReferenceService().canonicalize,
+                staged_upload,
+                destination,
+            )
+    except VoiceReferenceValidationError as exc:
         destination.unlink(missing_ok=True)
-        raise HTTPException(status_code=422, detail="The clone reference audio is empty.")
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        destination.unlink(missing_ok=True)
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     return {
         "path": f"/media/{destination.name}",
         "filename": safe_name,
+        "duration_seconds": metadata.duration_seconds,
+        "sample_rate": metadata.sample_rate,
+        "frame_count": metadata.frame_count,
+        "sha256": metadata.sha256,
+        "selection_start_seconds": selection_start_seconds,
+        "selection_end_seconds": selection_end_seconds,
     }
 
 
@@ -685,12 +818,7 @@ async def upload_voice_reference(audio: UploadFile = File(...)) -> dict[str, str
 async def render_edited_script(request: Request, payload: RenderScriptRequest) -> StreamingResponse:
     clone_reference_audio_path: Path | None = None
     if payload.voice_mode == "clone":
-        clone_reference_audio_path = _output_media_path(
-            payload.clone_reference_audio_path or "",
-            field_name="clone_reference_audio_path",
-        )
-        if not clone_reference_audio_path.is_file():
-            raise HTTPException(status_code=404, detail="Clone reference audio not found.")
+        clone_reference_audio_path = _voice_reference_media_path(payload.clone_reference_audio_path or "")
 
     config = _render_config(payload, clone_reference_audio_path)
     _require_copyright_preflight(config)
@@ -723,12 +851,9 @@ async def render_edited_script_with_video(
 
     clone_reference_audio_path: Path | None = None
     if render_payload.voice_mode == "clone":
-        clone_reference_audio_path = _output_media_path(
-            render_payload.clone_reference_audio_path or "",
-            field_name="clone_reference_audio_path",
+        clone_reference_audio_path = _voice_reference_media_path(
+            render_payload.clone_reference_audio_path or ""
         )
-        if not clone_reference_audio_path.is_file():
-            raise HTTPException(status_code=404, detail="Clone reference audio not found.")
 
     config = _render_config(render_payload, clone_reference_audio_path)
     _require_copyright_preflight(config)

@@ -5,11 +5,13 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import threading
 import time
 import wave
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Generator, Iterable
 
@@ -17,6 +19,7 @@ from app.models.schemas import DubbingScriptSegment, PipelineConfig, TranscriptS
 from app.services.dependency_service import DependencyService
 from app.services.timeline_service import TimelineService
 from app.services.translation_service import TranslationService
+from app.services.checkpoint_service import CheckpointStore
 from app.utils.media_probe import probe_duration, probe_video_dimensions
 from app.utils.vram import VRAMManager
 from app.utils.workspace import Workspace
@@ -31,6 +34,7 @@ from utils.tts_voice import (
     infer_stable_vieneu_audio,
     resolve_vieneu_voice,
 )
+from utils.language import detect_language
 
 logger = logging.getLogger(__name__)
 MODEL_CACHE_PATHS = configure_model_cache()
@@ -48,7 +52,8 @@ CLAUSE_PUNCTUATION = set(",:\uff0c\u3001\uff1a")
 GPU_LOCK_POLL_SECONDS = 1.0
 GPU_LOCK_WAIT_TIMEOUT_SECONDS = 180.0
 TTS_CACHE_MAX_AGE_SECONDS = 2 * 24 * 3600  # 2 days
-AUDIO_STEM_CACHE_VERSION = "demucs-normalized-residual-v2"
+AUDIO_STEM_CACHE_VERSION = "demucs-fullband-stereo-normalized-residual-v3"
+ASR_RECOGNITION_POLICY_VERSION = "asr-language-policy-v5"
 ACCOMPANIMENT_DEFAULT_VOLUME = 0.92
 ORIGINAL_FALLBACK_VOLUME = 0.12
 DEFAULT_X264_PRESET = "superfast"
@@ -56,6 +61,25 @@ DEFAULT_X264_CRF = 22
 VALID_X264_PRESETS = frozenset(
     {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}
 )
+
+
+def _env_value(name: str, default: str = "") -> str:
+    """Read a setting from the process environment, then the local .env."""
+    value = os.environ.get(name, "").strip()
+    if not value:
+        try:
+            for raw_line in Path(".env").read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if line.startswith(f"{name}="):
+                    value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+        except OSError:
+            pass
+    return value or default
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    return _env_value(name, "1" if default else "").lower() in {"1", "true", "yes", "on"}
 
 # ── TTS segment merging constants ──
 TTS_MERGE_MAX_GAP = 0.5           # max silence gap (seconds) between segments to merge
@@ -97,6 +121,54 @@ class AutoDubbingPipeline:
         self.cancel_event = cancel_event
         self.dependencies = DependencyService()
         self.last_source_engine = "unknown"
+
+    def _checkpoint_store(self, workspace: Workspace) -> CheckpointStore:
+        return CheckpointStore(
+            workspace.input_video,
+            root=self.config.checkpoint_root,
+            enabled=self.config.checkpoint_enabled,
+        )
+
+    def _checkpoint_config(self, stage: str) -> dict[str, object]:
+        """Only include settings that can change a stage's result."""
+        if stage == "asr":
+            return {
+                "stage": stage,
+                "policy_version": ASR_RECOGNITION_POLICY_VERSION,
+                "asr_model": self.config.asr_model,
+                "asr_engine": self.config.asr_engine,
+                "auto_paraformer": _env_truthy("AUTODUB_AUTO_PARAFORMER"),
+                "paraformer_model": _env_value("AUTODUB_PARAFORMER_MODEL", "paraformer-zh"),
+                "paraformer_venv": _env_value("AUTODUB_PARAFORMER_VENV", ".venv-asr"),
+                "whisper_model": self.config.whisper_model,
+                "beam_size": self.config.whisper_beam_size,
+                "compute_type": self.config.compute_type,
+                "source_language": self.config.source_language,
+                "vocal_separation": self.config.vocal_separation,
+                "segment_language_detection": self.config.segment_language_detection,
+            }
+        if stage == "ocr":
+            return {
+                "stage": stage,
+                "source_language": self.config.source_language,
+                "model": self.config.ocr_model,
+                "interval": self.config.ocr_interval_seconds,
+                "crop": self.config.ocr_crop_bottom_ratio,
+                "max_frames": self.config.ocr_max_frames,
+                "adaptive": self.config.ocr_adaptive,
+                "scene_threshold": self.config.ocr_scene_threshold,
+            }
+        return {
+            "stage": stage,
+            "source_language": self.config.source_language,
+            "target_language": self.config.target_language,
+            "provider": self.config.translation_provider,
+            "model": self.config.translation_model,
+            "batch_size": self.config.translate_batch_size,
+            "analysis": self.config.translate_analysis,
+            "review": self.config.translate_review,
+            "cps_budget": self.config.translate_cps_budget,
+        }
 
     def run(self, workspace: Workspace) -> Generator[str, None, Path]:
         output_path = workspace.output_dir / f"{workspace.request_id}_dubbed.mp4"
@@ -150,7 +222,7 @@ class AutoDubbingPipeline:
                     progress=46,
                     stats=source_stats,
                 )
-                translated_segments = self._canonical_timeline(self._translate_segments(segments))
+                translated_segments = self._canonical_timeline(self._translate_segments(segments, workspace=workspace))
                 yield self._event(
                     "processing",
                     "Script translated",
@@ -233,7 +305,7 @@ class AutoDubbingPipeline:
                 self.dependencies.require_ffmpeg()
                 segments = self._source_timeline(self._extract_source_segments(workspace))
                 VRAMManager.cleanup()
-                translated = self._canonical_timeline(self._translate_segments(segments))
+                translated = self._canonical_timeline(self._translate_segments(segments, workspace=workspace))
                 return [
                     DubbingScriptSegment(
                         id=segment.id,
@@ -242,6 +314,8 @@ class AutoDubbingPipeline:
                         original_text=segments[index].text if index < len(segments) else segment.text,
                         translated_text=segment.text,
                         voice_model=self.config.voice_model,
+                        source_language=segment.language,
+                        language_probability=segment.language_probability,
                     )
                     for index, segment in enumerate(translated)
                 ]
@@ -314,7 +388,7 @@ class AutoDubbingPipeline:
                     progress=70,
                     stats=source_stats,
                 )
-                translated = self._canonical_timeline(self._translate_segments(segments))
+                translated = self._canonical_timeline(self._translate_segments(segments, workspace=workspace))
                 yield self._event(
                     "processing",
                     "Script translated",
@@ -330,6 +404,8 @@ class AutoDubbingPipeline:
                         original_text=segments[index].text if index < len(segments) else segment.text,
                         translated_text=segment.text,
                         voice_model=self.config.voice_model,
+                        source_language=segment.language,
+                        language_probability=segment.language_probability,
                     )
                     for index, segment in enumerate(translated)
                 ]
@@ -483,6 +559,14 @@ class AutoDubbingPipeline:
             return self._run_ocr(workspace)
 
         segments = self._run_asr(workspace)
+        if self.config.source_mode == "voice":
+            return segments
+        if self.config.source_mode == "subtitle":
+            ocr_segments = self._run_ocr(workspace)
+            return ocr_segments or segments
+        if self.config.source_mode == "hybrid":
+            ocr_segments = self._run_ocr(workspace)
+            return self._merge_asr_ocr_segments(segments, ocr_segments)
         if self._should_use_ocr_fallback(segments):
             logger.info(
                 "source_extract.asr_sparse_using_ocr request_id=%s asr_segments=%s asr_chars=%s",
@@ -505,6 +589,18 @@ class AutoDubbingPipeline:
 
     def _run_ocr(self, workspace: Workspace) -> list[TranscriptSegment]:
         self._raise_if_cancelled(workspace)
+        checkpoint = self._checkpoint_store(workspace)
+        checkpoint_payload = self._checkpoint_config("ocr")
+        cached = checkpoint.load("ocr", checkpoint_payload)
+        if isinstance(cached, list):
+            try:
+                restored = [TranscriptSegment.model_validate(item) for item in cached]
+                if restored:
+                    self.last_source_engine = "OCR (checkpoint)"
+                    logger.info("checkpoint.hit stage=ocr request_id=%s segments=%s", workspace.request_id, len(restored))
+                    return restored
+            except Exception:
+                logger.warning("checkpoint.invalid stage=ocr request_id=%s", workspace.request_id, exc_info=True)
         self.last_source_engine = "OCR"
         ocr_segments = extract_video_ocr_segments(
             workspace.input_video,
@@ -512,18 +608,68 @@ class AutoDubbingPipeline:
             model=self.config.ocr_model or self.config.translation_model,
             interval_seconds=self.config.ocr_interval_seconds,
             crop_bottom_ratio=self.config.ocr_crop_bottom_ratio,
+            max_frames=self.config.ocr_max_frames,
+            adaptive=self.config.ocr_adaptive,
+            scene_threshold=self.config.ocr_scene_threshold,
             cancel_event=self.cancel_event,
         )
-        return [
+        normalized = [
             TranscriptSegment(
                 id=segment.id,
                 start=segment.start,
                 end=segment.end,
                 text=segment.text,
                 words=[],
+                language=detect_language(segment.text, fallback=self.config.source_language)[0],
+                language_probability=detect_language(segment.text, fallback=self.config.source_language)[1],
             )
             for segment in ocr_segments
         ]
+        if normalized:
+            checkpoint.save("ocr", checkpoint_payload, [item.model_dump(mode="json") for item in normalized])
+            logger.info("checkpoint.saved stage=ocr request_id=%s segments=%s", workspace.request_id, len(normalized))
+        return normalized
+
+    def _merge_asr_ocr_segments(
+        self,
+        asr_segments: list[TranscriptSegment],
+        ocr_segments: list[TranscriptSegment],
+    ) -> list[TranscriptSegment]:
+        """Combine speech and hard-subtitle timelines while removing duplicates."""
+        if not asr_segments:
+            return ocr_segments
+        if not ocr_segments:
+            return asr_segments
+
+        merged = list(asr_segments)
+        for ocr in ocr_segments:
+            overlapping = [
+                item
+                for item in merged
+                if min(item.end, ocr.end) - max(item.start, ocr.start) >= -0.15
+            ]
+            if not overlapping:
+                merged.append(ocr)
+                continue
+
+            # If the subtitle is the same utterance, ASR supplies better timing.
+            # If it is materially different, retain it as a separate cue so a
+            # hard-sub-only line is not silently discarded.
+            if any(self._text_similarity(item.text, ocr.text) >= 0.78 for item in overlapping):
+                continue
+            if all(len(item.text.strip()) < 8 for item in overlapping):
+                merged.append(ocr)
+
+        return TimelineService().from_transcript(merged)
+
+    @staticmethod
+    def _text_similarity(left: str, right: str) -> float:
+        normalize = lambda value: re.sub(r"[^\w\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", "", value.lower())
+        left_key = normalize(left)
+        right_key = normalize(right)
+        if not left_key or not right_key:
+            return 0.0
+        return SequenceMatcher(None, left_key, right_key).ratio()
 
     def _ensure_accompaniment_audio(self, workspace: Workspace, video_path: Path) -> Path | None:
         if not self.config.vocal_separation:
@@ -541,7 +687,7 @@ class AutoDubbingPipeline:
             cache_acc_path, cache_vocals_path = self._stem_cache_paths(video_path)
             self._evict_stale_stem_cache(cache_acc_path.parent)
             if cache_acc_path.is_file() and cache_acc_path.stat().st_size > 0:
-                shutil.copy2(cache_acc_path, acc_path)
+                self._materialize_background_stem(cache_acc_path, acc_path)
                 if cache_vocals_path.is_file() and cache_vocals_path.stat().st_size > 0:
                     sep_dir = workspace.root / "separated"
                     sep_dir.mkdir(parents=True, exist_ok=True)
@@ -562,6 +708,10 @@ class AutoDubbingPipeline:
                     ffmpeg.input(str(video_path))
                     .output(
                         str(source_audio),
+                        # Demucs must always receive the original-quality mix.
+                        # HQ_BACKGROUND controls the final mix only; allowing it
+                        # to downsample source separation permanently harms the
+                        # reusable stem cache and vocal-removal quality.
                         ac=2,
                         ar="44100",
                         acodec="pcm_s16le",
@@ -572,10 +722,21 @@ class AutoDubbingPipeline:
                     .run(capture_stdout=True, capture_stderr=True)
                 )
             sep_dir = workspace.root / "separated"
-            device = os.environ.get("AUTODUB_DEMUCS_DEVICE", "cpu").strip().lower()
-            if device not in {"cpu", "cuda"}:
-                logger.warning("vocal_separation.invalid_device value=%s fallback=cpu", device)
+            requested_device = os.environ.get("AUTODUB_DEMUCS_DEVICE", "auto").strip().lower()
+            if requested_device not in {"auto", "cpu", "cuda"}:
+                logger.warning("vocal_separation.invalid_device value=%s fallback=auto", requested_device)
+                requested_device = "auto"
+            cuda_available = bool(self.dependencies.cuda_status().get("available"))
+            if requested_device == "auto":
+                device = "cuda" if cuda_available else "cpu"
+            elif requested_device == "cuda" and not cuda_available:
+                logger.warning(
+                    "vocal_separation.cuda_unavailable fallback=cpu "
+                    "hint=install_a_cuda_enabled_pytorch_wheel"
+                )
                 device = "cpu"
+            else:
+                device = requested_device
             logger.info("vocal_separation.ensure_start device=%s path=%s", device, source_audio)
             sep_result = VocalSeparationService().separate(
                 audio_path=source_audio,
@@ -583,7 +744,6 @@ class AutoDubbingPipeline:
                 device=device,
                 cancel_event=self.cancel_event,
             )
-            shutil.copy2(str(sep_result.accompaniment_path), str(acc_path))
             try:
                 shutil.copy2(sep_result.accompaniment_path, cache_acc_path)
                 shutil.copy2(sep_result.vocals_path, cache_vocals_path)
@@ -594,6 +754,7 @@ class AutoDubbingPipeline:
                 )
             except OSError:
                 logger.warning("vocal_separation.cache_save_failed source=%s", video_path, exc_info=True)
+            self._materialize_background_stem(sep_result.accompaniment_path, acc_path)
             return acc_path
         except PipelineCancelledError:
             raise
@@ -603,6 +764,25 @@ class AutoDubbingPipeline:
                 "Vocal separation is enabled but failed; render stopped to prevent original voice bleed. "
                 f"{exc}"
             ) from exc
+
+    def _materialize_background_stem(self, source_path: Path, destination_path: Path) -> None:
+        """Keep cached Demucs stems lossless while honoring final-mix quality."""
+        if self.config.hq_background:
+            shutil.copy2(source_path, destination_path)
+            return
+        (
+            self._ffmpeg()
+            .input(str(source_path))
+            .output(
+                str(destination_path),
+                ac=1,
+                ar="16000",
+                acodec="pcm_s16le",
+                format="wav",
+            )
+            .overwrite_output()
+            .run(capture_stdout=True, capture_stderr=True)
+        )
 
     def _stem_cache_paths(self, video_path: Path) -> tuple[Path, Path]:
         digest = hashlib.sha256()
@@ -632,7 +812,28 @@ class AutoDubbingPipeline:
 
     def _run_asr(self, workspace: Workspace) -> list[TranscriptSegment]:
         self._raise_if_cancelled(workspace)
-        audio_path = workspace.root / "source_audio.wav"
+        checkpoint = self._checkpoint_store(workspace)
+        checkpoint_payload = self._checkpoint_config("asr")
+        cached = checkpoint.load("asr", checkpoint_payload)
+        if isinstance(cached, list):
+            try:
+                restored = [TranscriptSegment.model_validate(item) for item in cached]
+                if restored:
+                    self.last_source_engine = "ASR (checkpoint)"
+                    logger.info("checkpoint.hit stage=asr request_id=%s segments=%s", workspace.request_id, len(restored))
+                    return restored
+            except Exception:
+                logger.warning("checkpoint.invalid stage=asr request_id=%s", workspace.request_id, exc_info=True)
+
+        def finish(raw_segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
+            normalized = self._annotate_segment_languages(raw_segments)
+            if normalized:
+                checkpoint.save("asr", checkpoint_payload, [item.model_dump(mode="json") for item in normalized])
+                logger.info("checkpoint.saved stage=asr request_id=%s segments=%s", workspace.request_id, len(normalized))
+            return normalized
+
+        original_audio_path = workspace.root / "source_audio.wav"
+        audio_path = original_audio_path
         if not self._has_audio_stream(workspace.input_video):
             logger.info("asr.skip.no_audio request_id=%s input=%s", workspace.request_id, workspace.input_video)
             self.last_source_engine = "no audio"
@@ -654,6 +855,48 @@ class AutoDubbingPipeline:
                 audio_path = vocals_path
 
         try:
+            selected_engine = self.config.asr_engine
+            if selected_engine == "auto":
+                selected_engine = "paraformer" if (self.config.source_language or "").lower().startswith("zh") and _env_truthy("AUTODUB_AUTO_PARAFORMER") else "whisper"
+            if selected_engine == "paraformer" and audio_path != original_audio_path:
+                # Paraformer is more accurate on the original mixed track;
+                # short Demucs stems can distort Chinese phonemes. Keep the
+                # separated stem for render/background mixing, not ASR.
+                logger.info(
+                    "asr.paraformer.using_original_audio request_id=%s separated=%s",
+                    workspace.request_id,
+                    audio_path,
+                )
+                audio_path = original_audio_path
+            elif (
+                selected_engine == "whisper"
+                and (self.config.source_language or "").lower().startswith("zh")
+                and audio_path != original_audio_path
+            ):
+                # The separated stem is intentionally optimized for mixing;
+                # it can remove consonant energy that Whisper needs for Chinese
+                # phonemes. Use the untouched track for recognition as well.
+                logger.info(
+                    "asr.whisper.using_original_audio request_id=%s separated=%s",
+                    workspace.request_id,
+                    audio_path,
+                )
+                audio_path = original_audio_path
+            if selected_engine == "paraformer":
+                try:
+                    from utils.paraformer import transcribe as paraformer_transcribe
+
+                    self.last_source_engine = "Paraformer"
+                    return finish(self._normalize_segments(paraformer_transcribe(
+                        audio_path,
+                        language=self.config.source_language,
+                        model_id=_env_value("AUTODUB_PARAFORMER_MODEL", "paraformer-zh"),
+                    )))
+                except Exception:
+                    if self.config.asr_engine == "paraformer":
+                        raise
+                    logger.warning("paraformer.auto_fallback_to_whisper request_id=%s", workspace.request_id, exc_info=True)
+
             if remote_stt_enabled(self.config.asr_model):
                 self.last_source_engine = f"remote STT ({self.config.asr_model})"
                 logger.info(
@@ -663,14 +906,15 @@ class AutoDubbingPipeline:
                     self.config.source_language or "auto",
                     audio_path,
                 )
-                return self._normalize_segments(
+                return finish(self._normalize_segments(
                     transcribe_audio_remote(
                         audio_path,
                         source_language=self.config.source_language,
                         model=self.config.asr_model,
                     )
-                )
+                ))
 
+            whisper_arch = self.config.asr_model if self.config.whisper_model == "auto" else self.config.whisper_model
             try:
                 import whisperx
             except ImportError as exc:
@@ -678,23 +922,25 @@ class AutoDubbingPipeline:
 
             self.dependencies.require_cuda()
             device = "cuda"
-            self.last_source_engine = f"WhisperX {self.config.asr_model} on {device}"
+            self.last_source_engine = f"WhisperX {whisper_arch} on {device}"
             logger.info(
                 "legacy_pipeline.asr.model.load request_id=%s model=%s compute_type=%s device=%s language=%s cache=%s",
                 workspace.request_id,
-                self.config.asr_model,
+                whisper_arch,
                 self.config.compute_type,
                 device,
                 self.config.source_language or "auto",
                 MODEL_CACHE_PATHS.whisperx_asr_cache,
             )
             audio = whisperx.load_audio(str(audio_path))
+            force_paraformer_fallback = False
             with model_registry.acquire_whisperx_asr(
                 whisperx,
-                whisper_arch=self.config.asr_model,
+                whisper_arch=whisper_arch,
                 device=device,
                 compute_type=self.config.compute_type,
                 language=self.config.source_language,
+                beam_size=self.config.whisper_beam_size,
             ) as model:
                 result = model.transcribe(
                     audio,
@@ -702,12 +948,90 @@ class AutoDubbingPipeline:
                     language=self.config.source_language,
                 )
 
+                # Demucs can produce a poor vocal stem for very short clips or
+                # music-heavy audio. Whisper then tends to hallucinate a
+                # repeated English phrase ("of the South ...") even though the
+                # requested source language is Chinese. Re-decode the original
+                # mixed audio and keep it when it is objectively less suspect.
+                current_segments = result.get("segments", [])
+                if audio_path != original_audio_path and self._asr_needs_retry(current_segments):
+                    retry_audio = whisperx.load_audio(str(original_audio_path))
+                    retry_result = model.transcribe(
+                        retry_audio,
+                        batch_size=4,
+                        language=self.config.source_language,
+                    )
+                    current_score = self._asr_suspicion_score(current_segments)
+                    retry_score = self._asr_suspicion_score(retry_result.get("segments", []))
+                    logger.warning(
+                        "asr.suspect_transcript request_id=%s source_language=%s separated=%s current_score=%s retry_score=%s",
+                        workspace.request_id,
+                        self.config.source_language or "auto",
+                        audio_path != original_audio_path,
+                        current_score,
+                        retry_score,
+                    )
+                    if retry_score < current_score:
+                        result = retry_result
+                        audio = retry_audio
+                        audio_path = original_audio_path
+                        force_paraformer_fallback = retry_score >= 2
+                    else:
+                        logger.warning(
+                            "asr.suspect_transcript.kept request_id=%s reason=retry_not_better",
+                            workspace.request_id,
+                        )
+
+                # If Whisper still produces a clearly non-Chinese/repeated
+                # transcript, use the installed Chinese Paraformer as a
+                # quality fallback. This path is restricted to `asr_engine=auto`
+                # so an explicit Whisper choice remains respected.
+                if (
+                    self.config.asr_engine == "auto"
+                    and (audio_path != original_audio_path or force_paraformer_fallback)
+                    and self._asr_needs_retry(result.get("segments", []))
+                ):
+                    try:
+                        from utils.paraformer import transcribe as paraformer_transcribe
+
+                        paraformer_segments = paraformer_transcribe(
+                            original_audio_path,
+                            language=self.config.source_language,
+                            model_id=_env_value("AUTODUB_PARAFORMER_MODEL", "paraformer-zh"),
+                        )
+                        paraformer_score = self._asr_suspicion_score(paraformer_segments)
+                        whisper_score = self._asr_suspicion_score(result.get("segments", []))
+                        logger.info(
+                            "asr.paraformer_fallback request_id=%s whisper_score=%s paraformer_score=%s",
+                            workspace.request_id,
+                            whisper_score,
+                            paraformer_score,
+                        )
+                        if paraformer_segments and paraformer_score < whisper_score:
+                            result = {"segments": paraformer_segments, "language": self.config.source_language or "zh"}
+                            audio = whisperx.load_audio(str(original_audio_path))
+                            audio_path = original_audio_path
+                            self.last_source_engine = "Paraformer fallback"
+                    except Exception:
+                        logger.warning(
+                            "asr.paraformer_fallback_failed request_id=%s",
+                            workspace.request_id,
+                            exc_info=True,
+                        )
+
             VRAMManager.cleanup()
 
             if not self.config.word_timestamps:
-                return self._normalize_segments(result.get("segments", []))
+                return finish(self._normalize_segments(result.get("segments", [])))
 
             language_code = result.get("language") or self.config.source_language or "en"
+            logger.info(
+                "asr.language_resolved request_id=%s requested=%s model_detected=%s segments=%s",
+                workspace.request_id,
+                self.config.source_language or "auto",
+                language_code,
+                len(result.get("segments", [])),
+            )
             logger.info(
                 "legacy_pipeline.asr.align.load request_id=%s language=%s device=%s cache=%s",
                 workspace.request_id,
@@ -732,7 +1056,7 @@ class AutoDubbingPipeline:
                             device,
                             return_char_alignments=False,
                         )
-                    return self._normalize_segments(aligned.get("segments", []))
+                    return finish(self._normalize_segments(aligned.get("segments", [])))
                 except Exception as exc:
                     logger.warning(
                         "legacy_pipeline.asr.align.failed request_id=%s language=%s error=%s, falling back to ASR segments",
@@ -741,12 +1065,31 @@ class AutoDubbingPipeline:
                         exc,
                     )
 
-            return self._normalize_segments(raw_segs)
+            return finish(self._normalize_segments(raw_segs))
         finally:
             VRAMManager.cleanup()
 
-    def _translate_segments(self, segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
+    def _translate_segments(self, segments: list[TranscriptSegment], *, workspace: Workspace | None = None) -> list[TranscriptSegment]:
         self._raise_if_cancelled()
+        if workspace is not None:
+            checkpoint = self._checkpoint_store(workspace)
+            payload = {
+                **self._checkpoint_config("translation"),
+                "segments": [segment.model_dump(mode="json") for segment in segments],
+            }
+            cached = checkpoint.load("translation", payload)
+            if isinstance(cached, list):
+                try:
+                    restored = [TranscriptSegment.model_validate(item) for item in cached]
+                    if len(restored) == len(segments):
+                        logger.info("checkpoint.hit stage=translation request_id=%s segments=%s", workspace.request_id, len(restored))
+                        return restored
+                except Exception:
+                    logger.warning("checkpoint.invalid stage=translation request_id=%s", workspace.request_id, exc_info=True)
+            translated = TranslationService(self.config, self.cancel_event).translate(segments)
+            checkpoint.save("translation", payload, [item.model_dump(mode="json") for item in translated])
+            logger.info("checkpoint.saved stage=translation request_id=%s segments=%s", workspace.request_id, len(translated))
+            return translated
         return TranslationService(self.config, self.cancel_event).translate(segments)
 
     def _source_timeline(self, segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
@@ -1248,7 +1591,7 @@ class AutoDubbingPipeline:
             temporary.unlink(missing_ok=True)
 
     def _fit_audio_duration(self, source: Path, destination: Path, target_duration: float) -> None:
-        if self._fit_audio_duration_with_numpy(source, destination, target_duration):
+        if self.config.voice_speed == 1.0 and self._fit_audio_duration_with_numpy(source, destination, target_duration):
             return
 
         ffmpeg = self._ffmpeg()
@@ -1261,6 +1604,9 @@ class AutoDubbingPipeline:
             natural_target = max(target_duration, 0.1)
             ratio = max(0.1, current_duration / natural_target)
             tempo = ratio if current_duration > natural_target else 1.0
+            tempo *= self.config.voice_speed
+            if self.config.soft_timing_fit and tempo > self.config.timing_max_atempo and ratio <= self.config.timing_max_atempo:
+                tempo = self.config.timing_max_atempo
             if tempo > 1.35:
                 logger.warning(
                     "tts.audio_fit.high_speed source=%s raw_duration=%.3f target_duration=%.3f tempo=%.3f",
@@ -1477,6 +1823,10 @@ class AutoDubbingPipeline:
         tts_input = ffmpeg.input(str(tts_mix_path))
 
         video_stream = video_input.video
+        if self.config.video_speed != 1.0:
+            # 0.82 makes the picture slower and leaves roughly 22% more room
+            # for Vietnamese speech; 1.0 keeps the original duration.
+            video_stream = video_stream.filter("setpts", f"{1.0 / self.config.video_speed:.6f}*PTS")
         if script_segments:
             video_stream = self._apply_blur_boxes(
                 ffmpeg,
@@ -1553,6 +1903,19 @@ class AutoDubbingPipeline:
                 duration="first",
                 dropout_transition=0,
                 normalize=0,
+            )
+        if self.config.voice_postprocess:
+            mixed_audio = mixed_audio.filter(
+                "loudnorm",
+                I=self.config.voice_target_lufs,
+                TP=-1.0,
+                LRA=7.0,
+            )
+            logger.info(
+                "legacy_pipeline.render.voice_postprocess lufs=%s bg_duck_db=%s hq_background=%s",
+                self.config.voice_target_lufs,
+                self.config.bg_duck_voice_db,
+                self.config.hq_background,
             )
         mixed_audio = mixed_audio.filter("alimiter", limit=0.95)
 
@@ -1790,10 +2153,66 @@ class AutoDubbingPipeline:
                 end=float(raw.get("end", 0.0) or 0.0),
                 text=text,
                 words=words,
+                language=raw.get("language"),
+                language_probability=(float(raw.get("language_probability")) if raw.get("language_probability") is not None else None),
             )
             for split_segment in self._split_transcript_segment(base_segment):
                 segments.append(split_segment.model_copy(update={"id": len(segments)}))
         return segments
+
+    def _annotate_segment_languages(self, segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
+        if not self.config.segment_language_detection:
+            return segments
+        fallback = self.config.source_language or self.config.default_source_language
+        annotated: list[TranscriptSegment] = []
+        for segment in segments:
+            detected, probability = detect_language(segment.text, fallback=fallback)
+            # A user-selected language remains authoritative when the detector
+            # only saw a short Latin fragment or an isolated proper name.
+            language = detected
+            confidence = probability
+            if self.config.source_language:
+                requested = self.config.source_language.lower().replace("_", "-")
+                # An explicit source choice is the decode contract. Keep
+                # script-level detection for Japanese/Korean mixed speech,
+                # but do not let a short/garbled Latin hallucination relabel a
+                # Chinese timeline as English.
+                if requested.startswith("zh") and detected not in {"ja", "ko"}:
+                    language = self.config.source_language
+                elif probability < 0.7:
+                    language = self.config.source_language
+                confidence = probability
+            annotated.append(segment.model_copy(update={"language": language, "language_probability": confidence}))
+        return annotated
+
+    def _asr_needs_retry(self, raw_segments: list[dict]) -> bool:
+        """Detect the common Whisper repetition/language hallucination case."""
+        source = (self.config.source_language or "").lower().replace("_", "-")
+        if not source.startswith("zh"):
+            return False
+        return self._asr_suspicion_score(raw_segments) >= 2
+
+    @classmethod
+    def _asr_suspicion_score(cls, raw_segments: list[dict]) -> int:
+        score = 0
+        for raw in raw_segments or []:
+            text = str(raw.get("text") or "").strip()
+            if len(text) < 8:
+                continue
+            han_count = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", text))
+            latin_words = re.findall(r"[A-Za-z]+(?:'[A-Za-z]+)?", text.lower())
+            if han_count == 0 and len(latin_words) >= 5:
+                score += 1
+            # Repeated 2/3-word n-grams are a strong hallucination signal and
+            # much safer to flag than dropping a legitimate short sentence.
+            for width in (2, 3):
+                if len(latin_words) < width * 2:
+                    continue
+                ngrams = [tuple(latin_words[i : i + width]) for i in range(len(latin_words) - width + 1)]
+                if len(ngrams) != len(set(ngrams)):
+                    score += 2
+                    break
+        return score
 
     def _split_transcript_segment(self, segment: TranscriptSegment) -> list[TranscriptSegment]:
         duration = max(0.0, segment.end - segment.start)
@@ -1885,12 +2304,21 @@ class AutoDubbingPipeline:
             end=min(original.end, max(words[-1].end, words[0].start + MIN_SEGMENT_DURATION)),
             text=self._join_word_tokens([word.word for word in words]),
             words=words,
+            language=original.language,
+            language_probability=original.language_probability,
         )
 
     def _split_segment_by_text(self, segment: TranscriptSegment) -> list[TranscriptSegment]:
         duration = max(segment.end - segment.start, MIN_SEGMENT_DURATION)
         total_chars = max(1, len(segment.text))
         text_limit = self._segment_text_limit(segment.text)
+        # Paraformer local checkpoints can return one transcript without word
+        # timestamps. In that case a 120-second paragraph must still be split
+        # into speech-sized units; otherwise every TTS call inherits a giant
+        # duration and translation loses sentence-level timing.
+        if not segment.words and duration > self._segment_duration_limit(segment.text):
+            target_chars = int(total_chars * self._segment_duration_limit(segment.text) / duration)
+            text_limit = min(text_limit, max(16, target_chars))
         text_chunks = self._chunk_text(segment.text, text_limit)
         if len(text_chunks) <= 1:
             return [segment]
@@ -1912,6 +2340,8 @@ class AutoDubbingPipeline:
                     end=max(start + MIN_SEGMENT_DURATION, min(segment.end, end)),
                     text=clean_text,
                     words=[],
+                    language=segment.language,
+                    language_probability=segment.language_probability,
                 )
             )
         return self._merge_tiny_segments(chunks)
@@ -1996,6 +2426,8 @@ class AutoDubbingPipeline:
                     end=segment.end,
                     text=self._join_text_chunks(previous.text, segment.text),
                     words=[*previous.words, *segment.words],
+                    language=previous.language if previous.language == segment.language else None,
+                    language_probability=previous.language_probability,
                 )
             else:
                 merged.append(segment)

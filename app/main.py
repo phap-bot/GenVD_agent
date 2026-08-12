@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import asyncio
 import logging
+import os
 from pathlib import Path
 import time
 from uuid import uuid4
@@ -13,6 +15,8 @@ from fastapi.staticfiles import StaticFiles
 from app.api.genvideo_routes import router as genvideo_router
 from app.api.genvideo_flow_routes import router as genvideo_flow_router
 from app.api.routes import compat_router, router as dubbing_router, stream_router
+from app.api.short_video_routes import router as short_video_router
+from app.utils.workspace import WorkspaceManager
 from utils.model_cache import configure_model_cache
 from utils.model_registry import model_registry
 from utils.ninerouter import ensure_9router_running
@@ -48,8 +52,39 @@ Path("output").mkdir(parents=True, exist_ok=True)
 Path("temp").mkdir(parents=True, exist_ok=True)
 
 
+def _hours_env(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        try:
+            for line in Path(".env").read_text(encoding="utf-8").splitlines():
+                if line.strip().startswith(f"{name}="):
+                    raw = line.split("=", 1)[1].strip()
+                    break
+        except OSError:
+            pass
+    try:
+        return max(1.0 / 60.0, float(raw)) if raw else default
+    except ValueError:
+        return default
+
+
+async def _temp_cleanup_loop() -> None:
+    retention_hours = _hours_env("AUTODUB_TEMP_CLEANUP_MAX_AGE_HOURS", 24.0)
+    interval_hours = _hours_env("AUTODUB_TEMP_CLEANUP_INTERVAL_HOURS", 24.0)
+    retention_seconds = retention_hours * 3600.0
+    while True:
+        try:
+            await asyncio.to_thread(WorkspaceManager.evict_stale_all, retention_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("temp.cleanup.failed")
+        await asyncio.sleep(interval_hours * 3600.0)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    cleanup_task = asyncio.create_task(_temp_cleanup_loop(), name="temp-workspace-cleanup")
     logger.info("startup.ninerouter.begin")
     if ensure_9router_running():
         logger.info("startup.ninerouter.ready")
@@ -61,6 +96,11 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
         logger.info("shutdown.model_registry.begin")
         model_registry.shutdown()
 
@@ -122,6 +162,7 @@ app.add_middleware(
 app.include_router(dubbing_router)
 app.include_router(compat_router)
 app.include_router(stream_router)
+app.include_router(short_video_router)
 app.include_router(genvideo_flow_router)
 app.include_router(genvideo_router)
 app.mount("/media", StaticFiles(directory="output"), name="media")

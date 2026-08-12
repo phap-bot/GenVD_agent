@@ -40,6 +40,37 @@ watcher restarts do not interrupt an active pipeline:
 uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
+## Durable Render Queue
+
+Edited-script renders use a durable job fingerprint and persist their source,
+manifest, progress events, and intermediate chunks under `render_jobs/`.
+Repeated requests with the same video, script, timeline, and clone reference
+attach to the same job. A changed segment creates a new job but still reuses
+unchanged content-addressed TTS chunks.
+
+Local development defaults to one in-process render worker. For API reloads or
+production use, run Redis and the dedicated Celery worker:
+
+```powershell
+docker compose up -d redis
+.\scripts\start_render_worker.ps1
+```
+
+Start the API in another terminal:
+
+```powershell
+.\scripts\start_queued_backend.ps1
+```
+
+The render worker intentionally uses Celery's `solo` pool, concurrency `1`,
+prefetch `1`, late acknowledgements, and the dedicated `render` queue. This
+keeps CUDA/model work sequential. Do not use Uvicorn `--reload` for the queued
+backend; API restarts no longer stop the external render worker.
+
+Redis in `compose.yaml` enables AOF with `appendfsync everysec` and periodic RDB
+snapshots. Redis stores queue/result state; large media and checkpoints remain
+on the project disk.
+
 ## Windows FFmpeg Requirement
 
 The backend needs both `ffmpeg.exe` and `ffprobe.exe` available in PATH.
@@ -95,8 +126,9 @@ GET /api/v1/health/dependencies
 The studio exposes two isolated VieNeu-TTS paths:
 
 - `system`: every segment must resolve to the selected built-in voice ID.
-- `clone`: upload a clean 3–10 second reference clip; its encoded speaker data
-  is reused for every segment in that render.
+- `clone`: choose an exact 3-second window from a longer clean reference. The
+  browser uploads only that cut, and the backend validates/canonicalizes it to
+  24 kHz mono PCM WAV (72,000 frames) before reusing its speaker data.
 
 Voice selection is strict. An unavailable system voice or an invalid clone
 reference stops the render and returns an error; it never switches to another
@@ -122,8 +154,72 @@ POST /api/v1/batch-dub
 POST /api/v1/douyin
 ```
 
+Additive Short Video workflow (the existing Clone Video workflow remains
+unchanged):
+
+```text
+POST /api/v1/short-video/inspect
+POST /api/v1/short-video/analyze
+POST /api/v1/short-video/dub
+POST /api/v1/short-video/render-script
+GET  /api/v1/short-video/profiles
+```
+
+`/short-video/inspect` stores the upload once, probes its duration/audio/video
+metadata, and returns the backend-owned profile (`micro`, `short`,
+`short_extended`, or `long`). Analyze and dub accept the returned `media_id`;
+videos above `AUTODUB_SHORT_VIDEO_MAX_SECONDS` are rejected by the Short Video
+workflow and should be sent to Clone Video instead.
+
 The default request uses mock translation and mock TTS so the API can be tested
 before installing/configuring external translation and TTS providers.
+
+### Optimized recognition and durable stages
+
+ASR is selected with `AUTODUB_ASR_ENGINE=auto|whisper|paraformer`. Whisper
+uses `WHISPER_MODEL=auto`/`AUTODUB_WHISPER_MODEL` and a configurable beam size;
+explicit Paraformer jobs use the isolated `.venv-asr` runtime. Every decoded
+segment receives a language hint and confidence, so mixed-language shorts are
+translated in contiguous language groups instead of forcing one language over
+the whole file.
+
+ASR, adaptive OCR and translation checkpoints are content-addressed under
+`AUTODUB_CHECKPOINT_ROOT` and are written atomically. They can be reused after
+a backend restart or machine shutdown. `scripts/benchmark_ocr.py` measures
+real OCR elapsed time, frame budget and extracted cues for a supplied video.
+
+The shared pipeline honors `TRANSLATE_ANALYSIS`, `TRANSLATE_REVIEW`,
+`TRANSLATE_BATCH_SIZE`, `TRANSLATE_CPS_BUDGET`, soft timing limits, voice/video
+speed, LUFS normalization and background ducking. The Short Video clone-voice
+control uploads its reference through the same `/api/voice-reference` endpoint
+used by Clone Video; it does not create a second TTS implementation.
+
+Voice-reference uploads are capped by `AUTODUB_VOICE_REFERENCE_MAX_BYTES`
+(16 MiB by default). Files shorter than 3 seconds, full untrimmed recordings,
+renamed non-audio files, and clips outside the exact-duration tolerance are
+rejected instead of being passed through to VieNeu.
+
+Heavy dependencies can be isolated with:
+
+```powershell
+scripts/setup_venvs.ps1 -InstallAll
+```
+
+This creates `.venv-whisper`, `.venv-asr` and `.venv-vieneu`; the main runtime
+can remain on `requirements-core.txt` when model workers are deployed
+separately.
+
+After package installation, download the local checkpoints (Paraformer-zh,
+VieNeu-TTS v3 Turbo and its ONNX tokenizer) with:
+
+```powershell
+scripts/setup_venvs.ps1 -InstallAll -DownloadModels
+```
+
+The downloaded paths are `models/paraformer-zh`,
+`models/VieNeu-TTS-v3-Turbo` and `models/MOSS-Audio-Tokenizer-Nano-ONNX`.
+The setup script keeps these model directories out of git and configures the
+backend to use them offline.
 
 See [PIPELINE.md](PIPELINE.md) for the full pipeline map.
 

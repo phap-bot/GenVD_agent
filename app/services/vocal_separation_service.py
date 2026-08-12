@@ -1,15 +1,95 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 import threading
+import wave
 
 from app.utils.cancel import PipelineCancelledError
 from app.utils.vram import VRAMManager
 from utils.model_registry import model_registry
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_torch_device(torch, requested_device: str) -> str:
+    requested = (requested_device or "auto").strip().lower()
+    if requested not in {"auto", "cpu", "cuda"} and not requested.startswith("cuda:"):
+        logger.warning("vocal_separation.invalid_device requested=%s fallback=auto", requested_device)
+        requested = "auto"
+    if requested == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        logger.warning(
+            "vocal_separation.cuda_unavailable requested=%s fallback=cpu",
+            requested_device,
+        )
+        return "cpu"
+    return requested if requested.startswith("cuda") else "cpu"
+
+
+def _load_pcm_wav(torch, audio_path: Path):
+    with wave.open(str(audio_path), "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        sample_rate = wav_file.getframerate()
+        frame_count = wav_file.getnframes()
+        compression = wav_file.getcomptype()
+        payload = wav_file.readframes(frame_count)
+
+    if channels <= 0 or frame_count <= 0 or compression != "NONE" or sample_width != 2:
+        raise RuntimeError("The Demucs fallback loader requires a non-empty PCM16 WAV file.")
+    samples = torch.frombuffer(bytearray(payload), dtype=torch.int16)
+    expected_samples = frame_count * channels
+    if samples.numel() != expected_samples:
+        raise RuntimeError("PCM WAV sample count does not match its header.")
+    waveform = samples.reshape(frame_count, channels).transpose(0, 1).to(torch.float32)
+    waveform.div_(32768.0)
+    return waveform, sample_rate
+
+
+def _load_audio(torch, torchaudio, audio_path: Path):
+    try:
+        return torchaudio.load(str(audio_path))
+    except Exception as backend_error:
+        if audio_path.suffix.lower() != ".wav":
+            raise
+        logger.warning(
+            "vocal_separation.torchaudio_load_unavailable fallback=wave path=%s error=%s",
+            audio_path,
+            backend_error,
+        )
+        try:
+            return _load_pcm_wav(torch, audio_path)
+        except Exception as fallback_error:
+            raise RuntimeError(
+                "Unable to decode Demucs input. Install SoundFile or provide a valid PCM16 WAV file."
+            ) from fallback_error
+
+
+def _save_pcm_wav(torch, output_path: Path, waveform, sample_rate: int) -> None:
+    pcm = waveform.detach().to(device="cpu", dtype=torch.float32).clamp(-1.0, 1.0)
+    pcm = pcm.mul(32767.0).round().to(torch.int16).transpose(0, 1).contiguous()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(output_path), "wb") as wav_file:
+        wav_file.setnchannels(int(waveform.shape[0]))
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(int(sample_rate))
+        wav_file.writeframes(pcm.numpy().tobytes())
+
+
+def _save_audio(torch, torchaudio, output_path: Path, waveform, sample_rate: int) -> None:
+    try:
+        torchaudio.save(str(output_path), waveform, sample_rate)
+    except Exception as backend_error:
+        logger.warning(
+            "vocal_separation.torchaudio_save_unavailable fallback=wave path=%s error=%s",
+            output_path,
+            backend_error,
+        )
+        _save_pcm_wav(torch, output_path, waveform, sample_rate)
 
 
 @dataclass(frozen=True)
@@ -70,14 +150,16 @@ class VocalSeparationService:
                     "demucs is required for vocal separation. Install it with `pip install demucs`."
                 ) from exc
 
-            with model_registry.acquire_demucs(device=device) as model:
+            requested_device = device or os.environ.get("AUTODUB_DEMUCS_DEVICE", "auto")
+            resolved_device = _resolve_torch_device(torch, requested_device)
+            with model_registry.acquire_demucs(device=resolved_device) as model:
                 if cancel_event and cancel_event.is_set():
                     raise PipelineCancelledError("Vocal separation cancelled during model acquisition.")
 
                 # Demucs quality depends heavily on receiving the original
                 # stereo, full-bandwidth mix. Downsampling belongs to ASR,
                 # never to source separation.
-                wav, sr = torchaudio.load(str(audio_path))
+                wav, sr = _load_audio(torch, torchaudio, audio_path)
 
                 # Resample to model samplerate if necessary (htdemucs defaults to 44100)
                 if sr != model.samplerate:
@@ -91,7 +173,7 @@ class VocalSeparationService:
                 elif wav.shape[0] > 2:
                     wav = wav[:2, :]
 
-                wav = wav.to(device)
+                wav = wav.to(resolved_device)
                 original_wav = wav
 
                 # Match the normalization used by the official Demucs
@@ -110,7 +192,7 @@ class VocalSeparationService:
                     sources = apply_model(
                         model,
                         normalized_wav,
-                        device=device,
+                        device=resolved_device,
                         shifts=1,
                         split=True,
                         overlap=0.5,
@@ -131,7 +213,7 @@ class VocalSeparationService:
                 # A full 19-minute four-stem result can retain well over 1 GB
                 # on CPU. Keep only vocals before allocating the residual.
                 del vocals_source, sources, normalized_wav, reference, source_scale, source_offset
-                if device == "cuda":
+                if resolved_device.startswith("cuda"):
                     torch.cuda.empty_cache()
 
                 # Preserve the original ambience, stereo image and transients.
@@ -141,8 +223,8 @@ class VocalSeparationService:
                 acc_tensor.sub_(vocals_tensor).clamp_(-1.0, 1.0)
 
                 # Save wav files
-                torchaudio.save(str(vocals_path), vocals_tensor, sr)
-                torchaudio.save(str(accompaniment_path), acc_tensor, sr)
+                _save_audio(torch, torchaudio, vocals_path, vocals_tensor, sr)
+                _save_audio(torch, torchaudio, accompaniment_path, acc_tensor, sr)
 
                 logger.info(
                     "vocal_separation.completed vocals=%s accompaniment=%s",

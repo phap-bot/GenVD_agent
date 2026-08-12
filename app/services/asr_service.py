@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 from app.models.schemas import PipelineConfig, TranscriptSegment, WordTimestamp
@@ -9,9 +10,28 @@ from app.utils.memory import VRAMManager
 from utils.model_cache import configure_model_cache
 from utils.model_registry import model_registry
 from utils.stt import remote_stt_enabled, transcribe_audio_remote
+from utils.language import detect_language
 
 logger = logging.getLogger(__name__)
 MODEL_CACHE_PATHS = configure_model_cache()
+
+
+def _env_value(name: str, default: str = "") -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        try:
+            for raw_line in Path(".env").read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if line.startswith(f"{name}="):
+                    value = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    break
+        except OSError:
+            pass
+    return value or default
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    return _env_value(name, "1" if default else "").lower() in {"1", "true", "yes", "on"}
 
 
 def _ffmpeg():
@@ -62,6 +82,26 @@ class ASRService:
         )
 
     def _run_whisperx(self, audio_path: Path) -> list[TranscriptSegment]:
+        selected_engine = self.config.asr_engine
+        if (
+            selected_engine == "auto"
+            and (self.config.source_language or "").lower().startswith("zh")
+            and _env_truthy("AUTODUB_AUTO_PARAFORMER")
+        ):
+            selected_engine = "paraformer"
+        if selected_engine == "paraformer":
+            try:
+                from utils.paraformer import transcribe as paraformer_transcribe
+
+                return self._normalize_segments(paraformer_transcribe(
+                    audio_path,
+                    language=self.config.source_language,
+                    model_id=_env_value("AUTODUB_PARAFORMER_MODEL", "paraformer-zh"),
+                ))
+            except Exception:
+                if self.config.asr_engine == "paraformer":
+                    raise
+                logger.warning("asr_service.paraformer.auto_fallback_to_whisper", exc_info=True)
         if remote_stt_enabled(self.config.asr_model):
             logger.info(
                 "asr_service.remote.start model=%s language=%s audio=%s",
@@ -86,6 +126,7 @@ class ASRService:
         device = "cuda"
         batch_size = 4
 
+        whisper_arch = self.config.asr_model if self.config.whisper_model == "auto" else self.config.whisper_model
         logger.info(
             "asr_service.model.load model=%s compute_type=%s device=%s language=%s cache=%s",
             self.config.asr_model,
@@ -97,10 +138,11 @@ class ASRService:
         audio = whisperx.load_audio(str(audio_path))
         with model_registry.acquire_whisperx_asr(
             whisperx,
-            whisper_arch=self.config.asr_model,
+            whisper_arch=whisper_arch,
             device=device,
             compute_type=self.config.compute_type,
             language=self.config.source_language,
+            beam_size=self.config.whisper_beam_size,
         ) as model:
             result = model.transcribe(
                 audio,
@@ -163,6 +205,8 @@ class ASRService:
                     end=float(raw.get("end", 0.0) or 0.0),
                     text=str(raw.get("text", "")).strip(),
                     words=words,
+                    language=(raw.get("language") or detect_language(str(raw.get("text", "")), fallback=self.config.source_language)[0]),
+                    language_probability=(float(raw.get("language_probability")) if raw.get("language_probability") is not None else detect_language(str(raw.get("text", "")), fallback=self.config.source_language)[1]),
                 )
             )
         return segments
