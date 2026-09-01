@@ -29,10 +29,11 @@ DEFAULT_TRANSLATION_FALLBACK_MODELS = [
 ]
 SHORTEN_WORDS_PER_SECOND = 3.0
 TRANSLATION_PROVIDERS = {"9router", "ninerouter", "openai-compatible", "openai_compatible"}
-DEFAULT_TRANSLATION_BATCH_ITEMS = 80
+DEFAULT_TRANSLATION_BATCH_ITEMS = 24
 DEFAULT_TRANSLATION_BATCH_WORDS = 750
 DEFAULT_TRANSLATION_BATCH_CHARS = 12000
 DEFAULT_TRANSLATION_CONCURRENCY = 4
+DEFAULT_TRANSLATION_ATTEMPT_TIMEOUT_SECONDS = 18.0
 TRANSLATION_CONTEXT_WINDOW = 4
 TRANSLATION_CONTEXT_MAX_CHARS = 2400
 TRANSLATION_POLICY_VERSION = "batch-context-coherence-qa-v2"
@@ -556,6 +557,7 @@ def _translate_batches_concurrently(
                     model=selected_model,
                     timeout=timeout,
                     cancel_event=cancel_event,
+                    failed_models=failed_models,
                 )
                 if text
                 else text
@@ -955,6 +957,61 @@ def _translate_9router_segments_with_model_fallback(
     cps_budget: float = 12.5,
     source_intervals: tuple[tuple[float, float], ...] = (),
 ) -> list[str]:
+    # Do not send ASR hallucination loops to the gateway. Besides producing
+    # useless output, a large batch containing these lines can consume the
+    # whole request timeout before the per-line normalizer gets a chance to
+    # collapse them.
+    repeated_replacements = [
+        _deterministic_repeated_sound_translation(text, target)
+        for text in texts
+    ]
+    if any(repeated_replacements):
+        active_indexes = [index for index, replacement in enumerate(repeated_replacements) if not replacement]
+        if not active_indexes:
+            logger.info(
+                "translation.batch_repetition_short_circuit segments=%s skipped=%s",
+                len(texts),
+                len(texts),
+            )
+            return repeated_replacements
+
+        logger.info(
+            "translation.batch_repetition_filter segments=%s skipped=%s remaining=%s",
+            len(texts),
+            len(texts) - len(active_indexes),
+            len(active_indexes),
+        )
+        active_texts = tuple(texts[index] for index in active_indexes)
+        active_durations = tuple(target_durations[index] for index in active_indexes)
+        active_intervals = (
+            tuple(source_intervals[index] for index in active_indexes)
+            if source_intervals
+            else ()
+        )
+        active_translations = _translate_9router_segments_with_model_fallback(
+            active_texts,
+            target_durations=active_durations,
+            source_intervals=active_intervals,
+            source=source,
+            target=target,
+            selected_model=selected_model,
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+            cancel_event=cancel_event,
+            failed_models=failed_models,
+            context=context,
+            cps_budget=cps_budget,
+        )
+        if len(active_translations) != len(active_indexes):
+            raise ValueError(
+                f"Expected {len(active_indexes)} active translations, got {len(active_translations)}"
+            )
+        merged = list(repeated_replacements)
+        for index, translated in zip(active_indexes, active_translations):
+            merged[index] = translated
+        return merged
+
     last_error: Exception | None = None
     _raise_if_cancelled(cancel_event)
     attempt_timeout = _translation_attempt_timeout(timeout)
@@ -1016,7 +1073,10 @@ def _translate_9router_segments_with_model_fallback(
                 api_key=api_key,
                 timeout=timeout,
                 cancel_event=cancel_event,
-                failed_models=failed_models,
+                # A timeout for a large payload does not mean the model is
+                # unhealthy. Retry each smaller payload with a fresh model
+                # budget instead of immediately reporting "no models left".
+                failed_models=set(),
                 context=context,
                 cps_budget=cps_budget,
             ),
@@ -1031,7 +1091,7 @@ def _translate_9router_segments_with_model_fallback(
                 api_key=api_key,
                 timeout=timeout,
                 cancel_event=cancel_event,
-                failed_models=failed_models,
+                failed_models=set(),
                 context=context,
                 cps_budget=cps_budget,
             ),
@@ -1977,7 +2037,17 @@ def _fallback_if_bad_translation(
                     collapsed,
                 )
                 return collapsed
-        return fallback or clean_translation or source_text
+        if fallback and not _translation_needs_fallback(source_text, fallback, target):
+            return fallback
+        if fallback:
+            logger.warning(
+                "translation.google_fallback_rejected source=%s target=%s source_text=%s fallback=%s",
+                source,
+                target,
+                source_text,
+                fallback,
+            )
+        return clean_translation or source_text
     except Exception:
         logger.exception("translation.google_fallback_failed source=%s target=%s", source, target)
         return clean_translation or source_text
@@ -2231,9 +2301,12 @@ def _env_int(name: str, fallback: int, *, minimum: int, maximum: int) -> int:
 
 def _translation_attempt_timeout(timeout: float) -> float:
     try:
-        configured = float(_config_value("AUTODUB_TRANSLATION_ATTEMPT_TIMEOUT") or 30.0)
+        configured = float(
+            _config_value("AUTODUB_TRANSLATION_ATTEMPT_TIMEOUT")
+            or DEFAULT_TRANSLATION_ATTEMPT_TIMEOUT_SECONDS
+        )
     except (TypeError, ValueError):
-        configured = 30.0
+        configured = DEFAULT_TRANSLATION_ATTEMPT_TIMEOUT_SECONDS
     return max(5.0, min(float(timeout), configured))
 
 

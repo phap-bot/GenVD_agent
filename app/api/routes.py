@@ -279,7 +279,7 @@ def _config_from_form(
         default_source_language=_first_config_value(None, ("DEFAULT_SOURCE_LANG", "AUTODUB_DEFAULT_SOURCE_LANG"), "zh-CN"),
         ocr_adaptive=_env_bool("AUTODUB_OCR_ADAPTIVE", True),
         ocr_scene_threshold=_env_float("AUTODUB_OCR_SCENE_THRESHOLD", 0.28, 0.02, 1.0),
-        translate_batch_size=_env_int("TRANSLATE_BATCH_SIZE", 80, 1, 100),
+        translate_batch_size=_env_int("TRANSLATE_BATCH_SIZE", 24, 1, 100),
         translate_analysis=_env_bool("TRANSLATE_ANALYSIS", True),
         translate_review=_env_bool("TRANSLATE_REVIEW", True),
         translate_cps_budget=_env_float("TRANSLATE_CPS_BUDGET", 12.5, 1, 80),

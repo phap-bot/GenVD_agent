@@ -77,7 +77,7 @@ class PipelineConfig(BaseModel):
 
     # Shared translation, timing and audio quality controls. These fields are
     # persisted with queued jobs so resumed renders use the same policy.
-    translate_batch_size: int = Field(default=80, ge=1, le=100)
+    translate_batch_size: int = Field(default=24, ge=1, le=100)
     translate_analysis: bool = True
     translate_review: bool = True
     translate_cps_budget: float = Field(default=12.5, gt=1, le=80)
@@ -191,7 +191,7 @@ class RenderScriptRequest(BaseModel):
     whisper_model: str = "auto"
     whisper_beam_size: int = Field(default=1, ge=1, le=10)
     segment_language_detection: bool = True
-    translate_batch_size: int = Field(default=80, ge=1, le=100)
+    translate_batch_size: int = Field(default=24, ge=1, le=100)
     translate_analysis: bool = True
     translate_review: bool = True
     translate_cps_budget: float = Field(default=12.5, gt=1, le=80)
@@ -325,7 +325,7 @@ class ShortVideoRenderRequest(BaseModel):
     whisper_model: str = "auto"
     whisper_beam_size: int = Field(default=1, ge=1, le=10)
     segment_language_detection: bool = True
-    translate_batch_size: int = Field(default=80, ge=1, le=100)
+    translate_batch_size: int = Field(default=24, ge=1, le=100)
     translate_analysis: bool = True
     translate_review: bool = True
     translate_cps_budget: float = Field(default=12.5, gt=1, le=80)

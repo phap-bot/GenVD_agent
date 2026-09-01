@@ -188,6 +188,29 @@ class TimelineTranslationTests(unittest.TestCase):
         self.assertEqual(translated, "Hứ")
         gtx_mock.assert_called_once()
 
+    def test_translation_batch_filters_known_repetition_before_gateway_request(self) -> None:
+        from utils.translation import _translate_9router_segments_with_model_fallback
+
+        repeated_source = "흥," * 12
+        with patch(
+            "utils.translation._translate_9router_segments_cached",
+            return_value=["Bản dịch bình thường."],
+        ) as gateway_mock:
+            translated = _translate_9router_segments_with_model_fallback(
+                (repeated_source, "A normal sentence."),
+                target_durations=(1.0, 2.0),
+                source_intervals=((0.0, 1.0), (1.0, 3.0)),
+                source="auto",
+                target="vi",
+                selected_model="model",
+                base_url="http://localhost:20128/v1",
+                api_key="",
+                timeout=5.0,
+            )
+
+        self.assertEqual(translated, ["Hừm", "Bản dịch bình thường."])
+        self.assertEqual(gateway_mock.call_args.args[0], ("A normal sentence.",))
+
     def test_translation_batches_use_word_and_line_limits(self) -> None:
         with patch(
                 "utils.translation._config_value",
