@@ -14,10 +14,12 @@ from app.services.subtitle_service import SubtitleService
 from app.services.timeline_service import TimelineService
 from app.services.translation_service import TranslationService
 from app.services.checkpoint_service import CheckpointStore
+from app.services.pipeline import TTS_POLICY_VERSION
 from app.services.tts_service import TTSService
 from app.services.video_service import VideoService
 from app.utils.files import ensure_output_dir, make_request_id
 from app.utils.memory import VRAMManager
+from utils.translation import TRANSLATION_POLICY_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +111,7 @@ class PipelineManager:
                 translation_service = None
                 translation_payload = {
                     "stage": "translation",
+                    "policy_version": TRANSLATION_POLICY_VERSION,
                     **config.model_dump(mode="json", exclude={"clone_reference_audio_path"}),
                     "segments": [item.model_dump(mode="json") for item in segments],
                 }
@@ -125,6 +128,7 @@ class PipelineManager:
                 VRAMManager.cleanup()
 
                 logger.info("Starting TTS stage for request %s", request_id)
+                self._checkpoint_voice_setup(checkpoint, config, translated_segments, request_id)
                 tts_service = TTSService(config)
                 tts_tracks = tts_service.synthesize(translated_segments, work_dir)
                 del tts_service
@@ -149,6 +153,54 @@ class PipelineManager:
                 )
             finally:
                 VRAMManager.cleanup()
+
+    def _checkpoint_voice_setup(
+        self,
+        checkpoint: CheckpointStore,
+        config: PipelineConfig,
+        segments: list[TranscriptSegment],
+        request_id: str,
+    ) -> None:
+        """Persist the selected voice/timing identity before TTS starts."""
+        payload = {
+            "stage": "voice_setup",
+            "policy_version": TTS_POLICY_VERSION,
+            "voice_mode": config.voice_mode,
+            "voice_model": config.voice_model.strip(),
+            "clone_reference_audio_path": config.clone_reference_audio_path,
+            "voice_speed": round(config.voice_speed, 3),
+            "soft_timing_fit": bool(config.soft_timing_fit),
+            "timing_max_drift_s": round(config.timing_max_drift_s, 3),
+            "timing_min_gap_s": round(config.timing_min_gap_s, 3),
+            "timing_max_atempo": round(config.timing_max_atempo, 3),
+            "segments": [item.model_dump(mode="json") for item in segments],
+        }
+        cached = checkpoint.load("voice_setup", payload)
+        if isinstance(cached, dict):
+            logger.info(
+                "checkpoint.hit manager stage=voice_setup request_id=%s mode=%s voice=%s segments=%s",
+                request_id,
+                config.voice_mode,
+                config.voice_model,
+                len(segments),
+            )
+            return
+        checkpoint.save(
+            "voice_setup",
+            payload,
+            {
+                "voice_mode": config.voice_mode,
+                "default_voice": config.voice_model.strip(),
+                "segments": len(segments),
+            },
+        )
+        logger.info(
+            "checkpoint.saved manager stage=voice_setup request_id=%s mode=%s voice=%s segments=%s",
+            request_id,
+            config.voice_mode,
+            config.voice_model,
+            len(segments),
+        )
 
     def process_with_srt(
         self,
@@ -221,6 +273,16 @@ class PipelineManager:
                 VRAMManager.cleanup()
 
                 logger.info("Starting TTS stage for request %s", request_id)
+                self._checkpoint_voice_setup(
+                    CheckpointStore(
+                        video_path,
+                        root=config.checkpoint_root,
+                        enabled=config.checkpoint_enabled,
+                    ),
+                    config,
+                    translated_segments,
+                    request_id,
+                )
                 tts_service = TTSService(config)
                 tts_tracks = tts_service.synthesize(translated_segments, work_dir)
                 del tts_service

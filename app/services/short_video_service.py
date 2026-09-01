@@ -11,7 +11,10 @@ from app.models.schemas import ShortVideoProfile
 from app.utils.media_probe import probe_duration, probe_video_dimensions
 
 
-SHORT_VIDEO_MAX_SECONDS = 300.0
+# Short Video is deliberately a separate, fast-turnaround workflow.  Anything
+# longer than two minutes belongs to Clone Video so it cannot accidentally pay
+# the long-video OCR/translation/TTS cost.
+SHORT_VIDEO_MAX_SECONDS = 120.0
 SHORT_VIDEO_MEDIA_ROOT = Path("temp") / "short_video"
 _MEDIA_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 
@@ -27,7 +30,7 @@ class ShortVideoService:
     def max_short_seconds(self) -> float:
         raw = os.environ.get("AUTODUB_SHORT_VIDEO_MAX_SECONDS", str(SHORT_VIDEO_MAX_SECONDS)).strip()
         try:
-            return max(1.0, float(raw))
+            return min(SHORT_VIDEO_MAX_SECONDS, max(1.0, float(raw)))
         except ValueError:
             return SHORT_VIDEO_MAX_SECONDS
 
@@ -81,14 +84,18 @@ class ShortVideoService:
         max_short = self.max_short_seconds
         if duration <= 60:
             name = "micro"
-        elif duration <= 180:
+        elif duration <= 120:
             name = "short"
-        elif duration <= max_short:
+        elif duration <= 300:
+            # Kept as a compatibility label for clients that already know the
+            # profile name.  Its route is long whenever the configured Short
+            # limit is 120 seconds (the default), so it is never processed by
+            # the Short pipeline.
             name = "short_extended"
         else:
             name = "long"
 
-        is_short = name != "long"
+        is_short = duration <= max_short
         if name == "micro":
             asr_model = "base"
         elif is_short:
@@ -111,7 +118,7 @@ class ShortVideoService:
         profile = self.resolve_profile(duration, has_audio=self._has_audio(path))
         if profile.route != "short_video":
             raise ValueError(
-                f"Video duration {duration:.1f}s exceeds Short Video limit {profile.max_short_seconds:.1f}s; "
+                f"Video duration {duration:.1f}s exceeds Short Video limit {self.max_short_seconds:.1f}s; "
                 "use Clone Video for the long-video pipeline."
             )
         return profile
