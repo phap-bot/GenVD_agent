@@ -39,6 +39,15 @@ TRANSLATION_POLICY_VERSION = "batch-context-coherence-qa-v2"
 DEFAULT_COHERENCE_BATCH_ITEMS = 24
 DEFAULT_COHERENCE_TIMEOUT_SECONDS = 18.0
 TRANSLATION_SCENE_BREAK_SECONDS = 8.0
+REPEATED_SOUND_MIN_TOKENS = 6
+VI_REPEATED_SOUND_TRANSLATIONS = {
+    "흥": "Hừm",
+    "哼": "Hừm",
+    "嗯": "Ừm",
+    "啊": "À",
+    "哦": "Ồ",
+    "哈": "Ha",
+}
 VI_INCOMPLETE_LINE_ENDINGS = frozenset(
     {
         "đang",
@@ -123,6 +132,17 @@ def translate_text(
     if selected_provider in {"mock", "none", "off"}:
         return f"[{target}] {clean_text}"
 
+    repeated_sound = _deterministic_repeated_sound_translation(clean_text, target)
+    if repeated_sound:
+        logger.info(
+            "translation.repetition_short_circuit source=%s target=%s source_text=%s replacement=%s",
+            source,
+            target,
+            clean_text,
+            repeated_sound,
+        )
+        return repeated_sound
+
     try:
         _raise_if_cancelled(cancel_event)
         if selected_provider in {"9router", "ninerouter", "openai-compatible", "openai_compatible"}:
@@ -163,7 +183,14 @@ def translate_text(
             exc,
         )
         if (_config_value("AUTODUB_TRANSLATION_FALLBACK") or "google").strip().lower() == "google":
-            return _translate_google_gtx_cached(clean_text, source, target, timeout)
+            fallback = _translate_google_gtx_cached(clean_text, source, target, timeout)
+            return _fallback_if_bad_translation(
+                clean_text,
+                fallback,
+                source=source,
+                target=target,
+                timeout=timeout,
+            )
         return clean_text
 
 
@@ -1892,6 +1919,33 @@ def _fallback_if_bad_translation(
 ) -> str:
     clean_translation = _clean_translated_text(translated_text)
     clean_translation = _postprocess_translation(source_text, clean_translation, target)
+
+    repeated_sound = _deterministic_repeated_sound_translation(source_text, target)
+    if repeated_sound:
+        if clean_translation != repeated_sound:
+            logger.warning(
+                "translation.repetition_collapsed source=%s target=%s source_text=%s translated_text=%s replacement=%s",
+                source,
+                target,
+                source_text,
+                clean_translation,
+                repeated_sound,
+            )
+        return repeated_sound
+
+    if _is_repetition_loop(clean_translation):
+        collapsed = _collapse_repetition_loop(clean_translation)
+        if collapsed:
+            logger.warning(
+                "translation.repetition_collapsed source=%s target=%s source_text=%s translated_text=%s replacement=%s",
+                source,
+                target,
+                source_text,
+                clean_translation,
+                collapsed,
+            )
+            return collapsed
+
     if not _translation_needs_fallback(source_text, clean_translation, target):
         return clean_translation
 
@@ -1908,6 +1962,21 @@ def _fallback_if_bad_translation(
     try:
         fallback = _translate_google_gtx_cached(source_text, source, target, timeout)
         fallback = _postprocess_translation(source_text, _clean_translated_text(fallback), target)
+        repeated_sound = _deterministic_repeated_sound_translation(source_text, target)
+        if repeated_sound:
+            return repeated_sound
+        if _is_repetition_loop(fallback):
+            collapsed = _collapse_repetition_loop(fallback)
+            if collapsed:
+                logger.warning(
+                    "translation.repetition_collapsed source=%s target=%s source_text=%s translated_text=%s replacement=%s",
+                    source,
+                    target,
+                    source_text,
+                    fallback,
+                    collapsed,
+                )
+                return collapsed
         return fallback or clean_translation or source_text
     except Exception:
         logger.exception("translation.google_fallback_failed source=%s target=%s", source, target)
@@ -1920,6 +1989,8 @@ def _translation_needs_fallback(source_text: str, translated_text: str, target: 
     if _normalize_for_compare(source_text) == _normalize_for_compare(translated_text):
         return True
     if target.startswith("vi") and _contains_cjk(translated_text):
+        return True
+    if _is_repetition_loop(translated_text):
         return True
     if _looks_fragmentary_translation(
         translated_text,
@@ -2103,6 +2174,47 @@ def _postprocess_translation(source_text: str, translated_text: str, target: str
 
 def _contains_cjk(text: str) -> bool:
     return bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uac00-\ud7af]", text))
+
+
+def _repetition_tokens(text: str) -> list[str]:
+    """Tokenize words and CJK syllables for detecting ASR repetition loops."""
+    return re.findall(
+        r"[A-Za-zÀ-ỹĐđ0-9]+(?:['’][A-Za-zÀ-ỹĐđ0-9]+)?|"
+        r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]",
+        text,
+        flags=re.UNICODE,
+    )
+
+
+def _is_repetition_loop(text: str) -> bool:
+    tokens = _repetition_tokens(text)
+    if len(tokens) < REPEATED_SOUND_MIN_TOKENS:
+        return False
+    normalized = [token.casefold() for token in tokens]
+    counts = {token: normalized.count(token) for token in set(normalized)}
+    most_common = max(counts.values(), default=0)
+    return most_common / len(normalized) >= 0.8 and len(counts) <= 2
+
+
+def _collapse_repetition_loop(text: str) -> str:
+    tokens = _repetition_tokens(text)
+    if not _is_repetition_loop(text) or not tokens:
+        return ""
+    replacement = tokens[0]
+    terminal = re.search(r"([.!?！？。…]+)[\"'”’)]*\s*$", text)
+    if terminal:
+        replacement += terminal.group(1)
+    return replacement
+
+
+def _deterministic_repeated_sound_translation(text: str, target: str) -> str:
+    """Collapse known non-lexical ASR loops before spending an API request."""
+    if not target.startswith("vi") or not _is_repetition_loop(text):
+        return ""
+    tokens = _repetition_tokens(text)
+    if not tokens:
+        return ""
+    return VI_REPEATED_SOUND_TRANSLATIONS.get(tokens[0].casefold(), "")
 
 
 def _normalize_for_compare(text: str) -> str:

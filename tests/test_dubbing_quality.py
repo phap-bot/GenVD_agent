@@ -15,7 +15,7 @@ from app.services.pipeline import AutoDubbingPipeline
 from app.services.translation_service import TranslationService
 from app.services.vocal_separation_service import VocalSeparationResult
 from app.utils.workspace import WorkspaceManager
-from utils.translation import _translation_batches, translate_segments
+from utils.translation import _translation_batches, translate_segments, translate_text
 
 
 def _pipeline(**overrides) -> AutoDubbingPipeline:
@@ -151,6 +151,43 @@ class SentenceSegmentationTests(unittest.TestCase):
 
 
 class TimelineTranslationTests(unittest.TestCase):
+    def test_repeated_korean_filler_short_circuits_translation_api(self) -> None:
+        repeated_source = "흥," * 12
+        with (
+            patch("utils.translation._translate_9router_text_with_model_fallback") as router_mock,
+            patch("utils.translation._translate_google_gtx_cached") as gtx_mock,
+        ):
+            translated = translate_text(
+                repeated_source,
+                source_language="auto",
+                target_language="vi",
+                provider="9router",
+                model="model",
+            )
+
+        self.assertEqual(translated, "Hừm")
+        router_mock.assert_not_called()
+        gtx_mock.assert_not_called()
+
+    def test_repeated_fallback_output_is_collapsed_to_one_spoken_sound(self) -> None:
+        from utils.translation import _fallback_if_bad_translation
+
+        repeated_fallback = "Hứ, " * 12
+        with patch(
+            "utils.translation._translate_google_gtx_cached",
+            return_value=repeated_fallback,
+        ) as gtx_mock:
+            translated = _fallback_if_bad_translation(
+                "你好吗?",
+                "你好吗?",
+                source="auto",
+                target="vi",
+                timeout=5.0,
+            )
+
+        self.assertEqual(translated, "Hứ")
+        gtx_mock.assert_called_once()
+
     def test_translation_batches_use_word_and_line_limits(self) -> None:
         with patch(
                 "utils.translation._config_value",
