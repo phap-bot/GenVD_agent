@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import threading
 import wave
+import math
 
 from app.utils.cancel import PipelineCancelledError
 from app.utils.vram import VRAMManager
@@ -90,6 +91,28 @@ def _save_audio(torch, torchaudio, output_path: Path, waveform, sample_rate: int
             backend_error,
         )
         _save_pcm_wav(torch, output_path, waveform, sample_rate)
+
+
+def _resolve_demucs_chunk_seconds(value: str | float | int | None = None) -> float:
+    """Return a bounded chunk size for Demucs inference.
+
+    Demucs' ``split=True`` option still materializes the complete output for
+    the input tensor.  Feeding a long movie as one tensor therefore causes a
+    very large temporary allocation.  Chunking keeps the model's peak memory
+    bounded while retaining Demucs' own overlap handling inside each chunk.
+    """
+    raw = value if value is not None else os.environ.get("AUTODUB_DEMUCS_CHUNK_SECONDS", "60")
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("vocal_separation.invalid_chunk_seconds value=%s fallback=60", raw)
+        return 60.0
+    if not math.isfinite(seconds):
+        logger.warning("vocal_separation.invalid_chunk_seconds value=%s fallback=60", raw)
+        return 60.0
+    # Chunks below ten seconds add a large amount of model overhead; very
+    # large values recreate the original full-file memory problem.
+    return min(600.0, max(10.0, seconds))
 
 
 @dataclass(frozen=True)
@@ -179,42 +202,72 @@ class VocalSeparationService:
                 # Match the normalization used by the official Demucs
                 # separator. Calling apply_model on an unnormalized mix leaves
                 # substantially more vocal energy in the accompaniment stem.
-                reference = wav.mean(dim=0)
-                reference_mean = reference.mean()
-                reference_std = reference.std().clamp_min(1e-8)
-                normalized_wav = ((wav - reference_mean) / reference_std).unsqueeze(0)
+                # Keep only scalar statistics here; normalizing the complete
+                # movie before inference would allocate another full-duration
+                # tensor.
+                reference_mean = wav.mean()
+                reference_std = wav.std().clamp_min(1e-8)
 
-                logger.info("vocal_separation.infer audio_shape=%s sr=%s", list(normalized_wav.shape), sr)
+                total_samples = int(wav.shape[-1])
+                chunk_seconds = _resolve_demucs_chunk_seconds()
+                chunk_samples = max(1, int(round(chunk_seconds * sr)))
+                total_chunks = max(1, (total_samples + chunk_samples - 1) // chunk_samples)
+                logger.info(
+                    "vocal_separation.infer audio_shape=%s sr=%s chunk_seconds=%.1f chunks=%s",
+                    [1, int(wav.shape[0]), total_samples],
+                    sr,
+                    chunk_seconds,
+                    total_chunks,
+                )
 
-                with torch.no_grad():
-                    # apply_model returns tensor of shape [batch, sources, channels, time]
-                    # for htdemucs sources are usually: ['drums', 'bass', 'other', 'vocals']
-                    sources = apply_model(
-                        model,
-                        normalized_wav,
-                        device=resolved_device,
-                        shifts=1,
-                        split=True,
-                        overlap=0.5,
-                        progress=False,
-                    )
-                source_scale = reference_std.to(sources.device)
-                source_offset = reference_mean.to(sources.device)
-                sources.mul_(source_scale).add_(source_offset)
-
-                # Map source names
+                # Process one bounded chunk at a time. Demucs' split=True
+                # already applies overlap inside each chunk, and concatenating
+                # only the vocal stem avoids retaining all four full-duration
+                # source tensors in memory.
                 source_names = model.sources
-
-                # Extract vocals tensor [2, time]
                 vocals_idx = source_names.index("vocals") if "vocals" in source_names else -1
-                vocals_source = sources[0, vocals_idx if vocals_idx >= 0 else -1].detach()
-                vocals_tensor = vocals_source.clone() if vocals_source.device.type == "cpu" else vocals_source.cpu()
+                vocals_chunks = []
+                for chunk_index, start in enumerate(range(0, total_samples, chunk_samples), start=1):
+                    if cancel_event and cancel_event.is_set():
+                        raise PipelineCancelledError("Vocal separation cancelled during inference.")
+                    end = min(total_samples, start + chunk_samples)
+                    normalized_chunk = (
+                        (wav[..., start:end] - reference_mean) / reference_std
+                    ).unsqueeze(0)
+                    with torch.no_grad():
+                        # apply_model returns [batch, sources, channels, time].
+                        sources = apply_model(
+                            model,
+                            normalized_chunk,
+                            device=resolved_device,
+                            shifts=1,
+                            split=True,
+                            overlap=0.5,
+                            progress=False,
+                        )
+                    sources.mul_(reference_std.to(sources.device)).add_(reference_mean.to(sources.device))
+                    vocals_source = sources[0, vocals_idx if vocals_idx >= 0 else -1].detach()
+                    vocals_chunk = vocals_source.to(device="cpu", dtype=torch.float32).clone()
+                    expected_samples = end - start
+                    if vocals_chunk.shape[-1] < expected_samples:
+                        vocals_chunk = torch.nn.functional.pad(vocals_chunk, (0, expected_samples - vocals_chunk.shape[-1]))
+                    elif vocals_chunk.shape[-1] > expected_samples:
+                        vocals_chunk = vocals_chunk[..., :expected_samples]
+                    vocals_chunks.append(vocals_chunk)
+                    logger.info(
+                        "vocal_separation.chunk_done index=%s/%s start=%s end=%s progress=%s",
+                        chunk_index,
+                        total_chunks,
+                        start,
+                        end,
+                        round(chunk_index / total_chunks * 100),
+                    )
+                    del vocals_source, vocals_chunk, sources, normalized_chunk
+                    if resolved_device.startswith("cuda"):
+                        torch.cuda.empty_cache()
 
-                # A full 19-minute four-stem result can retain well over 1 GB
-                # on CPU. Keep only vocals before allocating the residual.
-                del vocals_source, sources, normalized_wav, reference, source_scale, source_offset
-                if resolved_device.startswith("cuda"):
-                    torch.cuda.empty_cache()
+                vocals_tensor = torch.cat(vocals_chunks, dim=-1)[..., :total_samples]
+                del vocals_chunks, reference_mean, reference_std
 
                 # Preserve the original ambience, stereo image and transients.
                 # Reuse the original audio buffer for the residual to avoid two

@@ -185,7 +185,7 @@ class PipelineManager:
                 len(segments),
             )
             return
-        checkpoint.save(
+        checkpoint_path = checkpoint.save(
             "voice_setup",
             payload,
             {
@@ -194,13 +194,14 @@ class PipelineManager:
                 "segments": len(segments),
             },
         )
-        logger.info(
-            "checkpoint.saved manager stage=voice_setup request_id=%s mode=%s voice=%s segments=%s",
-            request_id,
-            config.voice_mode,
-            config.voice_model,
-            len(segments),
-        )
+        if checkpoint_path is not None:
+            logger.info(
+                "checkpoint.saved manager stage=voice_setup request_id=%s mode=%s voice=%s segments=%s",
+                request_id,
+                config.voice_mode,
+                config.voice_model,
+                len(segments),
+            )
 
     def process_with_srt(
         self,

@@ -37,12 +37,13 @@ const VOICE_REFERENCE_URL = `${BACKEND_URL}/api/voice-reference`;
 const SHORTEN_TEXT_URL = `${BACKEND_URL}/api/shorten-text`;
 const TRANSLATION_MODELS_URL = `${BACKEND_URL}/api/translation/models`;
 const STT_MODELS_URL = `${BACKEND_URL}/api/stt/models`;
+const PIPELINE_SETTINGS_URL = `${BACKEND_URL}/api/pipeline/settings`;
 const DEFAULT_TRANSLATION_MODEL = "ag/gemini-3-flash-agent";
 const DEFAULT_OCR_MODEL = "gemini/gemini-2.5-flash";
 const DEFAULT_ASR_MODEL = "base";
 const VI_WORDS_PER_SECOND = 3;
 const STUDIO_SESSION_KEY = 'video-clone:studio-session:v1';
-const STUDIO_SESSION_VERSION = 1;
+const STUDIO_SESSION_VERSION = 2;
 
 type CopyrightSource = "unknown" | "owned" | "licensed" | "public_domain" | "permission" | "platform_library";
 type VoiceMode = "system" | "clone";
@@ -53,6 +54,10 @@ type StudioConfig = {
   translationProvider: "9router" | "google" | "mock";
   translationModel: string;
   asrModel: string;
+  asrEngine: "auto" | "whisper" | "paraformer";
+  whisperModel: string;
+  whisperBeamSize: number;
+  segmentLanguageDetection: boolean;
   voiceModel: string;
   voiceMode: VoiceMode;
   ttsDevice: "cuda";
@@ -62,7 +67,14 @@ type StudioConfig = {
   ocrFallback: boolean;
   ocrForce: boolean;
   ocrModel: string;
+  ocrIntervalSeconds: number;
+  ocrCropBottomRatio: number;
   vocalSeparation: boolean;
+  softTimingFit: boolean;
+  timingMaxDrift: number;
+  timingMinGap: number;
+  timingMaxAtempo: number;
+  voiceSpeed: number;
 };
 
 type ModelOption = {
@@ -491,19 +503,41 @@ export default function VideoDubbingStudio() {
     translationProvider: "9router",
     translationModel: DEFAULT_TRANSLATION_MODEL,
     asrModel: DEFAULT_ASR_MODEL,
+    asrEngine: "auto",
+    whisperModel: "auto",
+    whisperBeamSize: 5,
+    segmentLanguageDetection: true,
     voiceModel: "Trúc Ly",
     voiceMode: "system",
     ttsDevice: "cuda",
     copyrightAcknowledged: false,
     copyrightSource: "unknown",
     copyrightNotes: "",
-    ocrFallback: true,
+    ocrFallback: false,
     ocrForce: false,
     ocrModel: DEFAULT_OCR_MODEL,
+    ocrIntervalSeconds: 0.75,
+    ocrCropBottomRatio: 0.35,
     vocalSeparation: true,
+    softTimingFit: true,
+    timingMaxDrift: 1.5,
+    timingMinGap: 0.12,
+    timingMaxAtempo: 1.1,
+    voiceSpeed: 1.0,
   });
   const [translationModels, setTranslationModels] = useState<ModelOption[]>(fallbackTranslationModels);
   const [asrModels, setAsrModels] = useState<ModelOption[]>(fallbackAsrModelOptions);
+  const [pipelineSourceLanguages, setPipelineSourceLanguages] = useState<ModelOption[]>(languageOptions);
+  const [pipelineAsrEngines, setPipelineAsrEngines] = useState<ModelOption[]>([
+    { label: "Tự động", value: "auto" },
+    { label: "Whisper", value: "whisper" },
+    { label: "Paraformer", value: "paraformer" },
+  ]);
+  const [pipelineWhisperModels, setPipelineWhisperModels] = useState<ModelOption[]>(["auto", "tiny", "base", "small", "medium", "large-v3"].map((value) => ({ label: value, value })));
+  const [pipelineOcrModels, setPipelineOcrModels] = useState<ModelOption[]>([
+    { label: "Gemini 2.5 Flash OCR", value: DEFAULT_OCR_MODEL },
+    { label: "Gemini 2.5 Pro OCR", value: "gemini/gemini-2.5-pro" },
+  ]);
   const [activeStep, setActiveStep] = useState(0);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isRendering, setIsRendering] = useState(false);
@@ -625,7 +659,9 @@ export default function VideoDubbingStudio() {
         const stored = window.sessionStorage.getItem(STUDIO_SESSION_KEY);
         if (stored) {
           const parsed = JSON.parse(stored) as StudioSessionSnapshot;
-          if (parsed.version === STUDIO_SESSION_VERSION && parsed.sessionId) snapshot = parsed;
+          // Version 1 stored the old OCR default as enabled. Keep the rest of
+          // the session, but migrate that legacy default to off below.
+          if ((parsed.version === STUDIO_SESSION_VERSION || parsed.version === 1) && parsed.sessionId) snapshot = parsed;
         }
       } catch {
         window.sessionStorage.removeItem(STUDIO_SESSION_KEY);
@@ -636,6 +672,9 @@ export default function VideoDubbingStudio() {
 
       if (snapshot) {
         const restoredConfig = { ...config, ...snapshot.config };
+        if (snapshot.version < STUDIO_SESSION_VERSION) {
+          restoredConfig.ocrFallback = false;
+        }
         const restoredSegments = Array.isArray(snapshot.segments)
           ? snapshot.segments.map((segment) => normalizeSegment(segment, restoredConfig.voiceModel))
           : [];
@@ -903,8 +942,44 @@ export default function VideoDubbingStudio() {
       }
     }
 
+    async function loadPipelineSettings() {
+      try {
+        const response = await fetch(PIPELINE_SETTINGS_URL, { cache: "no-store" });
+        if (!response.ok) return;
+        const payload = (await response.json()) as {
+          source_languages?: Array<{ value?: string; label?: string }>;
+          asr_engines?: string[];
+          whisper_models?: string[];
+          timing?: { soft_timing_fit?: boolean; max_drift_s?: number; min_gap_s?: number; max_atempo?: number; voice_speed?: number };
+          ocr?: { interval_seconds?: number; crop_bottom_ratio?: number; enabled_by_default?: boolean; models?: Array<{ id?: string; label?: string }> };
+        };
+        if (!mounted) return;
+        const sourceOptions = (payload.source_languages ?? []).filter((item) => item.value).map((item) => ({ value: item.value as string, label: item.label || item.value as string }));
+        const asrEngineOptions = (payload.asr_engines ?? []).map((value) => ({ value, label: value === "auto" ? "Tự động" : value === "paraformer" ? "Paraformer" : "Whisper" }));
+        const whisperOptions = (payload.whisper_models ?? []).map((value) => ({ value, label: value }));
+        const ocrOptions = (payload.ocr?.models ?? []).filter((item) => item.id).map((item) => ({ value: item.id as string, label: item.label || item.id as string }));
+        if (sourceOptions.length) setPipelineSourceLanguages(sourceOptions);
+        if (asrEngineOptions.length) setPipelineAsrEngines(asrEngineOptions);
+        if (whisperOptions.length) setPipelineWhisperModels(whisperOptions);
+        if (ocrOptions.length) setPipelineOcrModels(ocrOptions);
+        setConfig((current) => ({
+          ...current,
+          softTimingFit: payload.timing?.soft_timing_fit ?? current.softTimingFit,
+          timingMaxDrift: payload.timing?.max_drift_s ?? current.timingMaxDrift,
+          timingMinGap: payload.timing?.min_gap_s ?? current.timingMinGap,
+          timingMaxAtempo: payload.timing?.max_atempo ?? current.timingMaxAtempo,
+          voiceSpeed: payload.timing?.voice_speed ?? current.voiceSpeed,
+          ocrIntervalSeconds: payload.ocr?.interval_seconds ?? current.ocrIntervalSeconds,
+          ocrCropBottomRatio: payload.ocr?.crop_bottom_ratio ?? current.ocrCropBottomRatio,
+        }));
+      } catch {
+        // Local fallback remains valid when an older backend is running.
+      }
+    }
+
     loadTranslationModels();
     loadSttModels();
+    loadPipelineSettings();
     return () => {
       mounted = false;
     };
@@ -948,16 +1023,27 @@ export default function VideoDubbingStudio() {
       translationProvider: '9router',
       translationModel: DEFAULT_TRANSLATION_MODEL,
       asrModel: DEFAULT_ASR_MODEL,
+      asrEngine: 'auto',
+      whisperModel: 'auto',
+      whisperBeamSize: 5,
+      segmentLanguageDetection: true,
       voiceModel: 'Trúc Ly',
       voiceMode: 'system',
       ttsDevice: 'cuda',
       copyrightAcknowledged: false,
       copyrightSource: 'unknown',
       copyrightNotes: '',
-      ocrFallback: true,
+      ocrFallback: false,
       ocrForce: false,
       ocrModel: DEFAULT_OCR_MODEL,
+      ocrIntervalSeconds: 0.75,
+      ocrCropBottomRatio: 0.35,
       vocalSeparation: true,
+      softTimingFit: true,
+      timingMaxDrift: 1.5,
+      timingMinGap: 0.12,
+      timingMaxAtempo: 1.1,
+      voiceSpeed: 1.0,
     });
     setActiveStep(0);
     setCloneReferenceFile(null);
@@ -1057,8 +1143,9 @@ export default function VideoDubbingStudio() {
     resetProcessing("Đã chọn video");
   }
 
-  function onDrop(event: DragEvent<HTMLLabelElement>) {
+  function onDrop(event: DragEvent<HTMLElement>) {
     event.preventDefault();
+    event.stopPropagation();
     handleFile(event.dataTransfer.files[0]);
   }
 
@@ -1210,6 +1297,10 @@ export default function VideoDubbingStudio() {
     formData.append("translation_provider", config.translationProvider);
     formData.append("translation_model", config.translationModel);
     formData.append("asr_model", config.asrModel);
+    formData.append("asr_engine", config.asrEngine);
+    formData.append("whisper_model", config.whisperModel);
+    formData.append("whisper_beam_size", String(config.whisperBeamSize));
+    formData.append("segment_language_detection", String(config.segmentLanguageDetection));
     formData.append("compute_type", "int8");
     formData.append("voice_model", config.voiceModel);
     formData.append("tts_device", config.ttsDevice);
@@ -1218,8 +1309,13 @@ export default function VideoDubbingStudio() {
     formData.append("ocr_fallback", String(config.ocrFallback));
     formData.append("ocr_force", String(config.ocrForce));
     formData.append("ocr_model", config.ocrModel);
-    formData.append("ocr_interval_seconds", "0.75");
-    formData.append("ocr_crop_bottom_ratio", "0.35");
+    formData.append("ocr_interval_seconds", String(config.ocrIntervalSeconds));
+    formData.append("ocr_crop_bottom_ratio", String(config.ocrCropBottomRatio));
+    formData.append("soft_timing_fit", String(config.softTimingFit));
+    formData.append("timing_max_drift_s", String(config.timingMaxDrift));
+    formData.append("timing_min_gap_s", String(config.timingMinGap));
+    formData.append("timing_max_atempo", String(config.timingMaxAtempo));
+    formData.append("voice_speed", String(config.voiceSpeed));
     formData.append("vocal_separation", String(config.vocalSeparation));
     appendCopyrightPreflight(formData);
 
@@ -1418,18 +1514,22 @@ export default function VideoDubbingStudio() {
         if (config.voiceMode === "system" && baseSegments.some((segment) => !segment.voice_model?.trim())) {
           throw new Error("Mỗi đoạn thoại phải có một giọng hệ thống hợp lệ.");
         }
-        const systemVoiceModel = scriptDefaultVoice();
+        const systemVoiceModel = config.voiceModel.trim() || scriptDefaultVoice();
         const cloneSelectionRevision = cloneSelectionRevisionRef.current;
         const cloneReferenceAudioPath = await uploadCloneReference(cloneSelectionRevision);
         assertCloneSelectionUnchanged(cloneSelectionRevision);
         const renderSegments = baseSegments.map((segment) => ({
           ...segment,
-          voice_model: segment.voice_model,
+          // Send the effective UI voice on every segment.  The backend keeps
+          // per-segment voice selection, but must never receive an empty
+          // setup when the user selected a default voice in the panel.
+          voice_model: segment.voice_model?.trim() || systemVoiceModel,
           subtitle_style: normalizeSubtitleStyle(segment.subtitle_style),
           blur_style: normalizeBlurStyle(segment.blur_style),
         }));
         const renderPayload = {
           source_video_path: sourceVideoUrl || `/media/${sessionIdRef.current}_source.mp4`,
+          source_language: config.sourceLanguage === "auto" ? null : config.sourceLanguage,
           target_language: config.targetLanguage,
           translation_provider: config.translationProvider,
           translation_model: config.translationModel,
@@ -1445,6 +1545,20 @@ export default function VideoDubbingStudio() {
           copyright_source: config.copyrightSource,
           copyright_notes: config.copyrightNotes.trim(),
           vocal_separation: config.vocalSeparation,
+          ocr_fallback: config.ocrFallback,
+          ocr_force: config.ocrForce,
+          ocr_model: config.ocrModel,
+          ocr_interval_seconds: config.ocrIntervalSeconds,
+          ocr_crop_bottom_ratio: config.ocrCropBottomRatio,
+          asr_engine: config.asrEngine,
+          whisper_model: config.whisperModel,
+          whisper_beam_size: config.whisperBeamSize,
+          segment_language_detection: config.segmentLanguageDetection,
+          soft_timing_fit: config.softTimingFit,
+          timing_max_drift_s: config.timingMaxDrift,
+          timing_min_gap_s: config.timingMinGap,
+          timing_max_atempo: config.timingMaxAtempo,
+          voice_speed: config.voiceSpeed,
           segments: renderSegments,
         };
 
@@ -1555,7 +1669,7 @@ export default function VideoDubbingStudio() {
 
         <nav className="hidden items-center gap-2 text-sm font-medium text-slate-600 lg:flex" aria-label="Chức năng chính">
           <button type="button" onClick={() => setActiveWorkspace("clone")} className={`rounded-md px-4 py-2 ${activeWorkspace === "clone" ? "border border-blue-200 bg-blue-50 text-blue-700" : "hover:bg-slate-100"}`}>Clone Video</button>
-          <button type="button" onClick={() => setActiveWorkspace("short")} className={`rounded-md px-4 py-2 ${activeWorkspace === "short" ? "border border-blue-200 bg-blue-50 text-blue-700" : "hover:bg-slate-100"}`}>Short Video</button>
+          <button type="button" onClick={() => setActiveWorkspace("short")} className={`rounded-md px-4 py-2 ${activeWorkspace === "short" ? "border border-blue-200 bg-blue-50 text-blue-700" : "hover:bg-slate-100"}`}>Short Video ≤2p</button>
           <button type="button" onClick={() => setActiveWorkspace("gen")} className={`rounded-md px-4 py-2 ${activeWorkspace === "gen" ? "border border-blue-200 bg-blue-50 text-blue-700" : "hover:bg-slate-100"}`}>Gen Video</button>
           <button type="button" onClick={() => setActiveWorkspace("setup")} className={`rounded-md px-4 py-2 ${activeWorkspace === "setup" ? "border border-blue-200 bg-blue-50 text-blue-700" : "hover:bg-slate-100"}`}>Thiết lập tải</button>
           <button className="rounded-md px-4 py-2 hover:bg-slate-100">Hướng Dẫn</button>
@@ -1588,7 +1702,12 @@ export default function VideoDubbingStudio() {
       ) : activeWorkspace === "short" ? (
         <ShortVideoWorkspace onOpenClone={() => setActiveWorkspace("clone")} />
       ) : (
-        <section className="grid min-h-[calc(100vh-64px)] min-w-0 lg:grid-cols-[360px_minmax(0,1fr)]" aria-label="Không gian làm việc lồng tiếng video">
+        <section
+          className="grid min-h-[calc(100vh-64px)] min-w-0 lg:grid-cols-[360px_minmax(0,1fr)]"
+          aria-label="Không gian làm việc lồng tiếng video"
+          onDragOver={(event) => event.preventDefault()}
+          onDrop={onDrop}
+        >
         <aside className="min-w-0 overflow-hidden border-r border-slate-200 bg-white p-5">
           <header className="flex items-center justify-between">
             <h2 className="text-xs font-bold uppercase tracking-wide text-slate-500">Dự án</h2>
@@ -1598,13 +1717,25 @@ export default function VideoDubbingStudio() {
             </button>
           </header>
 
-          <figure className="mt-4 overflow-hidden rounded-lg border border-slate-200 bg-slate-950">
+          <figure
+            className="relative mt-4 overflow-hidden rounded-lg border border-slate-200 bg-slate-950"
+            onDragOver={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              event.dataTransfer.dropEffect = "copy";
+            }}
+            onDrop={onDrop}
+          >
             {currentVideoUrl ? (
-              <video className="aspect-[9/14] w-full object-cover" src={currentVideoUrl} controls />
+              <div className="relative">
+                <video className="aspect-[9/14] w-full object-cover" src={currentVideoUrl} controls />
+                <label className="absolute inset-x-3 bottom-3 cursor-pointer rounded-md bg-slate-950/75 px-3 py-2 text-center text-xs font-semibold text-white">
+                  Thả video mới vào đây hoặc chọn file
+                  <input ref={inputRef} className="hidden" type="file" accept="video/*,.mkv" onChange={onFileChange} />
+                </label>
+              </div>
             ) : (
               <label
-                onDragOver={(event) => event.preventDefault()}
-                onDrop={onDrop}
                 className="flex aspect-[9/14] cursor-pointer flex-col items-center justify-center bg-slate-100 p-8 text-center text-slate-600"
               >
                 <input ref={inputRef} className="hidden" type="file" accept="video/*,.mkv" onChange={onFileChange} />
@@ -1638,7 +1769,18 @@ export default function VideoDubbingStudio() {
 
           <form className="mt-5 grid min-w-0 gap-4 border-t border-slate-200 pt-5" aria-label="Cấu hình lồng tiếng">
             <SelectField label="Nhận dạng giọng nói (ASR)" value={config.asrModel} options={asrModels} onChange={(value) => setConfig((current) => ({ ...current, asrModel: value }))} />
-            <SelectField label="Ngôn ngữ gốc" value={config.sourceLanguage} options={languageOptions} onChange={(value) => setConfig((current) => ({ ...current, sourceLanguage: value }))} />
+            <fieldset className="grid gap-3 rounded-md border border-violet-200 bg-violet-50/40 p-3">
+              <legend className="px-1 text-sm font-semibold text-violet-800">Thiết lập ASR chi tiết</legend>
+              <div className="grid grid-cols-2 gap-2">
+                <SelectField label="Engine" value={config.asrEngine} options={pipelineAsrEngines} onChange={(value) => setConfig((current) => ({ ...current, asrEngine: value as StudioConfig["asrEngine"] }))} />
+                <SelectField label="Whisper model" value={config.whisperModel} options={pipelineWhisperModels} onChange={(value) => setConfig((current) => ({ ...current, whisperModel: value }))} />
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <label className="grid gap-1 text-xs font-medium">Beam size<select value={config.whisperBeamSize} onChange={(event) => setConfig((current) => ({ ...current, whisperBeamSize: Number(event.target.value) }))} className="rounded border border-violet-200 bg-white px-2 py-2">{[1, 3, 5, 7, 10].map((value) => <option key={value} value={value}>{value}</option>)}</select></label>
+                <label className="flex items-center gap-2 pt-5 text-xs font-medium"><input type="checkbox" checked={config.segmentLanguageDetection} onChange={(event) => setConfig((current) => ({ ...current, segmentLanguageDetection: event.target.checked }))} /> Nhận diện ngôn ngữ từng đoạn</label>
+              </div>
+            </fieldset>
+            <SelectField label="Ngôn ngữ gốc" value={config.sourceLanguage} options={pipelineSourceLanguages} onChange={(value) => setConfig((current) => ({ ...current, sourceLanguage: value }))} />
             <SelectField label="Ngôn ngữ dịch" value={config.targetLanguage} options={targetLanguageOptions} onChange={(value) => setConfig((current) => ({ ...current, targetLanguage: value }))} />
             <SelectField
               label="Model dịch thuật (9Router)"
@@ -1649,6 +1791,7 @@ export default function VideoDubbingStudio() {
                 setConfig((current) => ({ ...current, translationModel: value }));
               }}
             />
+            <SelectField label="Model OCR" value={config.ocrModel} options={pipelineOcrModels} onChange={(value) => setConfig((current) => ({ ...current, ocrModel: value }))} />
             <fieldset className="grid gap-3 rounded-md border border-slate-200 bg-slate-50 p-3">
               <legend className="px-1 text-sm font-semibold text-slate-700">OCR phụ đề / video silent</legend>
               <label className="flex items-start gap-3 text-sm font-medium text-slate-700">
@@ -1669,6 +1812,21 @@ export default function VideoDubbingStudio() {
                 />
                 <span>Ép dùng OCR cho video có chữ/phụ đề trên màn hình</span>
               </label>
+              <div className="grid grid-cols-2 gap-2">
+                <label className="grid gap-1 text-xs font-medium">Khoảng quét OCR (giây)<input type="number" min="0.25" max="5" step="0.05" value={config.ocrIntervalSeconds} disabled={!config.ocrFallback && !config.ocrForce} onChange={(event) => setConfig((current) => ({ ...current, ocrIntervalSeconds: Math.max(0.25, Math.min(5, Number(event.target.value) || 0.75)) }))} className="rounded border border-slate-300 bg-white px-2 py-2" /></label>
+                <label className="grid gap-1 text-xs font-medium">Vùng phụ đề phía dưới (%)<input type="number" min="12" max="85" step="1" value={Math.round(config.ocrCropBottomRatio * 100)} disabled={!config.ocrFallback && !config.ocrForce} onChange={(event) => setConfig((current) => ({ ...current, ocrCropBottomRatio: Math.max(0.12, Math.min(0.85, (Number(event.target.value) || 35) / 100)) }))} className="rounded border border-slate-300 bg-white px-2 py-2" /></label>
+              </div>
+            </fieldset>
+            <fieldset className="grid gap-3 rounded-md border border-emerald-200 bg-emerald-50/40 p-3">
+              <legend className="px-1 text-sm font-semibold text-emerald-800">Khớp voice theo timeline gốc</legend>
+              <label className="flex items-center gap-2 text-sm font-medium"><input type="checkbox" checked={config.softTimingFit} onChange={(event) => setConfig((current) => ({ ...current, softTimingFit: event.target.checked }))} /> Dồn nhẹ vào khoảng lặng kế tiếp</label>
+              <p className="text-xs text-emerald-800">Gap tối thiểu chỉ áp dụng cho khoảng lặng thật giữa hai câu; hai cue chạm nhau sẽ được nối voice liên tục.</p>
+              <div className="grid grid-cols-2 gap-2">
+                <label className="grid gap-1 text-xs font-medium">Drift tối đa (giây)<input type="number" min="0" max="10" step="0.05" value={config.timingMaxDrift} onChange={(event) => setConfig((current) => ({ ...current, timingMaxDrift: Math.max(0, Math.min(10, Number(event.target.value) || 0)) }))} className="rounded border border-emerald-200 bg-white px-2 py-2" /></label>
+                <label className="grid gap-1 text-xs font-medium">Gap tối thiểu (giây)<input type="number" min="0" max="2" step="0.01" value={config.timingMinGap} onChange={(event) => setConfig((current) => ({ ...current, timingMinGap: Math.max(0, Math.min(2, Number(event.target.value) || 0)) }))} className="rounded border border-emerald-200 bg-white px-2 py-2" /></label>
+                <label className="grid gap-1 text-xs font-medium">Nén tốc độ tối đa<select value={config.timingMaxAtempo} onChange={(event) => setConfig((current) => ({ ...current, timingMaxAtempo: Number(event.target.value) }))} className="rounded border border-emerald-200 bg-white px-2 py-2"><option value="1.05">1.05x</option><option value="1.08">1.08x</option><option value="1.1">1.10x</option></select></label>
+                <label className="grid gap-1 text-xs font-medium">Tốc độ giọng đọc<select value={config.voiceSpeed} onChange={(event) => setConfig((current) => ({ ...current, voiceSpeed: Number(event.target.value) }))} className="rounded border border-emerald-200 bg-white px-2 py-2"><option value="0.9">0.90x</option><option value="1">1.00x</option><option value="1.1">1.10x</option></select></label>
+              </div>
             </fieldset>
             <fieldset className="grid gap-3 rounded-md border border-purple-200 bg-purple-50/50 p-3">
               <legend className="px-1 text-sm font-semibold text-purple-800">Vocal Separation (Tách giọng AI)</legend>

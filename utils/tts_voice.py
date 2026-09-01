@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,37 @@ def available_vieneu_voices(model: Any) -> set[str]:
 @dataclass(frozen=True)
 class ClonedVieneuVoice:
     voice_payload: dict[str, Any]
+
+
+def _config_value(name: str, default: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if value:
+        return value
+    try:
+        env_path = Path(__file__).resolve().parents[1] / ".env"
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            clean = line.strip()
+            if clean.startswith(f"{name}="):
+                return clean.split("=", 1)[1].strip().strip('"').strip("'") or default
+    except OSError:
+        pass
+    return default
+
+
+def _vieneu_batch_size() -> int:
+    try:
+        value = int(_config_value("AUTODUB_VIENEU_BATCH_SIZE", "16"))
+    except ValueError:
+        value = 16
+    return max(1, min(32, value))
+
+
+def _vieneu_max_chars() -> int:
+    try:
+        value = int(_config_value("AUTODUB_VIENEU_MAX_CHARS", "384"))
+    except ValueError:
+        value = 256
+    return max(64, min(512, value))
 
 
 def resolve_vieneu_voice(
@@ -83,8 +115,9 @@ def infer_stable_vieneu_audio(model: Any, text: str, voice: str):
     return model.infer(
         text=text.strip() or " ",
         voice=voice,
+        max_chars=_vieneu_max_chars(),
         emotion="natural",
-        temperature=0.25,
+        temperature=0.35,
         top_k=15,
         top_p=0.85,
         repetition_penalty=1.2,
@@ -104,7 +137,7 @@ def infer_stable_cloned_vieneu_audio(model: Any, text: str, reference: ClonedVie
     return model.infer(
         text=text.strip() or " ",
         emotion="natural",
-        temperature=0.25,
+        temperature=0.35,
         top_k=15,
         top_p=0.85,
         repetition_penalty=1.2,
@@ -113,4 +146,56 @@ def infer_stable_cloned_vieneu_audio(model: Any, text: str, reference: ClonedVie
         apply_watermark=False,
         voice=reference.voice_payload,
         use_ref_codes=True,
+        max_chars=_vieneu_max_chars(),
+    )
+
+
+def infer_stable_vieneu_audio_batch(model: Any, texts: list[str], voice: str) -> list[Any]:
+    """Batch system-voice synthesis when the installed VieNeu supports it."""
+    clean_texts = [text.strip() or " " for text in texts]
+    if not clean_texts:
+        return []
+    infer_batch = getattr(model, "infer_batch", None)
+    if not callable(infer_batch) or len(clean_texts) == 1:
+        return [infer_stable_vieneu_audio(model, text, voice) for text in clean_texts]
+    return infer_batch(
+        texts=clean_texts,
+        voice=voice,
+        style="tu_nhien",
+        temperature=0.35,
+        top_k=15,
+        top_p=0.85,
+        repetition_penalty=1.2,
+        max_chars=_vieneu_max_chars(),
+        batch_size=_vieneu_batch_size(),
+        apply_watermark=False,
+    )
+
+
+def infer_stable_cloned_vieneu_audio_batch(
+    model: Any,
+    texts: list[str],
+    reference: ClonedVieneuVoice,
+) -> list[Any]:
+    """Batch cloned-voice synthesis with a sequential compatibility fallback."""
+    if not isinstance(reference, ClonedVieneuVoice):
+        raise TypeError("A validated cloned voice reference is required.")
+    clean_texts = [text.strip() or " " for text in texts]
+    if not clean_texts:
+        return []
+    infer_batch = getattr(model, "infer_batch", None)
+    if not callable(infer_batch) or len(clean_texts) == 1:
+        return [infer_stable_cloned_vieneu_audio(model, text, reference) for text in clean_texts]
+    return infer_batch(
+        texts=clean_texts,
+        voice=reference.voice_payload,
+        style="tu_nhien",
+        use_ref_codes=True,
+        temperature=0.35,
+        top_k=15,
+        top_p=0.85,
+        repetition_penalty=1.2,
+        max_chars=_vieneu_max_chars(),
+        batch_size=_vieneu_batch_size(),
+        apply_watermark=False,
     )

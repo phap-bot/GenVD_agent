@@ -10,6 +10,19 @@ Synchronous FastAPI pipeline for local, low-VRAM auto-dubbing.
 uvicorn app.main:app --reload
 ```
 
+## Automatic media cleanup
+
+The API periodically removes abandoned temporary workspaces after 24 hours
+and files in `output/` after 12 hours. Active workspaces and queued/running
+render jobs are protected. Override the defaults in `.env` when needed:
+
+```text
+AUTODUB_TEMP_CLEANUP_MAX_AGE_HOURS=24
+AUTODUB_TEMP_CLEANUP_INTERVAL_HOURS=24
+AUTODUB_OUTPUT_CLEANUP_MAX_AGE_HOURS=12
+AUTODUB_OUTPUT_CLEANUP_INTERVAL_HOURS=1
+```
+
 ## Project Structure
 
 The backend lives under `app/`:
@@ -171,6 +184,26 @@ metadata, and returns the backend-owned profile (`micro`, `short`,
 videos above `AUTODUB_SHORT_VIDEO_MAX_SECONDS` are rejected by the Short Video
 workflow and should be sent to Clone Video instead.
 
+The default Short limit is 120 seconds (2 minutes). Short requests use the
+dedicated `ShortVideoPipeline`: semantic stitching is disabled, word/OCR cues
+stay independently editable, and each timeline cue gets its own TTS chunk so
+timing is not silently merged with the long-video policy. The Short Video UI
+also exposes ASR/Whisper/Paraformer, translation and OCR model controls; those
+values are sent as request fields rather than hardcoded in the browser.
+
+Clone Video uses the same backend settings contract at `GET /api/pipeline/settings`
+(also available at `/api/v1/pipeline/settings`). It supplies source languages,
+ASR engines/models, OCR defaults and timing limits to the UI; long-video
+analyze/render endpoints accept those values explicitly. Whisper repetition and
+number-flooding hallucinations are retried with guarded decoding and rejected
+before translation if they remain suspect, so bad ASR is not silently turned
+into subtitles.
+
+For continuous dialogue, ASR runs without an aggressive VAD filter and the
+pipeline checks the original PCM audio between cues. Audio-bearing gaps are
+closed at the midpoint; genuine silence is preserved. This behavior is
+controlled by `AUTODUB_FILL_SPEECH_GAPS` and `AUTODUB_SPEECH_GAP_MAX_S`.
+
 The default request uses mock translation and mock TTS so the API can be tested
 before installing/configuring external translation and TTS providers.
 
@@ -187,6 +220,12 @@ ASR, adaptive OCR and translation checkpoints are content-addressed under
 `AUTODUB_CHECKPOINT_ROOT` and are written atomically. They can be reused after
 a backend restart or machine shutdown. `scripts/benchmark_ocr.py` measures
 real OCR elapsed time, frame budget and extracted cues for a supplied video.
+
+Model weights are also cached in-process. With `AUTODUB_CPU_OFFLOAD=0`, the
+registry keeps the last active model warm and moves other stages to CPU before
+switching, so repeated renders do not deserialize the same Whisper/VieNeu
+weights again. `AUTODUB_PRELOAD_MODELS=asr` optionally warms ASR during backend
+startup; use `AUTODUB_CPU_OFFLOAD=1` instead on GPUs with very little VRAM.
 
 The shared pipeline honors `TRANSLATE_ANALYSIS`, `TRANSLATE_REVIEW`,
 `TRANSLATE_BATCH_SIZE`, `TRANSLATE_CPS_BUDGET`, soft timing limits, voice/video

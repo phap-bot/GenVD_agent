@@ -10,6 +10,7 @@ from app.models.schemas import PipelineConfig, RenderScriptRequest
 from utils.tts_voice import (
     encode_cloned_vieneu_voice,
     infer_stable_cloned_vieneu_audio,
+    infer_stable_vieneu_audio_batch,
     infer_stable_vieneu_audio,
     resolve_vieneu_voice,
 )
@@ -34,6 +35,16 @@ class FakeV31Model(FakeModel):
     def encode_reference(self, path: str):
         self.encoded_paths.append(path)
         return [0.1, 0.2], [101, 202, 303]
+
+
+class FakeBatchModel(FakeModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.infer_batch_calls: list[dict] = []
+
+    def infer_batch(self, **kwargs):
+        self.infer_batch_calls.append(kwargs)
+        return [[index] for index, _text in enumerate(kwargs["texts"])]
 
 
 def _render_payload(**overrides):
@@ -104,6 +115,17 @@ class VoiceSelectionTests(unittest.TestCase):
         self.assertNotIn("ref_codes", model.infer_calls[-1])
         self.assertNotIn("ref_audio", model.infer_calls[-1])
 
+    def test_system_inference_uses_native_batch_api_and_preserves_order(self) -> None:
+        model = FakeBatchModel()
+
+        result = infer_stable_vieneu_audio_batch(model, ["first", "second"], "Trúc Ly")
+
+        self.assertEqual(result, [[0], [1]])
+        self.assertEqual(model.infer_calls, [])
+        self.assertEqual(model.infer_batch_calls[-1]["voice"], "Trúc Ly")
+        self.assertEqual(model.infer_batch_calls[-1]["texts"], ["first", "second"])
+        self.assertEqual(model.infer_batch_calls[-1]["batch_size"], 16)
+
     def test_clone_mode_requires_reference_path(self) -> None:
         with self.assertRaisesRegex(ValidationError, "clone_reference_audio_path"):
             PipelineConfig(voice_mode="clone")
@@ -121,6 +143,26 @@ class VoiceSelectionTests(unittest.TestCase):
 
         self.assertEqual(request.voice_mode, "clone")
         self.assertEqual(request.clone_reference_audio_path, "/media/reference.wav")
+
+    def test_render_request_normalizes_blank_segment_voice_to_ui_default(self) -> None:
+        request = RenderScriptRequest(
+            **_render_payload(
+                voice_model="Ngọc Linh",
+                segments=[
+                    {
+                        "id": 0,
+                        "start": 0,
+                        "end": 1,
+                        "original_text": "xin chào",
+                        "translated_text": "xin chào",
+                        "voice_model": "   ",
+                    }
+                ],
+            )
+        )
+
+        self.assertEqual(request.voice_model, "Ngọc Linh")
+        self.assertEqual(request.segments[0].voice_model, "Ngọc Linh")
 
 
 if __name__ == "__main__":

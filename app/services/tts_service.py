@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import wave
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,12 +16,16 @@ from utils.model_cache import configure_model_cache
 from utils.model_registry import model_registry
 from utils.tts_voice import (
     encode_cloned_vieneu_voice,
+    infer_stable_cloned_vieneu_audio_batch,
     infer_stable_cloned_vieneu_audio,
+    infer_stable_vieneu_audio_batch,
     infer_stable_vieneu_audio,
     resolve_vieneu_voice,
 )
 
 logger = logging.getLogger(__name__)
+TTS_MIN_NATURAL_STRETCH_RATIO = 0.82
+TIMELINE_CONTIGUOUS_TOLERANCE_S = 0.04
 
 
 def _ffmpeg():
@@ -85,14 +90,35 @@ class TTSService:
                         self.config.voice_model,
                         self.voice,
                     )
-                for segment in segments:
-                    raw_path = tts_dir / f"segment_{segment.id:04d}_raw.wav"
-                    final_path = tts_dir / f"segment_{segment.id:04d}.wav"
-                    duration = max(segment.end - segment.start, 0.1)
-
-                    self._synthesize_with_model(segment.text, raw_path)
-                    self._fit_duration(raw_path, final_path, duration)
-                    tracks.append(TTSAudioTrack(segment.id, final_path, segment.start, segment.end))
+                batch_size = self._vieneu_batch_size()
+                for batch_start in range(0, len(segments), batch_size):
+                    batch_segments = segments[batch_start : batch_start + batch_size]
+                    texts = [segment.text for segment in batch_segments]
+                    if self.config.voice_mode == "clone":
+                        if self.clone_voice_reference is None:
+                            raise RuntimeError("Cloned voice was selected but its reference was not encoded.")
+                        audio_values = infer_stable_cloned_vieneu_audio_batch(
+                            model,
+                            texts,
+                            self.clone_voice_reference,
+                        )
+                    else:
+                        if self.voice is None:
+                            raise RuntimeError("System voice was selected but was not resolved.")
+                        audio_values = infer_stable_vieneu_audio_batch(model, texts, self.voice)
+                    if len(audio_values) != len(batch_segments):
+                        raise RuntimeError(
+                            f"VieNeu returned {len(audio_values)} audio values for {len(batch_segments)} segments."
+                        )
+                    for offset, (segment, audio) in enumerate(zip(batch_segments, audio_values)):
+                        index = batch_start + offset
+                        raw_path = tts_dir / f"segment_{segment.id:04d}_raw.wav"
+                        final_path = tts_dir / f"segment_{segment.id:04d}.wav"
+                        next_start = segments[index + 1].start if index + 1 < len(segments) else None
+                        duration = self._timing_fit_duration(segment, next_start)
+                        model.save(audio, str(raw_path))
+                        self._fit_duration(raw_path, final_path, duration)
+                        tracks.append(TTSAudioTrack(segment.id, final_path, segment.start, segment.start + duration))
 
             return tracks
         except Exception as exc:
@@ -138,6 +164,22 @@ class TTSService:
             audio = infer_stable_vieneu_audio(self.model, text, self.voice)
         self.model.save(audio, str(destination))
 
+    def _vieneu_batch_size(self) -> int:
+        try:
+            value = int(os.environ.get("AUTODUB_VIENEU_BATCH_SIZE", "16"))
+        except ValueError:
+            value = 16
+        return max(1, min(32, value))
+
+    def _timing_fit_duration(self, segment: TranscriptSegment, next_start: float | None) -> float:
+        natural = max(float(segment.end) - float(segment.start), 0.1)
+        if not self.config.soft_timing_fit or self.config.timing_max_drift_s <= 0 or next_start is None:
+            return natural
+        timeline_gap = float(next_start) - float(segment.end)
+        reserved_gap = 0.0 if timeline_gap <= TIMELINE_CONTIGUOUS_TOLERANCE_S else self.config.timing_min_gap_s
+        available_gap = max(0.0, timeline_gap - reserved_gap)
+        return natural + min(float(self.config.timing_max_drift_s), available_gap)
+
     def _fit_duration(self, source: Path, destination: Path, target_duration: float) -> None:
         ffmpeg = _ffmpeg()
         current_duration = self._probe_duration(source)
@@ -147,7 +189,21 @@ class TTSService:
 
         natural_target = max(target_duration, 0.1)
         ratio = max(0.1, current_duration / natural_target)
-        tempo = ratio if current_duration > natural_target else 1.0
+        # Fill a small duration shortfall with a bounded slow-down. Padding
+        # the tail is audible as a pause when adjacent cues touch exactly.
+        tempo = (
+            ratio
+            if current_duration > natural_target
+            or ratio >= TTS_MIN_NATURAL_STRETCH_RATIO
+            else 1.0
+        )
+        tempo *= self.config.voice_speed
+        if (
+            self.config.soft_timing_fit
+            and tempo > self.config.timing_max_atempo
+            and ratio <= self.config.timing_max_atempo
+        ):
+            tempo = self.config.timing_max_atempo
         if tempo > 1.35:
             logger.warning(
                 "tts_service.audio_fit.high_speed source=%s raw_duration=%.3f target_duration=%.3f tempo=%.3f",

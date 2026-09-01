@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 from app.models.schemas import PipelineConfig, TranscriptSegment, WordTimestamp
+from app.services.audio_timing import repair_continuous_speech_gaps
 from app.services.dependency_service import DependencyService
 from app.utils.memory import VRAMManager
 from utils.model_cache import configure_model_cache
@@ -57,7 +58,14 @@ class ASRService:
         self._extract_audio(video_path, audio_path)
 
         try:
-            return self._run_whisperx(audio_path)
+            segments = self._run_whisperx(audio_path)
+            if self.config.fill_speech_gaps:
+                segments = repair_continuous_speech_gaps(
+                    audio_path,
+                    segments,
+                    max_gap_s=self.config.speech_gap_max_s,
+                )
+            return segments
         finally:
             self.unload()
 
@@ -124,8 +132,6 @@ class ASRService:
 
         DependencyService().require_cuda()
         device = "cuda"
-        batch_size = 4
-
         whisper_arch = self.config.asr_model if self.config.whisper_model == "auto" else self.config.whisper_model
         logger.info(
             "asr_service.model.load model=%s compute_type=%s device=%s language=%s cache=%s",
@@ -144,11 +150,7 @@ class ASRService:
             language=self.config.source_language,
             beam_size=self.config.whisper_beam_size,
         ) as model:
-            result = model.transcribe(
-                audio,
-                batch_size=batch_size,
-                language=self.config.source_language,
-            )
+            result = self._transcribe_model(model, audio)
 
         VRAMManager.cleanup()
 
@@ -185,6 +187,22 @@ class ASRService:
                 )
 
         return self._normalize_segments(raw_segs)
+
+    def _transcribe_model(self, model, audio):
+        """Prefer complete speech coverage; keep compatibility with old wrappers."""
+        kwargs = {
+            "batch_size": self.config.whisper_batch_size,
+            "language": self.config.source_language,
+            "vad_filter": self.config.whisper_vad_filter,
+            "no_speech_threshold": 0.4,
+            "condition_on_previous_text": False,
+        }
+        try:
+            return model.transcribe(audio, **kwargs)
+        except TypeError:
+            for key in ("vad_filter", "no_speech_threshold", "condition_on_previous_text"):
+                kwargs.pop(key, None)
+            return model.transcribe(audio, **kwargs)
 
     def _normalize_segments(self, raw_segments: list[dict]) -> list[TranscriptSegment]:
         segments: list[TranscriptSegment] = []

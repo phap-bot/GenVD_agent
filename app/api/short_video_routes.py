@@ -18,7 +18,7 @@ from app.api.routes import (
     _voice_reference_media_path,
 )
 from app.models.schemas import RenderScriptRequest, ShortVideoInspectResponse, ShortVideoProfilesResponse, ShortVideoRenderRequest
-from app.services.pipeline import AutoDubbingPipeline
+from app.services.short_video_pipeline import ShortVideoPipeline
 from app.services.render_job_service import RenderJobDispatcher
 from app.services.short_video_service import ShortVideoService
 from app.utils.files import safe_filename, save_upload_file
@@ -70,6 +70,10 @@ def _short_config(
     translation_provider: str,
     translation_model: str,
     asr_model: str,
+    asr_engine: str,
+    whisper_model: str,
+    whisper_beam_size: int,
+    segment_language_detection: bool,
     compute_type: str,
     word_timestamps: bool,
     voice_model: str,
@@ -83,6 +87,15 @@ def _short_config(
     ocr_model: str,
     ocr_interval_seconds: float,
     ocr_crop_bottom_ratio: float,
+    translate_batch_size: int,
+    translate_analysis: bool,
+    translate_review: bool,
+    translate_cps_budget: float,
+    soft_timing_fit: bool,
+    timing_max_drift_s: float,
+    timing_min_gap_s: float,
+    timing_max_atempo: float,
+    voice_speed: float,
     copyright_confirmed: bool,
     copyright_source: str,
     copyright_notes: str,
@@ -90,6 +103,13 @@ def _short_config(
     voice_mode: str = "system",
     clone_reference_audio_path: str | None = None,
 ):
+    requested_asr_model = (asr_model or "").strip().lower()
+    effective_asr_engine = asr_engine if asr_engine in {"auto", "whisper", "paraformer"} else "auto"
+    # Paraformer is an engine choice, not a Whisper model id.  Normalize a
+    # legacy/UI value here so it can never reach whisperx as ``paraformer-zh``.
+    if requested_asr_model.startswith("paraformer"):
+        effective_asr_engine = "paraformer"
+        asr_model = "auto"
     config = _config_from_form(
         None if source_language in {None, "", "auto"} else source_language,
         target_language,
@@ -116,9 +136,30 @@ def _short_config(
         # Short Video does not pay the Demucs cost during analysis by default.
         vocal_separation=vocal_separation,
     )
-    # Short Video is intentionally hybrid: retain speech recognition while
-    # also reading hard-subtitles across the full short timeline.
-    config.source_mode = "hybrid"
+    config = config.model_copy(
+        update={
+            "short_video": True,
+            "asr_engine": effective_asr_engine,
+            "whisper_model": whisper_model.strip() or "auto",
+            "whisper_beam_size": max(1, min(10, int(whisper_beam_size))),
+            "segment_language_detection": bool(segment_language_detection),
+            "translate_batch_size": max(1, min(100, int(translate_batch_size))),
+            "translate_analysis": bool(translate_analysis),
+            "translate_review": bool(translate_review),
+            "translate_cps_budget": max(1.0, min(80.0, float(translate_cps_budget))),
+            "soft_timing_fit": bool(soft_timing_fit),
+            "timing_max_drift_s": max(0.0, min(10.0, float(timing_max_drift_s))),
+            "timing_min_gap_s": max(0.0, min(2.0, float(timing_min_gap_s))),
+            "timing_max_atempo": max(0.5, min(2.0, float(timing_max_atempo))),
+            "voice_speed": max(0.5, min(2.0, float(voice_speed))),
+        }
+    )
+    # Voice-only Shorts should not spend time sampling frames for OCR. OCR is
+    # an explicit opt-in for burned-in subtitles or silent clips; audio ASR is
+    # otherwise the sole source of the timeline.
+    config.ocr_fallback = bool(ocr_fallback)
+    config.ocr_force = bool(ocr_force and ocr_fallback)
+    config.source_mode = "hybrid" if config.ocr_fallback or config.ocr_force else "voice"
     config.ocr_max_frames = 600
     config.voice_mode = voice_mode if voice_mode in {"system", "clone"} else "system"
     if config.voice_mode == "clone":
@@ -136,8 +177,7 @@ def short_video_profiles() -> ShortVideoProfilesResponse:
         short_video_max_seconds=max_seconds,
         profiles=[
             service.resolve_profile(30),
-            service.resolve_profile(120),
-            service.resolve_profile(min(240, max_seconds)),
+            service.resolve_profile(max_seconds),
             service.resolve_profile(max_seconds + 1),
         ],
     )
@@ -173,13 +213,26 @@ async def analyze_short_video(
     translation_provider: str = Form(default=""),
     translation_model: str = Form(default=""),
     asr_model: str = Form(default="auto"),
-    compute_type: str = Form(default="int8"),
+    asr_engine: str = Form(default="auto"),
+    whisper_model: str = Form(default="auto"),
+    whisper_beam_size: int = Form(default=1),
+    segment_language_detection: bool = Form(default=True),
+    compute_type: str = Form(default="float16"),
     voice_model: str = Form(default=""),
-    ocr_fallback: bool = Form(default=True),
+    ocr_fallback: bool = Form(default=False),
     ocr_force: bool = Form(default=False),
     ocr_model: str = Form(default=""),
     ocr_interval_seconds: float = Form(default=0.5),
     ocr_crop_bottom_ratio: float = Form(default=0.35),
+    translate_batch_size: int = Form(default=80),
+    translate_analysis: bool = Form(default=True),
+    translate_review: bool = Form(default=True),
+    translate_cps_budget: float = Form(default=12.5),
+    soft_timing_fit: bool = Form(default=True),
+    timing_max_drift_s: float = Form(default=0.35),
+    timing_min_gap_s: float = Form(default=0.08),
+    timing_max_atempo: float = Form(default=1.08),
+    voice_speed: float = Form(default=1.0),
     copyright_confirmed: bool = Form(default=False),
     copyright_source: str = Form(default="unknown"),
     copyright_notes: str = Form(default=""),
@@ -192,6 +245,10 @@ async def analyze_short_video(
         translation_provider=translation_provider,
         translation_model=translation_model,
         asr_model=asr_model,
+        asr_engine=asr_engine,
+        whisper_model=whisper_model,
+        whisper_beam_size=whisper_beam_size,
+        segment_language_detection=segment_language_detection,
         compute_type=compute_type,
         word_timestamps=True,
         voice_model=voice_model,
@@ -205,6 +262,15 @@ async def analyze_short_video(
         ocr_model=ocr_model,
         ocr_interval_seconds=ocr_interval_seconds,
         ocr_crop_bottom_ratio=ocr_crop_bottom_ratio,
+        translate_batch_size=translate_batch_size,
+        translate_analysis=translate_analysis,
+        translate_review=translate_review,
+        translate_cps_budget=translate_cps_budget,
+        soft_timing_fit=soft_timing_fit,
+        timing_max_drift_s=timing_max_drift_s,
+        timing_min_gap_s=timing_min_gap_s,
+        timing_max_atempo=timing_max_atempo,
+        voice_speed=voice_speed,
         copyright_confirmed=copyright_confirmed,
         copyright_source=copyright_source,
         copyright_notes=copyright_notes,
@@ -221,7 +287,7 @@ async def analyze_short_video(
         request,
         workspace_manager,
         workspace,
-        lambda cancel_event: AutoDubbingPipeline(config, cancel_event=cancel_event).analyze_stream(workspace),
+        lambda cancel_event: ShortVideoPipeline(config, cancel_event=cancel_event).analyze_stream(workspace),
     )
 
 
@@ -234,18 +300,31 @@ async def dub_short_video(
     translation_provider: str = Form(default=""),
     translation_model: str = Form(default=""),
     asr_model: str = Form(default="auto"),
-    compute_type: str = Form(default="int8"),
+    asr_engine: str = Form(default="auto"),
+    whisper_model: str = Form(default="auto"),
+    whisper_beam_size: int = Form(default=1),
+    segment_language_detection: bool = Form(default=True),
+    compute_type: str = Form(default="float16"),
     voice_model: str = Form(default=""),
     background_volume: float = Form(default=0.0),
     tts_volume: float = Form(default=1.0),
     burn_subtitles: bool = Form(default=True),
     mock_translation: bool = Form(default=False),
     mock_tts: bool = Form(default=False),
-    ocr_fallback: bool = Form(default=True),
+    ocr_fallback: bool = Form(default=False),
     ocr_force: bool = Form(default=False),
     ocr_model: str = Form(default=""),
     ocr_interval_seconds: float = Form(default=0.5),
     ocr_crop_bottom_ratio: float = Form(default=0.35),
+    translate_batch_size: int = Form(default=80),
+    translate_analysis: bool = Form(default=True),
+    translate_review: bool = Form(default=True),
+    translate_cps_budget: float = Form(default=12.5),
+    soft_timing_fit: bool = Form(default=True),
+    timing_max_drift_s: float = Form(default=0.35),
+    timing_min_gap_s: float = Form(default=0.08),
+    timing_max_atempo: float = Form(default=1.08),
+    voice_speed: float = Form(default=1.0),
     copyright_confirmed: bool = Form(default=False),
     copyright_source: str = Form(default="unknown"),
     copyright_notes: str = Form(default=""),
@@ -261,6 +340,10 @@ async def dub_short_video(
         translation_provider=translation_provider,
         translation_model=translation_model,
         asr_model=asr_model,
+        asr_engine=asr_engine,
+        whisper_model=whisper_model,
+        whisper_beam_size=whisper_beam_size,
+        segment_language_detection=segment_language_detection,
         compute_type=compute_type,
         word_timestamps=True,
         voice_model=voice_model,
@@ -274,6 +357,15 @@ async def dub_short_video(
         ocr_model=ocr_model,
         ocr_interval_seconds=ocr_interval_seconds,
         ocr_crop_bottom_ratio=ocr_crop_bottom_ratio,
+        translate_batch_size=translate_batch_size,
+        translate_analysis=translate_analysis,
+        translate_review=translate_review,
+        translate_cps_budget=translate_cps_budget,
+        soft_timing_fit=soft_timing_fit,
+        timing_max_drift_s=timing_max_drift_s,
+        timing_min_gap_s=timing_min_gap_s,
+        timing_max_atempo=timing_max_atempo,
+        voice_speed=voice_speed,
         copyright_confirmed=copyright_confirmed,
         copyright_source=copyright_source,
         copyright_notes=copyright_notes,
@@ -292,7 +384,7 @@ async def dub_short_video(
         request,
         workspace_manager,
         workspace,
-        lambda cancel_event: AutoDubbingPipeline(config, cancel_event=cancel_event).run(workspace),
+        lambda cancel_event: ShortVideoPipeline(config, cancel_event=cancel_event).run(workspace),
     )
 
 
@@ -309,6 +401,7 @@ async def render_short_script(request: Request, payload: ShortVideoRenderRequest
 
     render_payload = RenderScriptRequest(
         source_video_path=f"/temp/short_video/{payload.media_id}/{source_path.name}",
+        source_language=payload.source_language,
         target_language=payload.target_language,
         translation_provider=payload.translation_provider,
         translation_model=payload.translation_model,
@@ -326,6 +419,11 @@ async def render_short_script(request: Request, payload: ShortVideoRenderRequest
         copyright_source=payload.copyright_source,
         copyright_notes=payload.copyright_notes,
         vocal_separation=payload.vocal_separation,
+        ocr_fallback=payload.ocr_fallback,
+        ocr_force=payload.ocr_force,
+        ocr_model=payload.ocr_model,
+        ocr_interval_seconds=payload.ocr_interval_seconds,
+        ocr_crop_bottom_ratio=payload.ocr_crop_bottom_ratio,
         asr_engine=payload.asr_engine,
         whisper_model=payload.whisper_model,
         whisper_beam_size=payload.whisper_beam_size,
@@ -348,7 +446,7 @@ async def render_short_script(request: Request, payload: ShortVideoRenderRequest
     )
     try:
         _require_copyright_preflight(render_payload)
-        config = _render_config(render_payload, clone_reference_path)
+        config = _render_config(render_payload, clone_reference_path).model_copy(update={"short_video": True})
         dispatcher = RenderJobDispatcher()
         submission = await asyncio.to_thread(
             dispatcher.submit,

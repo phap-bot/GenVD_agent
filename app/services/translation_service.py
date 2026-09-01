@@ -4,7 +4,13 @@ import logging
 from threading import Event
 
 from app.models.schemas import PipelineConfig, TranscriptSegment
-from utils.translation import normalize_translation_model, shorten_segments_for_duration, translate_segments
+from utils.translation import (
+    _looks_fragmentary_translation,
+    normalize_translation_model,
+    review_translation_coherence,
+    shorten_segments_for_duration,
+    translate_segments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +45,14 @@ class TranslationService:
             source_language = segments[group[0]].language or self.config.source_language
             texts = [segments[index].text for index in group]
             durations = [max(0.1, segments[index].end - segments[index].start) for index in group]
+            intervals = [(segments[index].start, segments[index].end) for index in group]
             if self.config.mock_translation:
                 values = [f"[{self.config.target_language}] {text}" for text in texts]
             else:
                 values = translate_segments(
                     texts,
                     target_durations=durations,
+                    source_intervals=intervals,
                     source_language=source_language,
                     target_language=self.config.target_language,
                     provider=self.config.translation_provider,
@@ -59,6 +67,30 @@ class TranslationService:
 
         if self.config.translate_review:
             translated_texts = self._review_timing(translated_texts, segments, context=context)
+
+        # Run continuity QA last so timing compression can never leave a
+        # previously coherent review sentence fragmented again. It remains
+        # batch-based and keeps every source cue mapped to the same timestamp.
+        if self.config.translate_analysis and not self.config.mock_translation:
+            for group in groups:
+                texts = [segments[index].text for index in group]
+                durations = [max(0.1, segments[index].end - segments[index].start) for index in group]
+                if len(texts) < 8 and not any(duration >= 6.0 for duration in durations):
+                    continue
+                reviewed_values = review_translation_coherence(
+                    [translated_texts[index] for index in group],
+                    target_durations=durations,
+                    source_intervals=[(segments[index].start, segments[index].end) for index in group],
+                    source_texts=texts,
+                    target_language=self.config.target_language,
+                    provider=self.config.translation_provider,
+                    model=resolved_model,
+                    context=context,
+                    batch_size=self.config.translate_batch_size,
+                    cancel_event=self.cancel_event,
+                )
+                for index, value in zip(group, reviewed_values):
+                    translated_texts[index] = value
 
         translated: list[TranscriptSegment] = []
         for segment, translated_text in zip(segments, translated_texts):
@@ -125,10 +157,17 @@ class TranslationService:
         candidate_durations: list[float] = []
         for index, (text, segment) in enumerate(zip(texts, segments)):
             duration = max(0.1, segment.end - segment.start)
-            max_chars = max(1, int(duration * self.config.translate_cps_budget))
-            if len(text.strip()) > max_chars:
+            raw_max_chars = max(1, int(duration * self.config.translate_cps_budget))
+            # Timing is a soft target. Do not send short, semantically complete
+            # lines to a compressor just because Vietnamese uses more
+            # characters than the source language.
+            max_chars = max(24, raw_max_chars)
+            review_threshold = max(36, int(raw_max_chars * 1.75))
+            if len(text.strip()) > review_threshold:
                 candidate_indices.append(index)
-                candidate_limits.append(max(1, int(max_chars / 4)))
+                # Four words is enough for a fragment, not for a complete
+                # Vietnamese question. TTS can tighten rate after translation.
+                candidate_limits.append(max(6, int(max_chars / 4)))
                 candidate_durations.append(duration)
         if not candidate_indices:
             return reviewed
@@ -142,6 +181,7 @@ class TranslationService:
         shortened = shorten_segments_for_duration(
             [texts[index] for index in candidate_indices],
             target_durations=candidate_durations,
+            source_intervals=[(segments[index].start, segments[index].end) for index in candidate_indices],
             target_language=self.config.target_language,
             source_texts=[segments[index].text for index in candidate_indices],
             context=context,
@@ -152,7 +192,23 @@ class TranslationService:
             cancel_event=self.cancel_event,
         )
         for index, value in zip(candidate_indices, shortened):
-            reviewed[index] = value.strip() or reviewed[index]
+            candidate = value.strip()
+            original = reviewed[index]
+            source_text = segments[index].text
+            if _looks_fragmentary_translation(
+                candidate,
+                source_text=source_text,
+                original_text=original,
+                target=self.config.target_language,
+            ):
+                logger.warning(
+                    "translation.review.rejected_fragment index=%s source=%s candidate=%s",
+                    index,
+                    source_text,
+                    candidate,
+                )
+                continue
+            reviewed[index] = candidate or original
         logger.info(
             "translation.review.done candidates=%s batches_max=%s",
             len(candidate_indices),

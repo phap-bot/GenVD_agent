@@ -18,6 +18,18 @@ from typing import Any
 logger = logging.getLogger("auto_dubbing.paraformer")
 
 
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _resolve_project_path(value: str | Path) -> Path:
+    """Resolve local runtime paths independently of the server's cwd."""
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return _project_root() / path
+
+
 def _audio_duration_seconds(audio_path: Path) -> float:
     """Read duration locally without importing the heavy ASR environment."""
     try:
@@ -39,25 +51,69 @@ def _audio_duration_seconds(audio_path: Path) -> float:
 
 def transcribe(audio_path: Path, *, language: str | None = None, model_id: str | None = None) -> list[dict[str, Any]]:
     selected_model = model_id or os.environ.get("AUTODUB_PARAFORMER_MODEL", "paraformer-zh")
+    audio_path = Path(audio_path).resolve()
+    if not audio_path.is_file():
+        raise FileNotFoundError(f"Paraformer audio file does not exist: {audio_path}")
+
+    # A configured local checkpoint must also be independent of the process
+    # cwd. Keep registry/model aliases (for example ``paraformer-zh``) intact.
+    local_model_path = _resolve_project_path(selected_model)
+    if local_model_path.is_dir():
+        selected_model = str(local_model_path)
+
     try:
         from funasr import AutoModel  # type: ignore
     except ImportError:
-        venv = Path(os.environ.get("AUTODUB_PARAFORMER_VENV", ".venv-asr"))
+        venv = _resolve_project_path(os.environ.get("AUTODUB_PARAFORMER_VENV", ".venv-asr"))
         python = venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-        worker = Path(__file__).resolve().parents[1] / "scripts" / "paraformer_worker.py"
+        worker = _project_root() / "scripts" / "paraformer_worker.py"
         if not python.is_file() or not worker.is_file():
             raise RuntimeError(
                 "Paraformer is not installed in the ASR environment. Run scripts/setup_venvs.ps1 -InstallAsr."
             )
-        completed = subprocess.run(
-            [str(python), str(worker), str(audio_path), "--model", selected_model, "--device", os.environ.get("AUTODUB_PARAFORMER_DEVICE", "cpu")],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=True,
-        )
-        result = json.loads(completed.stdout)
+        command = [
+            str(python),
+            str(worker),
+            str(audio_path),
+            "--model",
+            selected_model,
+            "--device",
+            os.environ.get("AUTODUB_PARAFORMER_DEVICE", "cpu"),
+        ]
+        try:
+            timeout_seconds = float(os.environ.get("AUTODUB_PARAFORMER_TIMEOUT", "300"))
+        except ValueError as exc:
+            raise RuntimeError("AUTODUB_PARAFORMER_TIMEOUT must be a number of seconds") from exc
+        if timeout_seconds <= 0:
+            raise RuntimeError("AUTODUB_PARAFORMER_TIMEOUT must be greater than zero")
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=str(_project_root()),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"Paraformer worker timed out after {timeout_seconds:g} seconds") from exc
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "no worker diagnostics").strip()
+            logger.error(
+                "paraformer.worker_failed exit_code=%s detail=%s",
+                completed.returncode,
+                detail[-4000:],
+            )
+            raise RuntimeError(
+                f"Paraformer worker failed with exit code {completed.returncode}: {detail[-1200:]}"
+            )
+        try:
+            result = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            detail = (completed.stdout or completed.stderr or "empty worker output").strip()
+            raise RuntimeError(f"Paraformer worker returned invalid JSON: {detail[-1200:]}") from exc
     else:
         model_kwargs: dict[str, Any] = {
             "model": selected_model,

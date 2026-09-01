@@ -173,6 +173,7 @@ class _ModelHandle:
         self.config = config
         self.model: Any | None = None
         self.lock = threading.RLock()
+        self.device: str | None = None
 
     @contextmanager
     def acquire(
@@ -185,9 +186,12 @@ class _ModelHandle:
             if self.model is None:
                 logger.info("model_registry.load.start key=%s", self.config.key)
                 self.model = self.config.loader()
+                self.device = device
                 logger.info("model_registry.load.done key=%s", self.config.key)
 
-            self.config.mover(self.model, device)
+            if self.device != device:
+                self.config.mover(self.model, device)
+                self.device = device
             if prepare is not None:
                 prepare(self.model)
 
@@ -195,13 +199,22 @@ class _ModelHandle:
                 yield self.model
             finally:
                 if self.config.offload_to_cpu and device.startswith("cuda"):
-                    self.config.mover(self.model, "cpu")
-                    _cleanup_cuda_cache()
-                    logger.info("model_registry.offloaded key=%s idle_device=cpu", self.config.key)
+                    self.offload()
+
+    def offload(self) -> None:
+        """Move an idle resident model to CPU without destroying its handle."""
+        with self.lock:
+            if self.model is None or not (self.device or "").startswith("cuda"):
+                return
+            self.config.mover(self.model, "cpu")
+            self.device = "cpu"
+            _cleanup_cuda_cache()
+            logger.info("model_registry.offloaded key=%s idle_device=cpu", self.config.key)
 
     def close(self) -> None:
         with self.lock:
             self.model = None
+            self.device = None
 
 
 class ModelRegistry:
@@ -232,6 +245,18 @@ class ModelRegistry:
                 self._handles[key] = handle
             return handle
 
+    def _evict_other_resident_models(self, active: _ModelHandle) -> None:
+        """Keep at most one model on CUDA while preserving all CPU handles.
+
+        This allows ``AUTODUB_CPU_OFFLOAD=0`` to make repeated renders fast,
+        while still protecting low-VRAM machines when the pipeline switches
+        from ASR to alignment, TTS or Demucs.
+        """
+        with self._lock:
+            handles = [handle for handle in self._handles.values() if handle is not active]
+        for handle in handles:
+            handle.offload()
+
     @contextmanager
     def acquire_whisperx_asr(
         self,
@@ -241,7 +266,7 @@ class ModelRegistry:
         device: str,
         compute_type: str,
         language: str | None,
-        beam_size: int = 5,
+        beam_size: int = 1,
     ) -> Iterator[Any]:
         normalized_beam_size = max(1, min(10, int(beam_size)))
         normalized_language = (language or "auto").strip().lower()
@@ -261,6 +286,7 @@ class ModelRegistry:
             model.tokenizer = None
 
         handle = self._handle(key, loader, _move_whisperx_asr)
+        self._evict_other_resident_models(handle)
         with handle.acquire(device=device, prepare=prepare) as model:
             yield model
 
@@ -282,6 +308,7 @@ class ModelRegistry:
             )
 
         handle = self._handle(key, loader, _move_align_payload)
+        self._evict_other_resident_models(handle)
         with handle.acquire(device=device) as payload:
             yield payload
 
@@ -292,7 +319,12 @@ class ModelRegistry:
         device: str,
         backend: str,
     ) -> Iterator[Any]:
-        key = ("vieneu", "v3turbo", device, backend)
+        try:
+            configured_batch_size = int(os.environ.get("AUTODUB_VIENEU_BATCH_SIZE", "16"))
+        except ValueError:
+            configured_batch_size = 16
+        max_batch_size = max(1, min(32, configured_batch_size))
+        key = ("vieneu", "v3turbo", device, backend, max_batch_size)
 
         def loader() -> Any:
             try:
@@ -318,9 +350,20 @@ class ModelRegistry:
             onnx_dir = os.environ.get("AUTODUB_VIENEU_ONNX_DIR")
             if onnx_dir:
                 kwargs["onnx_dir"] = onnx_dir
-            return Vieneu(mode="v3turbo", **kwargs)
+            kwargs["max_batch_size"] = max_batch_size
+            try:
+                return Vieneu(mode="v3turbo", **kwargs)
+            except TypeError as exc:
+                # Older VieNeu builds may not expose the static-batching
+                # constructor option; inference helpers still fall back to
+                # one-at-a-time generation for those versions.
+                if "max_batch_size" not in str(exc):
+                    raise
+                kwargs.pop("max_batch_size", None)
+                return Vieneu(mode="v3turbo", **kwargs)
 
         handle = self._handle(key, loader, _move_vieneu_model)
+        self._evict_other_resident_models(handle)
         with handle.acquire(device=device, prepare=_prepare_vieneu_for_cuda) as model:
             yield model
 
@@ -352,6 +395,7 @@ class ModelRegistry:
             _move_torch_object(model, target_device)
 
         handle = self._handle(key, loader, mover)
+        self._evict_other_resident_models(handle)
         with handle.acquire(device=device) as model:
             yield model
 
@@ -375,7 +419,7 @@ class ModelRegistry:
             device = "cuda"
             if "asr" in preload_targets or "all" in preload_targets:
                 arch = os.environ.get("AUTODUB_PRELOAD_ASR_MODEL", "base")
-                compute_type = os.environ.get("AUTODUB_PRELOAD_COMPUTE_TYPE", "int8")
+                compute_type = os.environ.get("AUTODUB_PRELOAD_COMPUTE_TYPE", "float16")
                 with self.acquire_whisperx_asr(
                     whisperx,
                     whisper_arch=arch,

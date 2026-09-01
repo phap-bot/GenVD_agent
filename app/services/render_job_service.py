@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 
 from app.models.schemas import DubbingScriptSegment, PipelineConfig, RenderScriptRequest
 from app.services.pipeline import AutoDubbingPipeline
+from app.services.short_video_pipeline import ShortVideoPipeline
 from app.utils.workspace import Workspace
 
 logger = logging.getLogger("auto_dubbing.render_jobs")
@@ -529,7 +530,8 @@ class RenderJobRunner:
             workspace = self.store.workspace(job_id)
             terminal_payload: dict[str, Any] | None = None
             try:
-                pipeline = AutoDubbingPipeline(config)
+                pipeline_cls = ShortVideoPipeline if config.short_video else AutoDubbingPipeline
+                pipeline = pipeline_cls(config)
                 for sse_event in pipeline.render_script(
                     workspace=workspace,
                     source_video_path=self.store.source_path(job_id),

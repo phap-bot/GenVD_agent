@@ -1,0 +1,4 @@
+-r requirements-core.txt
+torch==2.8.0
+torchaudio==2.8.0
+vieneu>=3.1.0

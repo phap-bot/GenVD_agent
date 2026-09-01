@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import threading
 from pathlib import Path
+from typing import Literal, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
@@ -55,6 +56,10 @@ VOICE_REFERENCE_SUFFIXES = {".wav"}
 VOICE_REFERENCE_DIR = Path("output")
 DEFAULT_VOICE_REFERENCE_MAX_BYTES = 16 * 1024 * 1024
 SOURCE_MEDIA_DIR = Path("temp") / "source_media"
+TranslationProvider = Literal["9router", "google", "mock"]
+ComputeType = Literal["int8", "float16"]
+AsrEngine = Literal["auto", "whisper", "paraformer"]
+CopyrightSource = Literal["unknown", "owned", "licensed", "public_domain", "permission", "platform_library"]
 
 
 def _first_config_value(value: str | None, env_names: tuple[str, ...], fallback: str) -> str:
@@ -103,7 +108,7 @@ def _fallback_asr_model(value: str | None) -> str:
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
+    raw = os.environ.get(name) or _dotenv_value(name)
     if raw is None or not raw.strip():
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
@@ -111,14 +116,16 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
     try:
-        return max(minimum, min(maximum, int(os.environ.get(name, str(default)))))
+        raw = os.environ.get(name) or _dotenv_value(name) or str(default)
+        return max(minimum, min(maximum, int(raw)))
     except (TypeError, ValueError):
         return default
 
 
 def _env_float(name: str, default: float, minimum: float, maximum: float) -> float:
     try:
-        return max(minimum, min(maximum, float(os.environ.get(name, str(default)))))
+        raw = os.environ.get(name) or _dotenv_value(name) or str(default)
+        return max(minimum, min(maximum, float(raw)))
     except (TypeError, ValueError):
         return default
 
@@ -194,11 +201,24 @@ def _config_from_form(
     copyright_source: str = "unknown",
     copyright_notes: str = "",
     vocal_separation: bool = False,
+    asr_engine: str | None = None,
+    whisper_model: str | None = None,
+    whisper_beam_size: int | None = None,
+    segment_language_detection: bool | None = None,
+    soft_timing_fit: bool | None = None,
+    timing_max_drift_s: float | None = None,
+    timing_min_gap_s: float | None = None,
+    timing_max_atempo: float | None = None,
+    voice_speed: float | None = None,
 ) -> PipelineConfig:
-    resolved_translation_provider = _first_config_value(
+    translation_provider_value = _first_config_value(
         translation_provider,
         ("AUTODUB_TRANSLATION_PROVIDER",),
         "9router",
+    )
+    resolved_translation_provider = cast(
+        TranslationProvider,
+        translation_provider_value if translation_provider_value in {"9router", "google", "mock"} else "9router",
     )
     resolved_translation_model = _first_config_value(
         translation_model,
@@ -206,10 +226,23 @@ def _config_from_form(
         "ag/gemini-3-flash-agent",
     )
     resolved_asr_model = _fallback_asr_model(asr_model)
-    resolved_compute_type = _first_config_value(compute_type, ("AUTODUB_COMPUTE_TYPE",), "int8")
+    compute_type_value = _first_config_value(compute_type, ("AUTODUB_COMPUTE_TYPE",), "float16")
+    resolved_compute_type = cast(
+        ComputeType,
+        compute_type_value if compute_type_value in {"int8", "float16"} else "float16",
+    )
     resolved_voice_model = _first_config_value(voice_model, ("AUTODUB_VOICE_MODEL",), "Trúc Ly")
     resolved_tts_device = "cuda"
     resolved_ocr_model = _first_config_value(ocr_model, ("AUTODUB_OCR_MODEL",), "gemini/gemini-2.5-flash")
+    resolved_copyright_source = cast(
+        CopyrightSource,
+        copyright_source if copyright_source in {"unknown", "owned", "licensed", "public_domain", "permission", "platform_library"} else "unknown",
+    )
+    asr_engine_value = _first_config_value(asr_engine, ("ASR_ENGINE", "AUTODUB_ASR_ENGINE"), "auto").strip().lower()
+    resolved_asr_engine = cast(
+        AsrEngine,
+        asr_engine_value if asr_engine_value in {"auto", "whisper", "paraformer"} else "auto",
+    )
 
     return PipelineConfig(
         source_language=source_language,
@@ -227,7 +260,7 @@ def _config_from_form(
         mock_translation=mock_translation,
         mock_tts=mock_tts,
         copyright_confirmed=copyright_confirmed,
-        copyright_source=copyright_source,
+        copyright_source=resolved_copyright_source,
         copyright_notes=copyright_notes,
         ocr_fallback=ocr_fallback,
         ocr_force=ocr_force,
@@ -235,22 +268,27 @@ def _config_from_form(
         ocr_interval_seconds=ocr_interval_seconds,
         ocr_crop_bottom_ratio=ocr_crop_bottom_ratio,
         vocal_separation=vocal_separation,
-        asr_engine=(_first_config_value(None, ("ASR_ENGINE", "AUTODUB_ASR_ENGINE"), "auto").strip().lower() if _first_config_value(None, ("ASR_ENGINE", "AUTODUB_ASR_ENGINE"), "auto").strip().lower() in {"auto", "whisper", "paraformer"} else "auto"),
-        whisper_model=_first_config_value(None, ("WHISPER_MODEL", "AUTODUB_WHISPER_MODEL"), "auto"),
-        whisper_beam_size=_env_int("WHISPER_BEAM_SIZE", _env_int("AUTODUB_WHISPER_BEAM_SIZE", 5, 1, 10), 1, 10),
+        asr_engine=resolved_asr_engine,
+        whisper_model=_first_config_value(whisper_model, ("WHISPER_MODEL", "AUTODUB_WHISPER_MODEL"), "auto"),
+        whisper_beam_size=max(1, min(10, int(whisper_beam_size if whisper_beam_size is not None else _env_int("WHISPER_BEAM_SIZE", _env_int("AUTODUB_WHISPER_BEAM_SIZE", 1, 1, 10), 1, 10)))),
+        whisper_batch_size=_env_int("AUTODUB_WHISPER_BATCH_SIZE", 8, 1, 32),
+        whisper_vad_filter=_env_bool("AUTODUB_WHISPER_VAD_FILTER", True),
+        segment_language_detection=(segment_language_detection if segment_language_detection is not None else True),
+        fill_speech_gaps=_env_bool("AUTODUB_FILL_SPEECH_GAPS", True),
+        speech_gap_max_s=_env_float("AUTODUB_SPEECH_GAP_MAX_S", 8.0, 0, 30),
         default_source_language=_first_config_value(None, ("DEFAULT_SOURCE_LANG", "AUTODUB_DEFAULT_SOURCE_LANG"), "zh-CN"),
         ocr_adaptive=_env_bool("AUTODUB_OCR_ADAPTIVE", True),
         ocr_scene_threshold=_env_float("AUTODUB_OCR_SCENE_THRESHOLD", 0.28, 0.02, 1.0),
-        translate_batch_size=_env_int("TRANSLATE_BATCH_SIZE", 40, 1, 80),
+        translate_batch_size=_env_int("TRANSLATE_BATCH_SIZE", 80, 1, 100),
         translate_analysis=_env_bool("TRANSLATE_ANALYSIS", True),
         translate_review=_env_bool("TRANSLATE_REVIEW", True),
         translate_cps_budget=_env_float("TRANSLATE_CPS_BUDGET", 12.5, 1, 80),
         video_speed=_env_float("VIDEO_SPEED", 1.0, 0.25, 2.0),
-        voice_speed=_env_float("VOICE_SPEED", 1.0, 0.5, 2.0),
-        soft_timing_fit=_env_bool("SOFT_TIMING_FIT", True),
-        timing_max_drift_s=_env_float("TIMING_MAX_DRIFT_S", 1.5, 0, 10),
-        timing_min_gap_s=_env_float("TIMING_MIN_GAP_S", 0.12, 0, 2),
-        timing_max_atempo=_env_float("TIMING_MAX_ATEMPO", 1.1, 0.5, 2),
+        voice_speed=max(0.5, min(2.0, float(voice_speed if voice_speed is not None else _env_float("VOICE_SPEED", 1.0, 0.5, 2.0)))),
+        soft_timing_fit=(soft_timing_fit if soft_timing_fit is not None else _env_bool("SOFT_TIMING_FIT", True)),
+        timing_max_drift_s=max(0.0, min(10.0, float(timing_max_drift_s if timing_max_drift_s is not None else _env_float("TIMING_MAX_DRIFT_S", 1.5, 0, 10)))),
+        timing_min_gap_s=max(0.0, min(2.0, float(timing_min_gap_s if timing_min_gap_s is not None else _env_float("TIMING_MIN_GAP_S", 0.12, 0, 2)))),
+        timing_max_atempo=max(0.5, min(2.0, float(timing_max_atempo if timing_max_atempo is not None else _env_float("TIMING_MAX_ATEMPO", 1.1, 0.5, 2)))),
         hq_background=_env_bool("HQ_BACKGROUND", True),
         voice_postprocess=_env_bool("VOICE_POSTPROCESS", True),
         voice_target_lufs=_env_float("VOICE_TARGET_LUFS", -16.0, -40, -1),
@@ -291,7 +329,7 @@ def _batch_response(result) -> BatchDubbingResponse:
 
 def _streaming_pipeline_response(request: Request, workspace_manager: WorkspaceManager, workspace, runner_factory) -> StreamingResponse:
     cancel_event = threading.Event()
-    event_queue: queue.Queue[object] = queue.Queue()
+    event_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
     errors: list[BaseException] = []
     request_id = getattr(workspace, "request_id", "unknown")
 
@@ -320,6 +358,9 @@ def _streaming_pipeline_response(request: Request, workspace_manager: WorkspaceM
     thread = threading.Thread(target=worker, daemon=True, name=f"autodub-stream-{request_id}")
     thread.start()
 
+    def get_stream_event() -> tuple[str, str | None]:
+        return event_queue.get(block=True, timeout=0.2)
+
     async def event_stream():
         try:
             while True:
@@ -328,12 +369,12 @@ def _streaming_pipeline_response(request: Request, workspace_manager: WorkspaceM
                     cancel_event.set()
                     break
                 try:
-                    kind, payload = await asyncio.to_thread(event_queue.get, True, 0.2)
+                    kind, payload = await asyncio.to_thread(get_stream_event)
                 except queue.Empty:
                     if not thread.is_alive() and event_queue.empty():
                         break
                     continue
-                if kind == "data":
+                if kind == "data" and payload is not None:
                     yield payload
                 else:
                     break
@@ -446,6 +487,15 @@ async def stream_dub_video(
     copyright_source: str = Form(default="unknown"),
     copyright_notes: str = Form(default=""),
     vocal_separation: bool = Form(default=False),
+    asr_engine: str = Form(default="auto"),
+    whisper_model: str = Form(default="auto"),
+    whisper_beam_size: int = Form(default=1),
+    segment_language_detection: bool = Form(default=True),
+    soft_timing_fit: bool = Form(default=True),
+    timing_max_drift_s: float = Form(default=1.5),
+    timing_min_gap_s: float = Form(default=0.12),
+    timing_max_atempo: float = Form(default=1.1),
+    voice_speed: float = Form(default=1.0),
 ) -> StreamingResponse:
     """SSE endpoint for the Next.js client.
 
@@ -477,6 +527,15 @@ async def stream_dub_video(
         copyright_source=copyright_source,
         copyright_notes=copyright_notes,
         vocal_separation=vocal_separation,
+        asr_engine=asr_engine,
+        whisper_model=whisper_model,
+        whisper_beam_size=whisper_beam_size,
+        segment_language_detection=segment_language_detection,
+        soft_timing_fit=soft_timing_fit,
+        timing_max_drift_s=timing_max_drift_s,
+        timing_min_gap_s=timing_min_gap_s,
+        timing_max_atempo=timing_max_atempo,
+        voice_speed=voice_speed,
     )
     _require_copyright_preflight(config)
 
@@ -515,6 +574,15 @@ async def analyze_video_script(
     copyright_source: str = Form(default="unknown"),
     copyright_notes: str = Form(default=""),
     vocal_separation: bool = Form(default=False),
+    asr_engine: str = Form(default="auto"),
+    whisper_model: str = Form(default="auto"),
+    whisper_beam_size: int = Form(default=1),
+    segment_language_detection: bool = Form(default=True),
+    soft_timing_fit: bool = Form(default=True),
+    timing_max_drift_s: float = Form(default=1.5),
+    timing_min_gap_s: float = Form(default=0.12),
+    timing_max_atempo: float = Form(default=1.1),
+    voice_speed: float = Form(default=1.0),
 ) -> AnalyzeResponse:
     config = _config_from_form(
         None if source_language == "auto" else source_language,
@@ -540,6 +608,15 @@ async def analyze_video_script(
         copyright_source=copyright_source,
         copyright_notes=copyright_notes,
         vocal_separation=vocal_separation,
+        asr_engine=asr_engine,
+        whisper_model=whisper_model,
+        whisper_beam_size=whisper_beam_size,
+        segment_language_detection=segment_language_detection,
+        soft_timing_fit=soft_timing_fit,
+        timing_max_drift_s=timing_max_drift_s,
+        timing_min_gap_s=timing_min_gap_s,
+        timing_max_atempo=timing_max_atempo,
+        voice_speed=voice_speed,
     )
     config.word_timestamps = True
     _require_copyright_preflight(config)
@@ -589,6 +666,15 @@ async def analyze_video_script_stream(
     copyright_source: str = Form(default="unknown"),
     copyright_notes: str = Form(default=""),
     vocal_separation: bool = Form(default=False),
+    asr_engine: str = Form(default="auto"),
+    whisper_model: str = Form(default="auto"),
+    whisper_beam_size: int = Form(default=1),
+    segment_language_detection: bool = Form(default=True),
+    soft_timing_fit: bool = Form(default=True),
+    timing_max_drift_s: float = Form(default=1.5),
+    timing_min_gap_s: float = Form(default=0.12),
+    timing_max_atempo: float = Form(default=1.1),
+    voice_speed: float = Form(default=1.0),
 ) -> StreamingResponse:
     config = _config_from_form(
         None if source_language == "auto" else source_language,
@@ -614,6 +700,15 @@ async def analyze_video_script_stream(
         copyright_source=copyright_source,
         copyright_notes=copyright_notes,
         vocal_separation=vocal_separation,
+        asr_engine=asr_engine,
+        whisper_model=whisper_model,
+        whisper_beam_size=whisper_beam_size,
+        segment_language_detection=segment_language_detection,
+        soft_timing_fit=soft_timing_fit,
+        timing_max_drift_s=timing_max_drift_s,
+        timing_min_gap_s=timing_min_gap_s,
+        timing_max_atempo=timing_max_atempo,
+        voice_speed=voice_speed,
     )
     config.word_timestamps = word_timestamps
     _require_copyright_preflight(config)
@@ -668,10 +763,11 @@ def _voice_reference_media_path(media_path: str) -> Path:
 
 def _render_config(payload: RenderScriptRequest, clone_reference_audio_path: Path | None) -> PipelineConfig:
     return PipelineConfig(
+        source_language=payload.source_language,
         target_language=payload.target_language,
         translation_provider=payload.translation_provider,
         translation_model=payload.translation_model,
-        voice_model=payload.voice_model,
+        voice_model=payload.voice_model.strip(),
         voice_mode=payload.voice_mode,
         clone_reference_audio_path=(
             str(clone_reference_audio_path) if clone_reference_audio_path is not None else None
@@ -686,6 +782,11 @@ def _render_config(payload: RenderScriptRequest, clone_reference_audio_path: Pat
         copyright_source=payload.copyright_source,
         copyright_notes=payload.copyright_notes,
         vocal_separation=payload.vocal_separation,
+        ocr_fallback=payload.ocr_fallback,
+        ocr_force=payload.ocr_force,
+        ocr_model=payload.ocr_model,
+        ocr_interval_seconds=payload.ocr_interval_seconds,
+        ocr_crop_bottom_ratio=payload.ocr_crop_bottom_ratio,
         asr_engine=payload.asr_engine,
         whisper_model=payload.whisper_model,
         whisper_beam_size=payload.whisper_beam_size,
@@ -822,6 +923,17 @@ async def render_edited_script(request: Request, payload: RenderScriptRequest) -
 
     config = _render_config(payload, clone_reference_audio_path)
     _require_copyright_preflight(config)
+    logger.info(
+        "script_render.voice_setup_received mode=%s default_voice=%s segment_voices=%s timing={soft:%s,max_drift:%.3f,min_gap:%.3f,max_atempo:%.3f,speed:%.3f}",
+        payload.voice_mode,
+        config.voice_model,
+        len({segment.voice_model.strip() for segment in payload.segments if segment.voice_model.strip()}),
+        config.soft_timing_fit,
+        config.timing_max_drift_s,
+        config.timing_min_gap_s,
+        config.timing_max_atempo,
+        config.voice_speed,
+    )
     source_video_path = _output_media_path(payload.source_video_path)
     dispatcher = RenderJobDispatcher()
     try:
@@ -857,6 +969,17 @@ async def render_edited_script_with_video(
 
     config = _render_config(render_payload, clone_reference_audio_path)
     _require_copyright_preflight(config)
+    logger.info(
+        "script_render.voice_setup_received mode=%s default_voice=%s segment_voices=%s timing={soft:%s,max_drift:%.3f,min_gap:%.3f,max_atempo:%.3f,speed:%.3f}",
+        render_payload.voice_mode,
+        config.voice_model,
+        len({segment.voice_model.strip() for segment in render_payload.segments if segment.voice_model.strip()}),
+        config.soft_timing_fit,
+        config.timing_max_drift_s,
+        config.timing_min_gap_s,
+        config.timing_max_atempo,
+        config.voice_speed,
+    )
 
     workspace_manager = WorkspaceManager()
     workspace = workspace_manager.create()
@@ -1173,6 +1296,58 @@ def stt_models() -> dict[str, object]:
     return list_stt_models(timeout=0.5)
 
 
+def _pipeline_settings_payload() -> dict[str, object]:
+    """UI contract for ASR/OCR/timing controls shared by both workflows."""
+    return {
+        "version": "pipeline-settings-v1",
+        "source_languages": [
+            {"value": "auto", "label": "Tự động nhận dạng"},
+            {"value": "zh", "label": "Tiếng Trung"},
+            {"value": "en", "label": "Tiếng Anh"},
+            {"value": "vi", "label": "Tiếng Việt"},
+            {"value": "ja", "label": "Tiếng Nhật"},
+            {"value": "ko", "label": "Tiếng Hàn"},
+        ],
+        "asr_engines": ["auto", "whisper", "paraformer"],
+        "whisper_models": ["auto", "tiny", "base", "small", "medium", "large-v3"],
+        "ocr": {
+            "enabled_by_default": False,
+            "interval_seconds": 0.75,
+            "crop_bottom_ratio": 0.35,
+            "models": [
+                {"id": "gemini/gemini-2.5-flash", "label": "Gemini 2.5 Flash OCR"},
+                {"id": "gemini/gemini-2.5-pro", "label": "Gemini 2.5 Pro OCR"},
+            ],
+        },
+        "timing": {
+            "soft_timing_fit": True,
+            "max_drift_s": 1.5,
+            "min_gap_s": 0.12,
+            "max_atempo": 1.1,
+            "voice_speed": 1.0,
+        },
+        "speech_gap_repair": {
+            "enabled": _env_bool("AUTODUB_FILL_SPEECH_GAPS", True),
+            "max_gap_s": _env_float("AUTODUB_SPEECH_GAP_MAX_S", 8.0, 0, 30),
+        },
+        "vocal_separation": {
+            "enabled_by_default": False,
+            "device": os.environ.get("AUTODUB_DEMUCS_DEVICE", "auto").strip().lower() or "auto",
+            "chunk_seconds": _env_float("AUTODUB_DEMUCS_CHUNK_SECONDS", 60.0, 10.0, 600.0),
+        },
+    }
+
+
+@router.get("/pipeline/settings")
+def pipeline_settings_v1() -> dict[str, object]:
+    return _pipeline_settings_payload()
+
+
+@stream_router.get("/pipeline/settings")
+def pipeline_settings() -> dict[str, object]:
+    return _pipeline_settings_payload()
+
+
 @compat_router.post("/upload-and-extract")
 async def upload_and_extract(video: UploadFile = File(...)) -> dict[str, str]:
     """Persist an uploaded video and extract a reviewable audio track."""
@@ -1244,10 +1419,18 @@ def transcribe(request: TranscribeRequest) -> list[dict[str, object]]:
             whisperx,
             whisper_arch="base",
             device=device,
-            compute_type="int8",
+            compute_type=_first_config_value(None, ("AUTODUB_COMPUTE_TYPE",), "float16"),
             language=None,
+            beam_size=_env_int("AUTODUB_WHISPER_BEAM_SIZE", 1, 1, 10),
         ) as model:
-            result = model.transcribe(audio, batch_size=4, language=None)
+            result = model.transcribe(
+                audio,
+                batch_size=_env_int("AUTODUB_WHISPER_BATCH_SIZE", 8, 1, 32),
+                language=None,
+                vad_filter=_env_bool("AUTODUB_WHISPER_VAD_FILTER", True),
+                no_speech_threshold=0.4,
+                condition_on_previous_text=False,
+            )
 
         VRAMManager.cleanup()
         language_code = result.get("language") or "en"
