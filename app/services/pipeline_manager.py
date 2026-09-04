@@ -52,6 +52,7 @@ class PipelineManager:
                     enabled=config.checkpoint_enabled,
                 )
                 accompaniment_path = None
+                original_vocal_path = None
                 asr_input = video_path
                 if config.vocal_separation:
                     try:
@@ -80,6 +81,7 @@ class PipelineManager:
                             device=os.environ.get("AUTODUB_DEMUCS_DEVICE", "auto"),
                         )
                         asr_input = sep_result.vocals_path
+                        original_vocal_path = sep_result.vocals_path
                         accompaniment_path = sep_result.accompaniment_path
                     except Exception as exc:
                         logger.exception("Vocal separation failed for request %s", request_id)
@@ -142,6 +144,7 @@ class PipelineManager:
                     work_dir=work_dir,
                     output_path=output_video_path,
                     accompaniment_path=accompaniment_path,
+                    original_vocal_path=original_vocal_path,
                 )
                 shutil.copy2(temp_subtitle_path, output_subtitle_path)
 
@@ -228,6 +231,7 @@ class PipelineManager:
             work_dir = Path(temp_root)
             try:
                 accompaniment_path = None
+                original_vocal_path = None
                 if config.vocal_separation:
                     try:
                         logger.info("Starting vocal separation stage for request %s", request_id)
@@ -255,6 +259,7 @@ class PipelineManager:
                             device=os.environ.get("AUTODUB_DEMUCS_DEVICE", "auto"),
                         )
                         accompaniment_path = sep_result.accompaniment_path
+                        original_vocal_path = sep_result.vocals_path
                     except Exception as exc:
                         logger.exception("Vocal separation failed for request %s", request_id)
                         raise RuntimeError(
@@ -297,6 +302,7 @@ class PipelineManager:
                     work_dir=work_dir,
                     output_path=output_video_path,
                     accompaniment_path=accompaniment_path,
+                    original_vocal_path=original_vocal_path,
                 )
                 shutil.copy2(temp_subtitle_path, output_subtitle_path)
 

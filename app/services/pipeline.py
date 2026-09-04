@@ -329,12 +329,14 @@ class AutoDubbingPipeline:
             self._combine_audio_chunks(chunks, tts_mix_path, total_duration=video_duration)
             yield self._event("processing", "Muxing subtitles and audio...", phase="render", progress=96)
             accompaniment_path = self._ensure_accompaniment_audio(workspace, workspace.input_video) if self.config.vocal_separation else None
+            original_vocal_path = self._separated_vocal_path(workspace) if self.config.vocal_separation else None
             self._render_video(
                 video_path=workspace.input_video,
                 subtitle_path=subtitle_path,
                 tts_mix_path=tts_mix_path,
                 output_path=output_path,
                 accompaniment_path=accompaniment_path,
+                original_vocal_path=original_vocal_path,
             )
             self._write_srt(translated_segments, output_subtitle_path, video_duration=video_duration)
 
@@ -633,6 +635,7 @@ class AutoDubbingPipeline:
             self._combine_audio_chunks(chunks, tts_mix_path, total_duration=video_duration)
             yield self._event("processing", "Muxing subtitles and audio...", phase="render", progress=94)
             accompaniment_path = self._ensure_accompaniment_audio(workspace, render_source_path) if self.config.vocal_separation else None
+            original_vocal_path = self._separated_vocal_path(workspace) if self.config.vocal_separation else None
             self._render_video(
                 video_path=render_source_path,
                 subtitle_path=subtitle_path,
@@ -643,6 +646,7 @@ class AutoDubbingPipeline:
                 video_height=video_height,
                 video_duration=video_duration,
                 accompaniment_path=accompaniment_path,
+                original_vocal_path=original_vocal_path,
             )
             self._write_srt(timeline_segments, output_subtitle_path, video_duration=video_duration)
 
@@ -1253,6 +1257,13 @@ class AutoDubbingPipeline:
                 "Vocal separation is enabled but failed; render stopped to prevent original voice bleed. "
                 f"{exc}"
             ) from exc
+
+    def _separated_vocal_path(self, workspace: Workspace) -> Path | None:
+        """Return the workspace vocal stem when it is available for final mixing."""
+        vocals_path = workspace.root / "separated" / "vocals.wav"
+        if vocals_path.is_file() and vocals_path.stat().st_size > 0:
+            return vocals_path
+        return None
 
     def _materialize_background_stem(self, source_path: Path, destination_path: Path) -> None:
         """Keep cached Demucs stems lossless while honoring final-mix quality."""
@@ -2521,6 +2532,7 @@ class AutoDubbingPipeline:
         video_height: int | None = None,
         video_duration: float | None = None,
         accompaniment_path: Path | None = None,
+        original_vocal_path: Path | None = None,
     ) -> None:
         ffmpeg = self._ffmpeg()
         video_input = ffmpeg.input(str(video_path))
@@ -2550,24 +2562,48 @@ class AutoDubbingPipeline:
         tts_sidechain = tts_split[0]
         tts_for_mix = tts_split[1]
         has_acc = accompaniment_path and accompaniment_path.is_file() and accompaniment_path.stat().st_size > 0
+        has_original_vocal = (
+            original_vocal_path
+            and original_vocal_path.is_file()
+            and original_vocal_path.stat().st_size > 0
+        )
         if self.config.vocal_separation and not has_acc:
             raise RuntimeError(
                 "Vocal separation is enabled but no accompaniment track is available; "
                 "render stopped to prevent original voice bleed."
             )
+        if self.config.vocal_separation and self.config.original_vocal_gain > 0 and not has_original_vocal:
+            raise RuntimeError(
+                "Original vocal level was requested but no separated vocal track is available."
+            )
         if has_acc:
             bg_vol = self.config.background_volume if self.config.background_volume > 0 else ACCOMPANIMENT_DEFAULT_VOLUME
+            bg_vol = round(bg_vol * self.config.accompaniment_gain, 6)
             logger.info(
-                "legacy_pipeline.render.accompaniment_ducked path=%s volume=%.2f ratio=12 release_ms=320",
+                "legacy_pipeline.render.accompaniment_ducked path=%s volume=%.2f vocal_gain=%.2f ratio=12 release_ms=320",
                 accompaniment_path,
                 bg_vol,
+                self.config.original_vocal_gain if self.config.vocal_separation else 0.0,
             )
             bg_audio = ffmpeg.input(str(accompaniment_path)).audio.filter("volume", bg_vol)
+            source_audio = bg_audio
+            if self.config.vocal_separation and has_original_vocal and self.config.original_vocal_gain > 0:
+                original_vocal = ffmpeg.input(str(original_vocal_path)).audio.filter(
+                    "volume", self.config.original_vocal_gain
+                )
+                source_audio = ffmpeg.filter(
+                    [bg_audio, original_vocal],
+                    "amix",
+                    inputs=2,
+                    duration="first",
+                    dropout_transition=0,
+                    normalize=0,
+                )
             # Keep the original ambience near full level between speech, then
             # duck it while dubbed speech is active. This masks residual vocal
             # bleed without flattening music and environmental sound globally.
             background_audio = ffmpeg.filter(
-                [bg_audio, tts_sidechain],
+                [source_audio, tts_sidechain],
                 "sidechaincompress",
                 threshold=0.02,
                 ratio=12,

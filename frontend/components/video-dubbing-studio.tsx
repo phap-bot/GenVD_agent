@@ -43,7 +43,7 @@ const DEFAULT_OCR_MODEL = "gemini/gemini-2.5-flash";
 const DEFAULT_ASR_MODEL = "base";
 const VI_WORDS_PER_SECOND = 3;
 const STUDIO_SESSION_KEY = 'video-clone:studio-session:v1';
-const STUDIO_SESSION_VERSION = 2;
+const STUDIO_SESSION_VERSION = 3;
 
 type CopyrightSource = "unknown" | "owned" | "licensed" | "public_domain" | "permission" | "platform_library";
 type VoiceMode = "system" | "clone";
@@ -70,6 +70,8 @@ type StudioConfig = {
   ocrIntervalSeconds: number;
   ocrCropBottomRatio: number;
   vocalSeparation: boolean;
+  originalVocalGain: number;
+  accompanimentGain: number;
   softTimingFit: boolean;
   timingMaxDrift: number;
   timingMinGap: number;
@@ -518,7 +520,9 @@ export default function VideoDubbingStudio() {
     ocrModel: DEFAULT_OCR_MODEL,
     ocrIntervalSeconds: 0.75,
     ocrCropBottomRatio: 0.35,
-    vocalSeparation: true,
+    vocalSeparation: false,
+    originalVocalGain: 0,
+    accompanimentGain: 1,
     softTimingFit: true,
     timingMaxDrift: 1.5,
     timingMinGap: 0.12,
@@ -659,9 +663,10 @@ export default function VideoDubbingStudio() {
         const stored = window.sessionStorage.getItem(STUDIO_SESSION_KEY);
         if (stored) {
           const parsed = JSON.parse(stored) as StudioSessionSnapshot;
-          // Version 1 stored the old OCR default as enabled. Keep the rest of
-          // the session, but migrate that legacy default to off below.
-          if ((parsed.version === STUDIO_SESSION_VERSION || parsed.version === 1) && parsed.sessionId) snapshot = parsed;
+          // Version 1 stored the old OCR default as enabled. Versions 1/2 also
+          // used the old always-on vocal-separation default; migrate that
+          // legacy default to the new opt-in behavior below.
+          if ((parsed.version === STUDIO_SESSION_VERSION || parsed.version === 2 || parsed.version === 1) && parsed.sessionId) snapshot = parsed;
         }
       } catch {
         window.sessionStorage.removeItem(STUDIO_SESSION_KEY);
@@ -674,6 +679,9 @@ export default function VideoDubbingStudio() {
         const restoredConfig = { ...config, ...snapshot.config };
         if (snapshot.version < STUDIO_SESSION_VERSION) {
           restoredConfig.ocrFallback = false;
+          restoredConfig.vocalSeparation = false;
+          restoredConfig.originalVocalGain = 0;
+          restoredConfig.accompanimentGain = 1;
         }
         const restoredSegments = Array.isArray(snapshot.segments)
           ? snapshot.segments.map((segment) => normalizeSegment(segment, restoredConfig.voiceModel))
@@ -1038,7 +1046,9 @@ export default function VideoDubbingStudio() {
       ocrModel: DEFAULT_OCR_MODEL,
       ocrIntervalSeconds: 0.75,
       ocrCropBottomRatio: 0.35,
-      vocalSeparation: true,
+      vocalSeparation: false,
+      originalVocalGain: 0,
+      accompanimentGain: 1,
       softTimingFit: true,
       timingMaxDrift: 1.5,
       timingMinGap: 0.12,
@@ -1317,6 +1327,8 @@ export default function VideoDubbingStudio() {
     formData.append("timing_max_atempo", String(config.timingMaxAtempo));
     formData.append("voice_speed", String(config.voiceSpeed));
     formData.append("vocal_separation", String(config.vocalSeparation));
+    formData.append("original_vocal_gain", String(config.originalVocalGain));
+    formData.append("accompaniment_gain", String(config.accompanimentGain));
     appendCopyrightPreflight(formData);
 
     setIsAnalyzing(true);
@@ -1545,6 +1557,8 @@ export default function VideoDubbingStudio() {
           copyright_source: config.copyrightSource,
           copyright_notes: config.copyrightNotes.trim(),
           vocal_separation: config.vocalSeparation,
+          original_vocal_gain: config.originalVocalGain,
+          accompaniment_gain: config.accompanimentGain,
           ocr_fallback: config.ocrFallback,
           ocr_force: config.ocrForce,
           ocr_model: config.ocrModel,
@@ -1829,7 +1843,7 @@ export default function VideoDubbingStudio() {
               </div>
             </fieldset>
             <fieldset className="grid gap-3 rounded-md border border-purple-200 bg-purple-50/50 p-3">
-              <legend className="px-1 text-sm font-semibold text-purple-800">Vocal Separation (Tách giọng AI)</legend>
+              <legend className="px-1 text-sm font-semibold text-purple-800">Âm thanh gốc</legend>
               <label className="flex items-start gap-3 text-sm font-medium text-slate-700">
                 <input
                   type="checkbox"
@@ -1838,10 +1852,52 @@ export default function VideoDubbingStudio() {
                   className="mt-1 h-4 w-4 rounded border-purple-300 text-purple-600 focus:ring-purple-500"
                 />
                 <div>
-                  <span className="font-semibold text-purple-900">Tách giọng nói (giữ lại nhạc nền & âm thanh môi trường)</span>
-                  <p className="mt-0.5 text-xs text-purple-700">Tự động loại bỏ voice gốc bằng Demucs AI. Giữ nhạc nền & hiệu ứng âm thanh sống động.</p>
+                  <span className="font-semibold text-purple-900">Bật tách giọng và nhạc nền</span>
+                  <p className="mt-0.5 text-xs text-purple-700">Mặc định tắt. Demucs chỉ chạy khi bạn bật tùy chọn này; các mức bên dưới điều khiển bản trộn cuối.</p>
                 </div>
               </label>
+              <div className="grid gap-3 rounded-md border border-purple-200 bg-white/70 p-3">
+                <label className="grid gap-1 text-xs font-medium text-slate-700">
+                  <span className="flex items-center justify-between gap-2">
+                    <span>Giữ lại giọng nói gốc</span>
+                    <output className="font-semibold text-purple-800">{Math.round(config.originalVocalGain * 100)}%</output>
+                  </span>
+                  <input
+                    type="range"
+                    min="0"
+                    max="1"
+                    step="0.05"
+                    value={config.originalVocalGain}
+                    disabled={!config.vocalSeparation}
+                    onChange={(event) => setConfig((current) => ({ ...current, originalVocalGain: Number(event.target.value) }))}
+                    className="accent-purple-600"
+                  />
+                  <span className="text-[11px] font-normal text-slate-500">0% = loại bỏ giọng gốc, 100% = giữ nguyên giọng gốc.</span>
+                </label>
+                <label className="grid gap-1 text-xs font-medium text-slate-700">
+                  <span className="flex items-center justify-between gap-2">
+                    <span>Giữ lại nhạc nền & hiệu ứng</span>
+                    <output className="font-semibold text-purple-800">{Math.round(config.accompanimentGain * 100)}%</output>
+                  </span>
+                  <input
+                    type="range"
+                    min="0"
+                    max="1.2"
+                    step="0.05"
+                    value={config.accompanimentGain}
+                    disabled={!config.vocalSeparation}
+                    onChange={(event) => setConfig((current) => ({ ...current, accompanimentGain: Number(event.target.value) }))}
+                    className="accent-purple-600"
+                  />
+                  <span className="text-[11px] font-normal text-slate-500">100% là mức nền chuẩn; có thể tăng tối đa 120%.</span>
+                </label>
+                <div className="flex flex-wrap gap-2">
+                  <button type="button" disabled={!config.vocalSeparation} onClick={() => setConfig((current) => ({ ...current, originalVocalGain: 1, accompanimentGain: 1 }))} className="rounded border border-purple-200 px-2 py-1 text-[11px] text-purple-800 disabled:cursor-not-allowed disabled:opacity-50">Giữ nguyên</button>
+                  <button type="button" disabled={!config.vocalSeparation} onClick={() => setConfig((current) => ({ ...current, originalVocalGain: 0.3, accompanimentGain: 1 }))} className="rounded border border-purple-200 px-2 py-1 text-[11px] text-purple-800 disabled:cursor-not-allowed disabled:opacity-50">Giảm giọng</button>
+                  <button type="button" disabled={!config.vocalSeparation} onClick={() => setConfig((current) => ({ ...current, originalVocalGain: 0, accompanimentGain: 1 }))} className="rounded border border-purple-200 px-2 py-1 text-[11px] text-purple-800 disabled:cursor-not-allowed disabled:opacity-50">Xóa giọng</button>
+                  <button type="button" disabled={!config.vocalSeparation} onClick={() => setConfig((current) => ({ ...current, originalVocalGain: 1, accompanimentGain: 0 }))} className="rounded border border-purple-200 px-2 py-1 text-[11px] text-purple-800 disabled:cursor-not-allowed disabled:opacity-50">Chỉ lấy giọng</button>
+                </div>
+              </div>
             </fieldset>
             <fieldset className="grid gap-3 rounded-md border border-amber-200 bg-amber-50 p-3">
               <legend className="px-1 text-sm font-semibold text-amber-800">Kiểm tra quyền sử dụng</legend>

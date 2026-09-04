@@ -100,6 +100,8 @@ def _short_config(
     copyright_source: str,
     copyright_notes: str,
     vocal_separation: bool,
+    original_vocal_gain: float = 0.0,
+    accompaniment_gain: float = 1.0,
     voice_mode: str = "system",
     clone_reference_audio_path: str | None = None,
 ):
@@ -135,6 +137,8 @@ def _short_config(
         copyright_notes=copyright_notes,
         # Short Video does not pay the Demucs cost during analysis by default.
         vocal_separation=vocal_separation,
+        original_vocal_gain=original_vocal_gain,
+        accompaniment_gain=accompaniment_gain,
     )
     config = config.model_copy(
         update={
@@ -329,6 +333,8 @@ async def dub_short_video(
     copyright_source: str = Form(default="unknown"),
     copyright_notes: str = Form(default=""),
     vocal_separation: bool = Form(default=False),
+    original_vocal_gain: float = Form(default=0.0),
+    accompaniment_gain: float = Form(default=1.0),
     voice_mode: str = Form(default="system"),
     clone_reference_audio_path: str | None = Form(default=None),
 ) -> StreamingResponse:
@@ -370,6 +376,8 @@ async def dub_short_video(
         copyright_source=copyright_source,
         copyright_notes=copyright_notes,
         vocal_separation=vocal_separation,
+        original_vocal_gain=original_vocal_gain,
+        accompaniment_gain=accompaniment_gain,
         voice_mode=voice_mode,
         clone_reference_audio_path=clone_reference_audio_path,
     )
@@ -419,6 +427,8 @@ async def render_short_script(request: Request, payload: ShortVideoRenderRequest
         copyright_source=payload.copyright_source,
         copyright_notes=payload.copyright_notes,
         vocal_separation=payload.vocal_separation,
+        original_vocal_gain=payload.original_vocal_gain,
+        accompaniment_gain=payload.accompaniment_gain,
         ocr_fallback=payload.ocr_fallback,
         ocr_force=payload.ocr_force,
         ocr_model=payload.ocr_model,

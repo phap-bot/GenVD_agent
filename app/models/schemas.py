@@ -74,6 +74,11 @@ class PipelineConfig(BaseModel):
     ocr_adaptive: bool = True
     ocr_scene_threshold: float = Field(default=0.28, ge=0.02, le=1.0)
     vocal_separation: bool = False
+    # Demucs produces separate stems; these gains control the final source
+    # mix after separation. They are independent from background_volume,
+    # which controls the ducked background under generated TTS.
+    original_vocal_gain: float = Field(default=0.0, ge=0, le=1)
+    accompaniment_gain: float = Field(default=1.0, ge=0, le=1.2)
 
     # Shared translation, timing and audio quality controls. These fields are
     # persisted with queued jobs so resumed renders use the same policy.
@@ -182,6 +187,8 @@ class RenderScriptRequest(BaseModel):
     copyright_source: Literal["owned", "licensed", "public_domain", "permission", "platform_library", "unknown"] = "unknown"
     copyright_notes: str = Field(default="", max_length=500)
     vocal_separation: bool = False
+    original_vocal_gain: float = Field(default=0.0, ge=0, le=1)
+    accompaniment_gain: float = Field(default=1.0, ge=0, le=1.2)
     ocr_fallback: bool = True
     ocr_force: bool = False
     ocr_model: str = Field(default="gemini/gemini-2.5-flash", min_length=1, max_length=160)
@@ -316,6 +323,8 @@ class ShortVideoRenderRequest(BaseModel):
     copyright_source: Literal["owned", "licensed", "public_domain", "permission", "platform_library", "unknown"] = "unknown"
     copyright_notes: str = Field(default="", max_length=500)
     vocal_separation: bool = False
+    original_vocal_gain: float = Field(default=0.0, ge=0, le=1)
+    accompaniment_gain: float = Field(default=1.0, ge=0, le=1.2)
     ocr_fallback: bool = False
     ocr_force: bool = False
     ocr_model: str = Field(default="gemini/gemini-2.5-flash", min_length=1, max_length=160)

@@ -808,6 +808,111 @@ class AudioGraphTests(unittest.TestCase):
         self.assertIn("-crf 22", graph)
         self.assertIn("-movflags +faststart", graph)
 
+    def test_source_mix_respects_original_vocal_and_accompaniment_gains(self) -> None:
+        pipeline = _pipeline(
+            burn_subtitles=False,
+            vocal_separation=True,
+            original_vocal_gain=0.3,
+            accompaniment_gain=1.2,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video = root / "video.mp4"
+            tts = root / "tts.wav"
+            accompaniment = root / "accompaniment.wav"
+            vocals = root / "vocals.wav"
+            output = root / "output.mp4"
+            for path in (video, tts, accompaniment, vocals):
+                path.write_bytes(b"x")
+
+            captured = {}
+
+            with patch.object(
+                pipeline,
+                "_run_ffmpeg_command",
+                side_effect=lambda command, stage: captured.update(args=command.compile()),
+            ):
+                pipeline._render_video(
+                    video,
+                    root / "unused.srt",
+                    tts,
+                    output,
+                    accompaniment_path=accompaniment,
+                    original_vocal_path=vocals,
+                )
+
+        graph = " ".join(str(item) for item in captured["args"])
+        self.assertIn("volume=1.104", graph)
+        self.assertIn("volume=0.3", graph)
+        self.assertIn("amix=", graph)
+        self.assertIn("inputs=2", graph)
+
+    def test_source_mix_rejects_requested_vocal_gain_without_vocal_stem(self) -> None:
+        pipeline = _pipeline(
+            burn_subtitles=False,
+            vocal_separation=True,
+            original_vocal_gain=0.5,
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video = root / "video.mp4"
+            tts = root / "tts.wav"
+            accompaniment = root / "accompaniment.wav"
+            output = root / "output.mp4"
+            for path in (video, tts, accompaniment):
+                path.write_bytes(b"x")
+
+            with self.assertRaisesRegex(RuntimeError, "no separated vocal track"):
+                pipeline._render_video(
+                    video,
+                    root / "unused.srt",
+                    tts,
+                    output,
+                    accompaniment_path=accompaniment,
+                )
+
+    def test_video_service_uses_the_same_source_mix_controls(self) -> None:
+        from app.services.video_service import VideoService
+
+        config = PipelineConfig(
+            copyright_confirmed=True,
+            copyright_source="owned",
+            burn_subtitles=False,
+            vocal_separation=True,
+            original_vocal_gain=0.4,
+            accompaniment_gain=1.1,
+        )
+        service = VideoService(config)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            video = root / "video.mp4"
+            tts = root / "tts.wav"
+            accompaniment = root / "accompaniment.wav"
+            vocals = root / "vocals.wav"
+            output = root / "output.mp4"
+            for path in (video, tts, accompaniment, vocals):
+                path.write_bytes(b"x")
+
+            captured = {}
+            with patch.object(
+                service,
+                "_run_ffmpeg_command",
+                side_effect=lambda command, stage: captured.update(args=command.compile()),
+            ):
+                service._render_video(
+                    video,
+                    root / "unused.srt",
+                    tts,
+                    output,
+                    accompaniment_path=accompaniment,
+                    original_vocal_path=vocals,
+                )
+
+        graph = " ".join(str(item) for item in captured["args"])
+        self.assertIn("volume=1.012", graph)
+        self.assertIn("volume=0.4", graph)
+        self.assertIn("inputs=2", graph)
+
     def test_invalid_x264_settings_fall_back_to_safe_defaults(self) -> None:
         pipeline = _pipeline(burn_subtitles=False)
         with tempfile.TemporaryDirectory() as temp_dir:

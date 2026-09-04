@@ -36,6 +36,7 @@ class VideoService:
         work_dir: Path,
         output_path: Path,
         accompaniment_path: Path | None = None,
+        original_vocal_path: Path | None = None,
     ) -> tuple[Path, Path]:
         segments = TimelineService().from_transcript(segments)
         subtitle_path = work_dir / "subtitles.srt"
@@ -45,7 +46,14 @@ class VideoService:
         if tts_tracks:
             self._build_aligned_tts_track(tts_tracks, tts_mix_path)
 
-        self._render_video(video_path, subtitle_path, tts_mix_path if tts_tracks else None, output_path, accompaniment_path=accompaniment_path)
+        self._render_video(
+            video_path,
+            subtitle_path,
+            tts_mix_path if tts_tracks else None,
+            output_path,
+            accompaniment_path=accompaniment_path,
+            original_vocal_path=original_vocal_path,
+        )
         return output_path, subtitle_path
 
     def generate_srt(self, segments: list[TranscriptSegment], destination: Path) -> Path:
@@ -90,6 +98,7 @@ class VideoService:
         tts_mix_path: Path | None,
         output_path: Path,
         accompaniment_path: Path | None = None,
+        original_vocal_path: Path | None = None,
     ) -> None:
         ffmpeg = _ffmpeg()
         video_input = ffmpeg.input(str(video_path))
@@ -99,8 +108,48 @@ class VideoService:
             logger.info("video_service.render.subtitle_filter path=%s", subtitle_filter_path)
             video_stream = video_stream.filter("subtitles", subtitle_filter_path)
 
+        has_acc = accompaniment_path and accompaniment_path.is_file() and accompaniment_path.stat().st_size > 0
+        has_original_vocal = (
+            original_vocal_path
+            and original_vocal_path.is_file()
+            and original_vocal_path.stat().st_size > 0
+        )
+        if self.config.vocal_separation and not has_acc:
+            raise RuntimeError(
+                "Vocal separation is enabled but no accompaniment track is available; "
+                "render stopped to prevent original voice bleed."
+            )
+        if self.config.vocal_separation and self.config.original_vocal_gain > 0 and not has_original_vocal:
+            raise RuntimeError(
+                "Original vocal level was requested but no separated vocal track is available."
+            )
+
         if tts_mix_path is None:
-            audio_stream = ffmpeg.input(str(accompaniment_path)).audio if (accompaniment_path and accompaniment_path.is_file()) else video_input.audio
+            if has_acc:
+                if self.config.vocal_separation:
+                    bg_vol = self.config.background_volume if self.config.background_volume > 0 else ACCOMPANIMENT_DEFAULT_VOLUME
+                    audio_stream = ffmpeg.input(str(accompaniment_path)).audio.filter(
+                        "volume", round(bg_vol * self.config.accompaniment_gain, 6)
+                    )
+                    if has_original_vocal and self.config.original_vocal_gain > 0:
+                        vocal_stream = ffmpeg.input(str(original_vocal_path)).audio.filter(
+                            "volume", self.config.original_vocal_gain
+                        )
+                        audio_stream = ffmpeg.filter(
+                            [audio_stream, vocal_stream],
+                            "amix",
+                            inputs=2,
+                            duration="first",
+                            dropout_transition=0,
+                            normalize=0,
+                        )
+                else:
+                    # Preserve the historical no-TTS behavior for callers that
+                    # provide an accompaniment path without enabling the
+                    # configurable separation mix.
+                    audio_stream = ffmpeg.input(str(accompaniment_path)).audio
+            else:
+                audio_stream = video_input.audio
             command = ffmpeg.output(
                 video_stream,
                 audio_stream,
@@ -116,18 +165,31 @@ class VideoService:
         tts_split = tts_audio.filter_multi_output("asplit")
         tts_sidechain = tts_split[0]
         tts_for_mix = tts_split[1]
-        has_acc = accompaniment_path and accompaniment_path.is_file() and accompaniment_path.stat().st_size > 0
-        if self.config.vocal_separation and not has_acc:
-            raise RuntimeError(
-                "Vocal separation is enabled but no accompaniment track is available; "
-                "render stopped to prevent original voice bleed."
-            )
         if has_acc:
             bg_vol = self.config.background_volume if self.config.background_volume > 0 else ACCOMPANIMENT_DEFAULT_VOLUME
-            logger.info("video_service.render.accompaniment_ducked path=%s volume=%.2f", accompaniment_path, bg_vol)
+            bg_vol = round(bg_vol * self.config.accompaniment_gain, 6)
+            logger.info(
+                "video_service.render.accompaniment_ducked path=%s volume=%.2f vocal_gain=%.2f",
+                accompaniment_path,
+                bg_vol,
+                self.config.original_vocal_gain if self.config.vocal_separation else 0.0,
+            )
             bg_audio = ffmpeg.input(str(accompaniment_path)).audio.filter("volume", bg_vol)
+            source_audio = bg_audio
+            if self.config.vocal_separation and has_original_vocal and self.config.original_vocal_gain > 0:
+                original_vocal = ffmpeg.input(str(original_vocal_path)).audio.filter(
+                    "volume", self.config.original_vocal_gain
+                )
+                source_audio = ffmpeg.filter(
+                    [bg_audio, original_vocal],
+                    "amix",
+                    inputs=2,
+                    duration="first",
+                    dropout_transition=0,
+                    normalize=0,
+                )
             background_audio = ffmpeg.filter(
-                [bg_audio, tts_sidechain],
+                [source_audio, tts_sidechain],
                 "sidechaincompress",
                 threshold=0.02,
                 ratio=12,
