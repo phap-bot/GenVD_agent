@@ -188,6 +188,179 @@ class TimelineTranslationTests(unittest.TestCase):
         self.assertEqual(translated, "Hứ")
         gtx_mock.assert_called_once()
 
+    def test_source_fragment_does_not_trigger_google_fallback(self) -> None:
+        from utils.translation import _fallback_if_bad_translation
+
+        with patch("utils.translation._translate_google_gtx_cached") as gtx_mock:
+            translated = _fallback_if_bad_translation(
+                "到了晚上阿翔在清洗氣局突然聽到聲響,",
+                "Đến tối, A Hương bỗng nghe thấy tiếng động ở góc phòng,",
+                source="auto",
+                target="vi",
+                timeout=5.0,
+            )
+
+        self.assertEqual(translated, "Đến tối, A Hương bỗng nghe thấy tiếng động ở góc phòng,")
+        gtx_mock.assert_not_called()
+
+    def test_translation_request_retries_connection_reset_at_most_three_times(self) -> None:
+        from utils.translation import _with_translation_request_retries
+
+        calls = 0
+
+        def flaky_request() -> str:
+            nonlocal calls
+            calls += 1
+            if calls <= 3:
+                raise ConnectionResetError(10054, "connection reset")
+            return "ok"
+
+        with (
+            patch(
+                "utils.translation._config_value",
+                side_effect=lambda name: "3"
+                if name == "AUTODUB_TRANSLATION_CONNECTION_REFUSED_RETRIES"
+                else None,
+            ),
+            patch("utils.translation._connection_refused_retry_delay", return_value=0.0),
+        ):
+            result = _with_translation_request_retries(
+                flaky_request,
+                model="google-gtx",
+                source="auto",
+                target="vi",
+                batch_size=1,
+                endpoint="google_gtx",
+            )
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls, 4)
+
+    def test_empty_gateway_response_is_retried_before_error(self) -> None:
+        from utils.translation import TranslationResponseError, _parse_chat_completion_body, _with_translation_request_retries
+
+        calls = 0
+
+        def empty_response() -> str:
+            nonlocal calls
+            calls += 1
+            raise TranslationResponseError("empty")
+
+        with (
+            patch(
+                "utils.translation._config_value",
+                side_effect=lambda name: "3"
+                if name == "AUTODUB_TRANSLATION_CONNECTION_REFUSED_RETRIES"
+                else None,
+            ),
+            patch("utils.translation._connection_refused_retry_delay", return_value=0.0),
+            self.assertRaises(TranslationResponseError),
+        ):
+            _with_translation_request_retries(
+                empty_response,
+                model="model",
+                source="auto",
+                target="vi",
+                batch_size=24,
+                endpoint="9router",
+            )
+
+        self.assertEqual(calls, 4)
+        with self.assertRaises(TranslationResponseError):
+            _parse_chat_completion_body("", "application/json")
+
+    def test_batch_shorten_retries_empty_gateway_response_before_heuristic_fallback(self) -> None:
+        from utils.translation import TranslationResponseError, _shorten_9router_segments_cached
+
+        class EmptyResponse:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return b""
+
+        _shorten_9router_segments_cached.cache_clear()
+        with (
+            patch("utils.translation.urlopen", return_value=EmptyResponse()) as urlopen_mock,
+            patch(
+                "utils.translation._config_value",
+                side_effect=lambda name: "3"
+                if name == "AUTODUB_TRANSLATION_CONNECTION_REFUSED_RETRIES"
+                else None,
+            ),
+            patch("utils.translation._connection_refused_retry_delay", return_value=0.0),
+            self.assertRaises(TranslationResponseError),
+        ):
+            _shorten_9router_segments_cached(
+                ("A complete sentence.",),
+                ("A complete sentence.",),
+                (2.0,),
+                (6,),
+                "vi",
+                "model",
+                "http://localhost:20128/v1",
+                "",
+                5.0,
+            )
+
+        self.assertEqual(urlopen_mock.call_count, 4)
+
+    def test_structured_request_falls_back_when_gateway_rejects_json_mode(self) -> None:
+        from utils.translation import TranslationResponseFormatUnsupported, _with_structured_json_fallback
+
+        modes: list[bool] = []
+
+        def operation(use_json_response_format: bool) -> str:
+            modes.append(use_json_response_format)
+            if use_json_response_format:
+                raise TranslationResponseFormatUnsupported()
+            return "prompt-json-result"
+
+        result = _with_structured_json_fallback(
+            operation,
+            model="model",
+            source="auto",
+            target="vi",
+            batch_size=2,
+        )
+
+        self.assertEqual(result, "prompt-json-result")
+        self.assertEqual(modes, [True, False])
+
+    def test_batch_shorten_switches_model_after_non_json_content(self) -> None:
+        from utils.translation import TranslationResponseError, _shorten_9router_segments_with_model_fallback
+
+        with (
+            patch("utils.translation._translation_model_attempts", return_value=["bad-model", "good-model"]),
+            patch(
+                "utils.translation._shorten_9router_segments_cached",
+                side_effect=[
+                    TranslationResponseError("Translation model returned non-JSON content", retryable=False),
+                    ["Câu đã rút gọn đầy đủ."],
+                ],
+            ) as shorten_mock,
+        ):
+            result = _shorten_9router_segments_with_model_fallback(
+                ("Câu đầy đủ cần rút gọn.",),
+                source_texts=("Câu đầy đủ cần rút gọn.",),
+                target_durations=(2.0,),
+                max_words=(6,),
+                target="vi",
+                selected_model="bad-model",
+                base_url="http://localhost:20128/v1",
+                api_key="",
+                timeout=5.0,
+                context="",
+            )
+
+        self.assertEqual(result, ["Câu đã rút gọn đầy đủ."])
+        self.assertEqual([call.args[5] for call in shorten_mock.call_args_list], ["bad-model", "good-model"])
+
     def test_translation_batch_filters_known_repetition_before_gateway_request(self) -> None:
         from utils.translation import _translate_9router_segments_with_model_fallback
 
@@ -303,6 +476,7 @@ class TimelineTranslationTests(unittest.TestCase):
         request_payload = json.loads(urlopen_mock.call_args.args[0].data.decode("utf-8"))
         user_payload = json.loads(request_payload["messages"][1]["content"])
         self.assertEqual(translated, ["Ban dich."])
+        self.assertEqual(request_payload["response_format"], {"type": "json_object"})
         self.assertEqual(user_payload["segments"][0]["start_seconds"], 10.0)
         self.assertEqual(user_payload["segments"][0]["end_seconds"], 12.0)
         self.assertEqual(user_payload["segments"][0]["target_duration_seconds"], 2.0)

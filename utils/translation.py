@@ -14,6 +14,19 @@ from urllib.request import Request, urlopen
 
 logger = logging.getLogger("auto_dubbing.translation")
 
+
+class TranslationResponseError(RuntimeError):
+    """A provider returned an empty or structurally invalid response."""
+
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+class TranslationResponseFormatUnsupported(RuntimeError):
+    """The OpenAI-compatible gateway rejected the JSON response format option."""
+
+
 DEFAULT_9ROUTER_BASE_URL = "http://localhost:20128/v1"
 DEFAULT_TRANSLATION_MODEL = "ag/gemini-3-flash-agent"
 GATEWAY_MODEL_PREFIXES = ("9router/",)
@@ -34,6 +47,7 @@ DEFAULT_TRANSLATION_BATCH_WORDS = 750
 DEFAULT_TRANSLATION_BATCH_CHARS = 12000
 DEFAULT_TRANSLATION_CONCURRENCY = 4
 DEFAULT_TRANSLATION_ATTEMPT_TIMEOUT_SECONDS = 18.0
+DEFAULT_TRANSLATION_RETRIES = 3
 TRANSLATION_CONTEXT_WINDOW = 4
 TRANSLATION_CONTEXT_MAX_CHARS = 2400
 TRANSLATION_POLICY_VERSION = "batch-context-coherence-qa-v2"
@@ -184,14 +198,23 @@ def translate_text(
             exc,
         )
         if (_config_value("AUTODUB_TRANSLATION_FALLBACK") or "google").strip().lower() == "google":
-            fallback = _translate_google_gtx_cached(clean_text, source, target, timeout)
-            return _fallback_if_bad_translation(
-                clean_text,
-                fallback,
-                source=source,
-                target=target,
-                timeout=timeout,
-            )
+            if selected_provider in TRANSLATION_PROVIDERS:
+                try:
+                    fallback = _translate_google_gtx_cached(clean_text, source, target, timeout)
+                    return _fallback_if_bad_translation(
+                        clean_text,
+                        fallback,
+                        source=source,
+                        target=target,
+                        timeout=timeout,
+                    )
+                except Exception as fallback_exc:
+                    logger.warning(
+                        "translation.fallback_exhausted source=%s target=%s error=%s",
+                        source,
+                        target,
+                        fallback_exc,
+                    )
         return clean_text
 
 
@@ -838,18 +861,19 @@ def shorten_segments_for_duration(
         batch_index, batch, batch_sources, batch_durations, batch_limits, batch_intervals = spec
         _raise_if_cancelled(cancel_event)
         try:
-            shortened = _shorten_9router_segments_cached(
+            shortened = _shorten_9router_segments_with_model_fallback(
                 tuple(batch),
-                batch_sources,
-                batch_durations,
-                batch_limits,
-                target,
-                selected_model,
-                _nine_router_base_url(),
-                _nine_router_api_key() or "",
-                _translation_attempt_timeout(timeout),
-                context or "",
-                batch_intervals,
+                source_texts=batch_sources,
+                target_durations=batch_durations,
+                max_words=batch_limits,
+                target=target,
+                selected_model=selected_model,
+                base_url=_nine_router_base_url(),
+                api_key=_nine_router_api_key() or "",
+                timeout=_translation_attempt_timeout(timeout),
+                context=context or "",
+                source_intervals=batch_intervals,
+                cancel_event=cancel_event,
             )
             values = [
                 _enforce_shortened_text(
@@ -918,13 +942,14 @@ def _translate_9router_text_with_model_fallback(
         raise RuntimeError("No 9Router translation models left after failed attempts")
     for model in attempt_models:
         try:
-            return _with_connection_refused_retries(
+            return _with_translation_request_retries(
                 lambda: _translate_9router_cached(text, source, target, model, base_url, api_key, attempt_timeout),
                 model=model,
                 source=source,
                 target=target,
                 batch_size=1,
                 cancel_event=cancel_event,
+                endpoint="9router",
             )
         except Exception as exc:
             last_error = exc
@@ -1020,7 +1045,7 @@ def _translate_9router_segments_with_model_fallback(
         raise RuntimeError("No 9Router translation models left after failed attempts")
     for model in attempt_models:
         try:
-            return _with_connection_refused_retries(
+            return _with_translation_request_retries(
                 lambda: _translate_9router_segments_cached(
                     texts,
                     target_durations,
@@ -1039,6 +1064,7 @@ def _translate_9router_segments_with_model_fallback(
                 target=target,
                 batch_size=len(texts),
                 cancel_event=cancel_event,
+                endpoint="9router",
             )
         except Exception as exc:
             last_error = exc
@@ -1277,21 +1303,32 @@ def _shorten_9router_cached(
             },
         ],
     }
-    request = Request(
-        _api_url(base_url, "chat/completions"),
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=_openai_compatible_headers(api_key),
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-            content_type = response.headers.get("Content-Type", "")
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"9Router shorten request failed with HTTP {exc.code}: {detail}") from exc
+    def request_and_parse(use_json_response_format: bool = True) -> str:
+        request = Request(
+            _api_url(base_url, "chat/completions"),
+            data=json.dumps(_structured_json_payload(payload, use_json_response_format), ensure_ascii=False).encode("utf-8"),
+            headers=_openai_compatible_headers(api_key),
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+                content_type = response.headers.get("Content-Type", "")
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if use_json_response_format and _is_response_format_rejection(detail):
+                raise TranslationResponseFormatUnsupported from exc
+            raise RuntimeError(f"9Router shorten request failed with HTTP {exc.code}: {detail}") from exc
 
-    shortened = _clean_shortened_text(_parse_chat_completion_body(body, content_type))
+        return _clean_shortened_text(_parse_chat_completion_body(body, content_type))
+
+    shortened = _with_structured_json_fallback(
+        request_and_parse,
+        model=model,
+        source="auto",
+        target=target,
+        batch_size=1,
+    )
     logger.info(
         "shorten.done provider=9router model=%s target=%s max_words=%s input_words=%s output_words=%s",
         model,
@@ -1366,24 +1403,39 @@ def _shorten_9router_segments_cached(
             },
         ],
     }
-    request = Request(
-        _api_url(base_url, "chat/completions"),
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=_openai_compatible_headers(api_key),
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-            content_type = response.headers.get("Content-Type", "")
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"9Router batch shorten request failed with HTTP {exc.code}: {detail}") from exc
+    def request_and_parse(use_json_response_format: bool = True) -> list[str]:
+        request = Request(
+            _api_url(base_url, "chat/completions"),
+            data=json.dumps(_structured_json_payload(payload, use_json_response_format), ensure_ascii=False).encode("utf-8"),
+            headers=_openai_compatible_headers(api_key),
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+                content_type = response.headers.get("Content-Type", "")
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if use_json_response_format and _is_response_format_rejection(detail):
+                raise TranslationResponseFormatUnsupported from exc
+            raise RuntimeError(f"9Router batch shorten request failed with HTTP {exc.code}: {detail}") from exc
 
-    content = _parse_chat_completion_body(body, content_type).strip()
-    shortened = _parse_translation_response(content, expected_count=len(texts))
-    if len(shortened) != len(texts):
-        raise ValueError(f"Expected {len(texts)} shortened segments, got {len(shortened)}")
+        content = _parse_chat_completion_body(body, content_type).strip()
+        shortened = _parse_translation_response(content, expected_count=len(texts))
+        if len(shortened) != len(texts):
+            raise TranslationResponseError(
+                f"Expected {len(texts)} shortened segments, got {len(shortened)}",
+                retryable=False,
+            )
+        return shortened
+
+    shortened = _with_structured_json_fallback(
+        request_and_parse,
+        model=model,
+        source="auto",
+        target=target,
+        batch_size=len(texts),
+    )
     logger.info(
         "shorten.done provider=9router_batch model=%s target=%s segments=%s input_words=%s output_words=%s",
         model,
@@ -1393,6 +1445,56 @@ def _shorten_9router_segments_cached(
         sum(_count_words(text) for text in shortened),
     )
     return shortened
+
+
+def _shorten_9router_segments_with_model_fallback(
+    texts: tuple[str, ...],
+    *,
+    source_texts: tuple[str, ...],
+    target_durations: tuple[float, ...],
+    max_words: tuple[int, ...],
+    target: str,
+    selected_model: str,
+    base_url: str,
+    api_key: str,
+    timeout: float,
+    context: str,
+    source_intervals: tuple[tuple[float, float], ...] = (),
+    cancel_event: Event | None = None,
+) -> list[str]:
+    """Use the next model when a batch cannot produce a valid structured result."""
+    failed_models: set[str] = set()
+    last_error: Exception | None = None
+    _raise_if_cancelled(cancel_event)
+    for attempt_model in _translation_model_attempts(selected_model, failed_models=failed_models):
+        try:
+            return _shorten_9router_segments_cached(
+                texts,
+                source_texts,
+                target_durations,
+                max_words,
+                target,
+                attempt_model,
+                base_url,
+                api_key,
+                timeout,
+                context,
+                source_intervals,
+            )
+        except Exception as exc:
+            last_error = exc
+            _remember_failed_translation_model(attempt_model, failed_models)
+            logger.warning(
+                "shorten.batch_model_attempt_failed model=%s target=%s batch_size=%s error=%s",
+                attempt_model,
+                target,
+                len(texts),
+                exc,
+            )
+            _raise_if_cancelled(cancel_event)
+    if last_error is not None:
+        raise last_error
+    return list(texts)
 
 
 def _review_9router_segments_with_model_fallback(
@@ -1410,11 +1512,11 @@ def _review_9router_segments_with_model_fallback(
     cancel_event: Event | None = None,
 ) -> list[str]:
     last_error: Exception | None = None
+    failed_models: set[str] = set()
     _raise_if_cancelled(cancel_event)
-    # Coherence QA is an optional polish pass. The primary translation has
-    # already succeeded, so do not multiply latency with model fallbacks or
-    # recursive per-line retries when the gateway is slow.
-    for attempt_model in (selected_model,):
+    # Coherence QA is optional, but a provider that cannot return the required
+    # structure should not discard the whole polish pass immediately.
+    for attempt_model in _translation_model_attempts(selected_model, failed_models=failed_models):
         try:
             return _review_9router_segments_cached(
                 texts,
@@ -1430,6 +1532,7 @@ def _review_9router_segments_with_model_fallback(
             )
         except Exception as exc:
             last_error = exc
+            _remember_failed_translation_model(attempt_model, failed_models)
             logger.warning(
                 "translation.coherence.model_attempt_failed model=%s target=%s batch_size=%s error=%s",
                 attempt_model,
@@ -1527,24 +1630,39 @@ def _review_9router_segments_cached(
             },
         ],
     }
-    request = Request(
-        _api_url(base_url, "chat/completions"),
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=_openai_compatible_headers(api_key),
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-            content_type = response.headers.get("Content-Type", "")
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"9Router coherence review failed with HTTP {exc.code}: {detail}") from exc
+    def request_and_parse(use_json_response_format: bool = True) -> list[str]:
+        request = Request(
+            _api_url(base_url, "chat/completions"),
+            data=json.dumps(_structured_json_payload(payload, use_json_response_format), ensure_ascii=False).encode("utf-8"),
+            headers=_openai_compatible_headers(api_key),
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+                content_type = response.headers.get("Content-Type", "")
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if use_json_response_format and _is_response_format_rejection(detail):
+                raise TranslationResponseFormatUnsupported from exc
+            raise RuntimeError(f"9Router coherence review failed with HTTP {exc.code}: {detail}") from exc
 
-    content = _parse_chat_completion_body(body, content_type).strip()
-    reviewed = _parse_translation_response(content, expected_count=len(texts))
-    if len(reviewed) != len(texts):
-        raise ValueError(f"Expected {len(texts)} coherence results, got {len(reviewed)}")
+        content = _parse_chat_completion_body(body, content_type).strip()
+        reviewed = _parse_translation_response(content, expected_count=len(texts))
+        if len(reviewed) != len(texts):
+            raise TranslationResponseError(
+                f"Expected {len(texts)} coherence results, got {len(reviewed)}",
+                retryable=False,
+            )
+        return reviewed
+
+    reviewed = _with_structured_json_fallback(
+        request_and_parse,
+        model=model,
+        source="auto",
+        target=target,
+        batch_size=len(texts),
+    )
     logger.info(
         "translation.coherence.done provider=9router_batch model=%s target=%s segments=%s",
         model,
@@ -1650,24 +1768,39 @@ def _translate_9router_segments_cached(
             },
         ],
     }
-    request = Request(
-        _api_url(base_url, "chat/completions"),
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=_openai_compatible_headers(api_key),
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8")
-            content_type = response.headers.get("Content-Type", "")
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"9Router batch request failed with HTTP {exc.code}: {detail}") from exc
+    def request_and_parse(use_json_response_format: bool = True) -> list[str]:
+        request = Request(
+            _api_url(base_url, "chat/completions"),
+            data=json.dumps(_structured_json_payload(payload, use_json_response_format), ensure_ascii=False).encode("utf-8"),
+            headers=_openai_compatible_headers(api_key),
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8")
+                content_type = response.headers.get("Content-Type", "")
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            if use_json_response_format and _is_response_format_rejection(detail):
+                raise TranslationResponseFormatUnsupported from exc
+            raise RuntimeError(f"9Router batch request failed with HTTP {exc.code}: {detail}") from exc
 
-    content = _parse_chat_completion_body(body, content_type).strip()
-    translated = _parse_translation_response(content, expected_count=len(texts))
-    if len(translated) != len(texts):
-        raise ValueError(f"Expected {len(texts)} translations, got {len(translated)}")
+        content = _parse_chat_completion_body(body, content_type).strip()
+        translated = _parse_translation_response(content, expected_count=len(texts))
+        if len(translated) != len(texts):
+            raise TranslationResponseError(
+                f"Expected {len(texts)} translations, got {len(translated)}",
+                retryable=False,
+            )
+        return translated
+
+    translated = _with_structured_json_fallback(
+        request_and_parse,
+        model=model,
+        source=source,
+        target=target,
+        batch_size=len(texts),
+    )
 
     logger.info(
         "translation.done provider=9router_batch model=%s source=%s target=%s segments=%s input_len=%s output_len=%s",
@@ -1682,15 +1815,27 @@ def _translate_9router_segments_cached(
 
 
 def _parse_chat_completion_body(body: str, content_type: str) -> str:
+    if not body or not body.strip():
+        raise TranslationResponseError("9Router returned an empty response body")
     if "text/event-stream" in content_type or body.lstrip().startswith("data:"):
-        return _parse_chat_completion_sse(body)
+        content = _parse_chat_completion_sse(body).strip()
+        if not content:
+            raise TranslationResponseError("9Router returned an empty streaming response")
+        return content
 
-    payload = json.loads(body)
-    return (
-        payload.get("choices", [{}])[0]
-        .get("message", {})
-        .get("content", "")
-    )
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise TranslationResponseError("9Router returned a non-JSON response body") from exc
+    if not isinstance(payload, dict):
+        raise TranslationResponseError("9Router response body is not a JSON object")
+    try:
+        content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+    except (AttributeError, IndexError, KeyError, TypeError) as exc:
+        raise TranslationResponseError("9Router response has no valid message content") from exc
+    if not isinstance(content, str) or not content.strip():
+        raise TranslationResponseError("9Router response has empty message content")
+    return content
 
 
 def _parse_chat_completion_sse(body: str) -> str:
@@ -1718,23 +1863,31 @@ def _parse_chat_completion_sse(body: str) -> str:
 
 def _parse_translation_response(content: str, *, expected_count: int | None = None) -> list[str]:
     clean = content.strip()
+    if not clean:
+        raise TranslationResponseError("Translation model returned empty content")
     if clean.startswith("```"):
         clean = re.sub(r"^```(?:json)?\s*", "", clean, flags=re.IGNORECASE)
         clean = re.sub(r"\s*```$", "", clean)
 
     try:
         parsed = json.loads(clean)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
         start = clean.find("[")
         end = clean.rfind("]")
         if start == -1 or end == -1 or end <= start:
-            raise
-        parsed = json.loads(clean[start : end + 1])
+            raise TranslationResponseError("Translation model returned non-JSON content", retryable=False) from exc
+        try:
+            parsed = json.loads(clean[start : end + 1])
+        except json.JSONDecodeError as nested_exc:
+            raise TranslationResponseError(
+                "Translation model returned malformed JSON content",
+                retryable=False,
+            ) from nested_exc
 
     if isinstance(parsed, dict):
         parsed = parsed.get("translations") or parsed.get("segments") or parsed.get("items")
     if not isinstance(parsed, list):
-        raise ValueError("Translation response is not a JSON array")
+        raise TranslationResponseError("Translation response is not a JSON array", retryable=False)
 
     if parsed and all(isinstance(item, dict) for item in parsed):
         return _translation_texts_from_objects(parsed, expected_count=expected_count)
@@ -1813,10 +1966,33 @@ def _translate_google_gtx_cached(text: str, source: str, target: str, timeout: f
         f"https://translate.googleapis.com/translate_a/single?{params}",
         headers={"User-Agent": "Mozilla/5.0"},
     )
-    with urlopen(request, timeout=timeout) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    def request_and_parse() -> str:
+        with urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+        if not body.strip():
+            raise TranslationResponseError("Google GTX returned an empty response")
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise TranslationResponseError("Google GTX returned non-JSON response") from exc
+        if not isinstance(payload, list) or not payload or not isinstance(payload[0], list):
+            raise TranslationResponseError("Google GTX returned an invalid translation shape")
+        try:
+            translated = "".join(part[0] for part in payload[0] if isinstance(part, list) and part and part[0])
+        except (IndexError, KeyError, TypeError) as exc:
+            raise TranslationResponseError("Google GTX returned an invalid translation shape") from exc
+        if not translated.strip():
+            raise TranslationResponseError("Google GTX returned empty translated text")
+        return translated.strip()
 
-    translated = "".join(part[0] for part in payload[0] if part and part[0])
+    translated = _with_translation_request_retries(
+        request_and_parse,
+        model="google-gtx",
+        source=source,
+        target=target,
+        batch_size=1,
+        endpoint="google_gtx",
+    )
     logger.info(
         "translation.done provider=google_gtx source=%s target=%s input_len=%s output_len=%s",
         source,
@@ -1824,7 +2000,7 @@ def _translate_google_gtx_cached(text: str, source: str, target: str, timeout: f
         len(text),
         len(translated),
     )
-    return translated.strip() or text
+    return translated or text
 
 
 def _translation_batches(
@@ -2120,12 +2296,13 @@ def _looks_fragmentary_translation(
     if not clean:
         return True
 
-    if clean[-1] in ",;:，；：":
-        return True
-
     source = source_text.strip()
     original = original_text.strip()
     source_or_original = source or original
+    source_is_fragment = bool(re.search(r"[,;:，；：]\s*$", source_or_original))
+    if clean[-1] in ",;:，；：" and not source_is_fragment:
+        return True
+
     source_is_question = bool(re.search(r"[?？]\s*$", source_or_original))
     source_is_exclamation = bool(re.search(r"[!！]\s*$", source_or_original))
     candidate_has_question = bool(re.search(r"[?？]\s*$", clean))
@@ -2326,7 +2503,7 @@ def _raise_if_cancelled(cancel_event: Event | None) -> None:
         raise RuntimeError("Translation cancelled")
 
 
-def _with_connection_refused_retries(
+def _with_translation_request_retries(
     operation,
     *,
     model: str,
@@ -2334,19 +2511,26 @@ def _with_connection_refused_retries(
     target: str,
     batch_size: int,
     cancel_event: Event | None = None,
+    endpoint: str = "9router",
 ):
-    retries = _env_int("AUTODUB_TRANSLATION_CONNECTION_REFUSED_RETRIES", 2, minimum=0, maximum=8)
+    # Keep the existing setting name for backwards compatibility. It now
+    # covers connection resets and empty/malformed provider responses too.
+    retries = _env_int(
+        "AUTODUB_TRANSLATION_CONNECTION_REFUSED_RETRIES",
+        DEFAULT_TRANSLATION_RETRIES,
+        minimum=0,
+        maximum=DEFAULT_TRANSLATION_RETRIES,
+    )
     for attempt in range(retries + 1):
         try:
             _raise_if_cancelled(cancel_event)
             return operation()
         except Exception as exc:
-            if not _is_connection_refused_error(exc) or attempt >= retries:
-                if _is_connection_refused_error(exc):
+            if not _is_translation_request_retryable(exc) or attempt >= retries:
+                if _is_translation_request_retryable(exc):
                     logger.error(
-                        "translation.connection_refused_exhausted cause=9router_unreachable base_url=%s hint=%s model=%s source=%s target=%s batch_size=%s attempts=%s error=%s",
-                        _nine_router_base_url(),
-                        "No service is listening on the configured 9Router/OpenAI-compatible endpoint.",
+                        "translation.request_retries_exhausted endpoint=%s model=%s source=%s target=%s batch_size=%s attempts=%s error=%s",
+                        endpoint,
                         model,
                         source,
                         target,
@@ -2358,9 +2542,8 @@ def _with_connection_refused_retries(
 
             delay = _connection_refused_retry_delay(attempt)
             logger.warning(
-                "translation.connection_refused_retry cause=9router_unreachable base_url=%s hint=%s model=%s source=%s target=%s batch_size=%s attempt=%s retries=%s delay=%.2f error=%s",
-                _nine_router_base_url(),
-                "Auto-starting 9Router gateway...",
+                "translation.request_retry endpoint=%s model=%s source=%s target=%s batch_size=%s attempt=%s retries=%s delay=%.2f error=%s",
+                endpoint,
                 model,
                 source,
                 target,
@@ -2370,11 +2553,12 @@ def _with_connection_refused_retries(
                 delay,
                 exc,
             )
-            try:
-                from utils.ninerouter import ensure_9router_running
-                ensure_9router_running(_nine_router_base_url())
-            except Exception as auto_err:
-                logger.warning("translation.autostart_9router_failed error=%s", auto_err)
+            if endpoint == "9router":
+                try:
+                    from utils.ninerouter import ensure_9router_running
+                    ensure_9router_running(_nine_router_base_url())
+                except Exception as auto_err:
+                    logger.warning("translation.autostart_9router_failed error=%s", auto_err)
             deadline = time.monotonic() + delay
             while True:
                 _raise_if_cancelled(cancel_event)
@@ -2383,6 +2567,68 @@ def _with_connection_refused_retries(
                     break
                 time.sleep(min(0.2, remaining))
     raise RuntimeError("unreachable translation retry state")
+
+
+def _is_translation_request_retryable(exc: BaseException) -> bool:
+    if isinstance(exc, TranslationResponseError):
+        return exc.retryable
+    if isinstance(exc, HTTPError):
+        return exc.code in {408, 425, 429, 500, 502, 503, 504}
+    if isinstance(exc, (ConnectionError, TimeoutError, OSError)):
+        return True
+    if isinstance(exc, URLError):
+        return True
+    return _is_connection_refused_error(exc)
+
+
+def _with_structured_json_fallback(
+    operation,
+    *,
+    model: str,
+    source: str,
+    target: str,
+    batch_size: int,
+    cancel_event: Event | None = None,
+):
+    """Prefer enforced JSON, then retry compatibly without it if unsupported."""
+    request_kwargs = {
+        "model": model,
+        "source": source,
+        "target": target,
+        "batch_size": batch_size,
+        "cancel_event": cancel_event,
+        "endpoint": "9router",
+    }
+    try:
+        return _with_translation_request_retries(
+            lambda: operation(True),
+            **request_kwargs,
+        )
+    except TranslationResponseFormatUnsupported:
+        logger.warning(
+            "translation.response_format_unsupported model=%s target=%s batch_size=%s fallback=prompt_json",
+            model,
+            target,
+            batch_size,
+        )
+        return _with_translation_request_retries(
+            lambda: operation(False),
+            **request_kwargs,
+        )
+
+
+def _structured_json_payload(payload: dict, use_json_response_format: bool) -> dict:
+    request_payload = dict(payload)
+    if use_json_response_format:
+        request_payload["response_format"] = {"type": "json_object"}
+    return request_payload
+
+
+def _is_response_format_rejection(detail: str) -> bool:
+    lowered = detail.casefold()
+    return "response_format" in lowered or (
+        "json_object" in lowered and any(marker in lowered for marker in ("unsupported", "not support", "invalid"))
+    )
 
 
 def _connection_refused_retry_delay(attempt: int) -> float:
