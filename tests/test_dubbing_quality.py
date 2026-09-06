@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import subprocess
@@ -8,6 +9,7 @@ import time
 import unittest
 import wave
 from pathlib import Path
+from urllib.error import HTTPError
 from unittest.mock import MagicMock, patch
 
 from app.models.schemas import DubbingScriptSegment, PipelineConfig, TranscriptSegment, WordTimestamp
@@ -399,6 +401,54 @@ class TimelineTranslationTests(unittest.TestCase):
 
         self.assertEqual([len(batch) for batch in batches], [1, 2])
 
+    def test_translation_context_is_small_and_request_batch_has_a_gateway_ceiling(self) -> None:
+        from utils.translation import _bounded_translation_batch_size, _build_batch_continuity_context
+
+        source = [f"Câu nguồn {index} nói về cảnh phim." for index in range(12)]
+        context = _build_batch_continuity_context(source, batch_start=4, batch_end=8)
+
+        self.assertLessEqual(len(context), 1400)
+        self.assertIn("Câu nguồn 2", context)
+        self.assertIn("Câu nguồn 3", context)
+        self.assertIn("Câu nguồn 8", context)
+        self.assertIn("Câu nguồn 9", context)
+        self.assertNotIn("Câu nguồn 1", context)
+        self.assertNotIn("Câu nguồn 10", context)
+        self.assertEqual(_bounded_translation_batch_size(24), 16)
+
+    def test_large_batch_timeout_splits_before_fallback_model_attempts(self) -> None:
+        from utils.translation import _is_timeout_error, _translate_9router_segments_with_model_fallback
+
+        calls: list[tuple[tuple[str, ...], str]] = []
+
+        def timeout_batch(texts, *args, **kwargs):
+            calls.append((texts, kwargs.get("model", args[3] if len(args) > 3 else "")))
+            raise TimeoutError("timed out")
+
+        with (
+            patch("utils.translation._translate_9router_segments_cached", side_effect=timeout_batch),
+            patch("utils.translation._translation_model_attempts", return_value=["slow-model", "fallback-model"]),
+            patch("utils.translation._connection_refused_retry_delay", return_value=0.0),
+        ):
+            with self.assertRaises(TimeoutError):
+                _translate_9router_segments_with_model_fallback(
+                    ("one", "two", "three", "four"),
+                    target_durations=(1.0, 1.0, 1.0, 1.0),
+                    source_intervals=((0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 4.0)),
+                    source="zh",
+                    target="vi",
+                    selected_model="slow-model",
+                    base_url="http://localhost:20128/v1",
+                    api_key="",
+                    timeout=5.0,
+                )
+
+        # The first request cycle exhausts retries for the large batch.  A
+        # fallback model must not be tried until the payload has been split.
+        self.assertEqual(calls[0], (('one', 'two', 'three', 'four'), "slow-model"))
+        self.assertEqual(calls[4][1], "slow-model")
+        self.assertTrue(_is_timeout_error(HTTPError("http://9router", 504, "gateway timeout", {}, None)))
+
     def test_translation_batches_run_concurrently_but_restore_source_order(self) -> None:
         calls: list[tuple[str, ...]] = []
 
@@ -470,6 +520,7 @@ class TimelineTranslationTests(unittest.TestCase):
                 "http://localhost:20128/v1",
                 "",
                 5.0,
+                "Previous source context: scene setup",
                 source_intervals=((10.0, 12.0),),
             )
 
@@ -477,6 +528,8 @@ class TimelineTranslationTests(unittest.TestCase):
         user_payload = json.loads(request_payload["messages"][1]["content"])
         self.assertEqual(translated, ["Ban dich."])
         self.assertEqual(request_payload["response_format"], {"type": "json_object"})
+        self.assertEqual(request_payload["max_tokens"], 512)
+        self.assertEqual(user_payload["continuity_context"], "Previous source context: scene setup")
         self.assertEqual(user_payload["segments"][0]["start_seconds"], 10.0)
         self.assertEqual(user_payload["segments"][0]["end_seconds"], 12.0)
         self.assertEqual(user_payload["segments"][0]["target_duration_seconds"], 2.0)
@@ -535,7 +588,8 @@ class TimelineTranslationTests(unittest.TestCase):
             "Đoạn 1 đã được nối mạch.",
             "Đoạn 0 đã được nối mạch.",
         ])
-        self.assertIn("Following translated context", requests[0]["messages"][0]["content"])
+        first_review_payload = json.loads(requests[0]["messages"][1]["content"])
+        self.assertIn("Following translated context", first_review_payload["continuity_context"])
 
     def test_timing_review_batches_all_over_budget_segments_once(self) -> None:
         segments = [
@@ -713,6 +767,118 @@ class AtomicCacheTests(unittest.TestCase):
             self.assertEqual(list(root.glob("*.tmp")), [])
 
 
+class FFmpegMonitorTests(unittest.TestCase):
+    def test_progress_time_parser_and_duration_scaled_timeout(self) -> None:
+        from app.services.pipeline import _parse_ffmpeg_progress_time
+
+        pipeline = _pipeline()
+        config = pipeline._ffmpeg_monitor_config(551.34)
+
+        self.assertAlmostEqual(_parse_ffmpeg_progress_time("00:01:02.500000") or 0.0, 62.5)
+        self.assertIsNone(_parse_ffmpeg_progress_time("not-a-time"))
+        self.assertEqual(config.heartbeat_seconds, 15.0)
+        self.assertAlmostEqual(config.hard_timeout_seconds, 1654.02)
+
+    def test_render_watchdog_terminates_a_stalled_ffmpeg_process(self) -> None:
+        from app.services.pipeline import _FFmpegMonitorConfig
+
+        class HungProcess:
+            pid = 1234
+
+            def __init__(self) -> None:
+                self.stdout = io.StringIO("")
+                self.stderr = io.StringIO("render blocked\n")
+                self.return_code = None
+                self.terminated = False
+
+            def poll(self):
+                return self.return_code
+
+            def terminate(self) -> None:
+                self.terminated = True
+                self.return_code = -15
+
+            def wait(self, timeout=None):
+                return self.return_code
+
+            def kill(self) -> None:
+                self.return_code = -9
+
+        pipeline = _pipeline()
+        process = HungProcess()
+        command = MagicMock()
+        command.compile.return_value = ["ffmpeg", "-i", "input.mp4", "output.mp4"]
+        monitor_config = _FFmpegMonitorConfig(
+            heartbeat_seconds=30.0,
+            stall_seconds=0.0,
+            finalize_seconds=0.0,
+            hard_timeout_seconds=60.0,
+        )
+
+        with (
+            patch.object(pipeline, "_ffmpeg_monitor_config", return_value=monitor_config),
+            patch("app.services.pipeline.subprocess.Popen", return_value=process) as popen,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "FFmpeg render stalled"):
+                pipeline._run_ffmpeg_command(command, "render", expected_duration=10.0)
+
+        self.assertTrue(process.terminated)
+        arguments = popen.call_args.args[0]
+        self.assertEqual(
+            arguments[:5],
+            ["ffmpeg", "-progress", "pipe:1", "-nostats", "-nostdin"],
+        )
+
+    def test_render_monitor_publishes_durable_progress_event(self) -> None:
+        from app.services.pipeline import _FFmpegMonitorConfig
+
+        class CompletedProcess:
+            pid = 5678
+
+            def __init__(self) -> None:
+                self.stdout = io.StringIO(
+                    "frame=100\n"
+                    "fps=25.0\n"
+                    "out_time=00:00:05.000000\n"
+                    "speed=1.0x\n"
+                    "progress=end\n"
+                )
+                self.stderr = io.StringIO("")
+                self.poll_count = 0
+
+            def poll(self):
+                self.poll_count += 1
+                return 0 if self.poll_count >= 5 else None
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self) -> None:
+                raise AssertionError("completed FFmpeg process must not be terminated")
+
+        pipeline = _pipeline()
+        runtime_events = []
+        pipeline.set_runtime_event_callback(runtime_events.append)
+        command = MagicMock()
+        command.compile.return_value = ["ffmpeg", "-i", "input.mp4", "output.mp4"]
+        monitor_config = _FFmpegMonitorConfig(
+            heartbeat_seconds=0.0,
+            stall_seconds=60.0,
+            finalize_seconds=60.0,
+            hard_timeout_seconds=120.0,
+        )
+
+        with (
+            patch.object(pipeline, "_ffmpeg_monitor_config", return_value=monitor_config),
+            patch("app.services.pipeline.subprocess.Popen", return_value=CompletedProcess()),
+        ):
+            pipeline._run_ffmpeg_command(command, "render", expected_duration=10.0)
+
+        rendered = [event for event in runtime_events if event.get("phase") == "render"]
+        self.assertTrue(rendered)
+        self.assertTrue(any(event["stats"]["render_percent"] == 50.0 for event in rendered))
+
+
 class AudioGraphTests(unittest.TestCase):
     def test_separation_extracts_full_band_stereo_instead_of_asr_mono(self) -> None:
         pipeline = _pipeline(vocal_separation=True)
@@ -793,8 +959,9 @@ class AudioGraphTests(unittest.TestCase):
 
             captured = {}
 
-            def capture(command, stage):
+            def capture(command, stage, **kwargs):
                 captured["args"] = command.compile()
+                captured["expected_duration"] = kwargs.get("expected_duration")
 
             with patch.object(pipeline, "_run_ffmpeg_command", side_effect=capture):
                 pipeline._render_video(video, root / "unused.srt", tts, output, accompaniment_path=accompaniment)
@@ -804,9 +971,10 @@ class AudioGraphTests(unittest.TestCase):
         self.assertIn("ratio=12", graph)
         self.assertIn("volume=0.92", graph)
         self.assertIn("alimiter", graph)
-        self.assertIn("-preset superfast", graph)
-        self.assertIn("-crf 22", graph)
+        self.assertIn("-vcodec copy", graph)
+        self.assertNotIn("-preset", graph)
         self.assertIn("-movflags +faststart", graph)
+        self.assertIsNone(captured["expected_duration"])
 
     def test_source_mix_respects_original_vocal_and_accompaniment_gains(self) -> None:
         pipeline = _pipeline(
@@ -830,7 +998,7 @@ class AudioGraphTests(unittest.TestCase):
             with patch.object(
                 pipeline,
                 "_run_ffmpeg_command",
-                side_effect=lambda command, stage: captured.update(args=command.compile()),
+                side_effect=lambda command, stage, **_kwargs: captured.update(args=command.compile()),
             ):
                 pipeline._render_video(
                     video,
@@ -914,7 +1082,7 @@ class AudioGraphTests(unittest.TestCase):
         self.assertIn("inputs=2", graph)
 
     def test_invalid_x264_settings_fall_back_to_safe_defaults(self) -> None:
-        pipeline = _pipeline(burn_subtitles=False)
+        pipeline = _pipeline(burn_subtitles=True)
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             video = root / "video.mp4"
@@ -927,12 +1095,16 @@ class AudioGraphTests(unittest.TestCase):
             with (
                 patch.dict(
                     "os.environ",
-                    {"AUTODUB_X264_PRESET": "invalid", "AUTODUB_X264_CRF": "invalid"},
+                    {
+                        "AUTODUB_VIDEO_ENCODER": "libx264",
+                        "AUTODUB_X264_PRESET": "invalid",
+                        "AUTODUB_X264_CRF": "invalid",
+                    },
                 ),
                 patch.object(
                     pipeline,
                     "_run_ffmpeg_command",
-                    side_effect=lambda command, stage: captured.update(args=command.compile()),
+                    side_effect=lambda command, stage, **_kwargs: captured.update(args=command.compile()),
                 ),
             ):
                 pipeline._render_video(video, root / "unused.srt", tts, output)
@@ -955,7 +1127,7 @@ class AudioGraphTests(unittest.TestCase):
             with patch.object(
                 pipeline,
                 "_run_ffmpeg_command",
-                side_effect=lambda command, stage: captured.update(args=command.compile()),
+                side_effect=lambda command, stage, **_kwargs: captured.update(args=command.compile()),
             ):
                 pipeline._render_video(video, root / "unused.srt", tts, output)
 
@@ -1029,6 +1201,63 @@ class AudioGraphTests(unittest.TestCase):
             )
 
             pipeline._render_video(video, root / "unused.srt", tts, output, accompaniment_path=accompaniment)
+
+            self.assertTrue(output.is_file())
+            self.assertGreater(output.stat().st_size, 0)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "FFmpeg executable is required")
+    def test_subtitle_and_audio_graph_executes_with_qsv_when_available(self) -> None:
+        from app.services.dependency_service import DependencyService
+        from app.utils.video_encoder import hardware_encoder_usable
+
+        ffmpeg_binary = DependencyService().resolve_binary("ffmpeg") or "ffmpeg"
+        if not hardware_encoder_usable(ffmpeg_binary, "h264_qsv"):
+            self.skipTest("Intel Quick Sync encoder is unavailable")
+
+        pipeline = _pipeline(burn_subtitles=True, vocal_separation=True)
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as temp_dir:
+            root = Path(temp_dir)
+            video = root / "video.mp4"
+            tts = root / "tts.wav"
+            accompaniment = root / "accompaniment.wav"
+            subtitle = root / "subtitle.srt"
+            output = root / "output.mp4"
+            quiet = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "check": True}
+            subprocess.run(
+                [
+                    ffmpeg_binary, "-y",
+                    "-f", "lavfi", "-i", "color=c=black:s=320x180:r=25:d=1",
+                    "-f", "lavfi", "-i", "sine=frequency=220:duration=1",
+                    "-shortest", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                    str(video),
+                ],
+                **quiet,
+            )
+            subprocess.run(
+                [ffmpeg_binary, "-y", "-f", "lavfi", "-i", "sine=frequency=880:duration=1", str(tts)],
+                **quiet,
+            )
+            subprocess.run(
+                [
+                    ffmpeg_binary, "-y", "-f", "lavfi", "-i", "sine=frequency=330:duration=1",
+                    str(accompaniment),
+                ],
+                **quiet,
+            )
+            subtitle.write_text(
+                "1\n00:00:00,000 --> 00:00:00,800\nBản dịch thử nghiệm\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict("os.environ", {"AUTODUB_VIDEO_ENCODER": "h264_qsv"}, clear=False):
+                pipeline._render_video(
+                    video,
+                    subtitle,
+                    tts,
+                    output,
+                    video_duration=1.0,
+                    accompaniment_path=accompaniment,
+                )
 
             self.assertTrue(output.is_file())
             self.assertGreater(output.stat().st_size, 0)

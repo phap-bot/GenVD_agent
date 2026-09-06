@@ -204,7 +204,10 @@ class RenderJobRunnerTests(unittest.TestCase):
 
             class SuccessfulPipeline:
                 def __init__(self, _config):
-                    pass
+                    self.runtime_event_callback = None
+
+                def set_runtime_event_callback(self, callback):
+                    self.runtime_event_callback = callback
 
                 def render_script(self, workspace, source_video_path, script_segments):
                     self.assert_source = source_video_path
@@ -214,6 +217,12 @@ class RenderJobRunnerTests(unittest.TestCase):
                         "progress": 60,
                         "stats": {"chunks": 1, "groups": 1},
                     }) + "\n\n"
+                    self.runtime_event_callback({
+                        "status": "processing",
+                        "phase": "render",
+                        "progress": 97,
+                        "stats": {"render_percent": 50.0},
+                    })
                     output = workspace.output_dir / f"{workspace.request_id}_script_dubbed.mp4"
                     output.write_bytes(b"rendered")
                     yield "data: " + json.dumps({
@@ -223,14 +232,16 @@ class RenderJobRunnerTests(unittest.TestCase):
                         "video_url": f"/media/{output.name}",
                     }) + "\n\n"
 
+            callback_events = []
             with patch("app.services.render_job_service.AutoDubbingPipeline", SuccessfulPipeline):
-                result = RenderJobRunner(store).run(job_id, attempt)
+                result = RenderJobRunner(store).run(job_id, attempt, state_callback=callback_events.append)
 
             manifest = store.read_manifest(job_id)
             self.assertEqual(result["status"], "complete")
             self.assertEqual(manifest["status"], "complete")
             self.assertEqual(manifest["completed_groups"], 1)
             self.assertTrue(store.output_path(job_id).is_file())
+            self.assertTrue(any(event.get("progress") == 97 for event in callback_events))
 
     def test_failed_attempt_keeps_workspace_and_can_resume(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
