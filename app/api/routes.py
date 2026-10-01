@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from app.models.schemas import (
     AnalyzeResponse,
@@ -36,7 +37,7 @@ from app.services.voice_reference_service import (
     VoiceReferenceService,
     VoiceReferenceValidationError,
 )
-from app.utils.cancel import PipelineCancelledError
+from app.utils.cancel import ACTIVE_OPERATIONS, PipelineCancelledError, schedule_process_termination
 from app.utils.files import UploadSizeLimitError, safe_filename, save_upload_file, save_upload_file_limited
 from app.utils.vram import VRAMManager
 from app.utils.workspace import WorkspaceManager
@@ -49,6 +50,11 @@ compat_router = APIRouter(prefix="/api", tags=["dubbing-compat"])
 stream_router = APIRouter(prefix="/api", tags=["dubbing-stream"])
 logger = logging.getLogger("auto_dubbing.routes")
 STREAM_WORKER_JOIN_TIMEOUT_SECONDS = 5.0
+
+
+class CancelOperationRequest(BaseModel):
+    request_id: str | None = None
+    hard: bool = True
 
 
 REMOTE_ASR_PROVIDERS = {"9router", "remote", "openai-compatible", "openai_compatible", "gemini"}
@@ -197,6 +203,10 @@ def _config_from_form(
     ocr_model: str = "gemini/gemini-2.5-flash",
     ocr_interval_seconds: float = 0.75,
     ocr_crop_bottom_ratio: float = 0.35,
+    flash_text_enabled: bool = False,
+    flash_text_mode: str = "balanced",
+    flash_text_min_confidence: float = 0.58,
+    flash_text_max_duration_s: float = 3.0,
     copyright_confirmed: bool = False,
     copyright_source: str = "unknown",
     copyright_notes: str = "",
@@ -269,6 +279,10 @@ def _config_from_form(
         ocr_model=resolved_ocr_model,
         ocr_interval_seconds=ocr_interval_seconds,
         ocr_crop_bottom_ratio=ocr_crop_bottom_ratio,
+        flash_text_enabled=flash_text_enabled,
+        flash_text_mode=flash_text_mode if flash_text_mode in {"balanced", "strict"} else "balanced",
+        flash_text_min_confidence=max(0.2, min(0.98, flash_text_min_confidence)),
+        flash_text_max_duration_s=max(0.1, min(10.0, flash_text_max_duration_s)),
         vocal_separation=vocal_separation,
         original_vocal_gain=original_vocal_gain,
         accompaniment_gain=accompaniment_gain,
@@ -316,6 +330,7 @@ def _dubbing_response(result) -> DubbingResponse:
         output_video_path=str(result.output_video_path),
         subtitle_path=str(result.subtitle_path) if result.subtitle_path else None,
         segments_count=len(result.segments),
+        caption_suggestions=result.caption_suggestions,
     )
 
 
@@ -336,6 +351,7 @@ def _streaming_pipeline_response(request: Request, workspace_manager: WorkspaceM
     event_queue: queue.Queue[tuple[str, str | None]] = queue.Queue()
     errors: list[BaseException] = []
     request_id = getattr(workspace, "request_id", "unknown")
+    ACTIVE_OPERATIONS.register(request_id, cancel_event, "pipeline-stream")
 
     def worker() -> None:
         logger.info("stream.worker.start request_id=%s", request_id)
@@ -357,6 +373,7 @@ def _streaming_pipeline_response(request: Request, workspace_manager: WorkspaceM
             errors.append(exc)
         finally:
             event_queue.put(("done", None))
+            ACTIVE_OPERATIONS.unregister(request_id)
             logger.info("stream.worker.done request_id=%s cancelled=%s", request_id, cancel_event.is_set())
 
     thread = threading.Thread(target=worker, daemon=True, name=f"autodub-stream-{request_id}")
@@ -413,7 +430,11 @@ def _streaming_pipeline_response(request: Request, workspace_manager: WorkspaceM
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "X-Operation-ID": request_id,
+        },
     )
 
 
@@ -436,7 +457,7 @@ def _render_job_streaming_response(
                 yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
 
             manifest = await asyncio.to_thread(dispatcher.store.read_manifest, submission.job_id)
-            terminal = manifest.get("status") in {"complete", "failed"}
+            terminal = manifest.get("status") in {"complete", "failed", "cancelled"}
             if terminal:
                 latest_events = await asyncio.to_thread(
                     dispatcher.store.read_events,
@@ -464,6 +485,35 @@ def _render_job_streaming_response(
             "X-Render-Job-ID": submission.job_id,
         },
     )
+
+
+@compat_router.post("/cancel")
+async def cancel_current_operation(payload: CancelOperationRequest) -> dict[str, object]:
+    """Cancel the stream started by this UI and optionally terminate its backend worker."""
+
+    operation = (
+        ACTIVE_OPERATIONS.cancel(payload.request_id)
+        if payload.request_id
+        else ACTIVE_OPERATIONS.cancel_only_active()
+    )
+    if operation is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No active pipeline matches this request. The stream may already be finished.",
+        )
+    if payload.hard:
+        schedule_process_termination(
+            reason=f"ui_cancel:{operation.operation_id}",
+            pid=operation.pid,
+        )
+    return {
+        "status": "cancelling",
+        "request_id": operation.operation_id,
+        "hard": payload.hard,
+        "pid": operation.pid,
+    }
+
+
 @stream_router.post("/dub")
 async def stream_dub_video(
     request: Request,
@@ -487,6 +537,10 @@ async def stream_dub_video(
     ocr_model: str = Form(default=""),
     ocr_interval_seconds: float = Form(default=0.75),
     ocr_crop_bottom_ratio: float = Form(default=0.35),
+    flash_text_enabled: bool = Form(default=False),
+    flash_text_mode: str = Form(default="balanced"),
+    flash_text_min_confidence: float = Form(default=0.58),
+    flash_text_max_duration_s: float = Form(default=3.0),
     copyright_confirmed: bool = Form(default=False),
     copyright_source: str = Form(default="unknown"),
     copyright_notes: str = Form(default=""),
@@ -529,6 +583,10 @@ async def stream_dub_video(
         ocr_model,
         ocr_interval_seconds,
         ocr_crop_bottom_ratio,
+        flash_text_enabled=flash_text_enabled,
+        flash_text_mode=flash_text_mode,
+        flash_text_min_confidence=flash_text_min_confidence,
+        flash_text_max_duration_s=flash_text_max_duration_s,
         copyright_confirmed=copyright_confirmed,
         copyright_source=copyright_source,
         copyright_notes=copyright_notes,
@@ -578,6 +636,10 @@ async def analyze_video_script(
     ocr_model: str = Form(default=""),
     ocr_interval_seconds: float = Form(default=0.75),
     ocr_crop_bottom_ratio: float = Form(default=0.35),
+    flash_text_enabled: bool = Form(default=False),
+    flash_text_mode: str = Form(default="balanced"),
+    flash_text_min_confidence: float = Form(default=0.58),
+    flash_text_max_duration_s: float = Form(default=3.0),
     copyright_confirmed: bool = Form(default=False),
     copyright_source: str = Form(default="unknown"),
     copyright_notes: str = Form(default=""),
@@ -614,6 +676,10 @@ async def analyze_video_script(
         ocr_model,
         ocr_interval_seconds,
         ocr_crop_bottom_ratio,
+        flash_text_enabled=flash_text_enabled,
+        flash_text_mode=flash_text_mode,
+        flash_text_min_confidence=flash_text_min_confidence,
+        flash_text_max_duration_s=flash_text_max_duration_s,
         copyright_confirmed=copyright_confirmed,
         copyright_source=copyright_source,
         copyright_notes=copyright_notes,
@@ -640,12 +706,15 @@ async def analyze_video_script(
         preview_path = workspace.output_dir / f"{workspace.request_id}_source.mp4"
         shutil.copy2(workspace.input_video, preview_path)
         _cache_source_media(workspace.input_video, preview_path.name)
-        segments = AutoDubbingPipeline(config).analyze(workspace)
+        pipeline = AutoDubbingPipeline(config)
+        segments = pipeline.analyze(workspace)
         return AnalyzeResponse(
             request_id=workspace.request_id,
             status="completed",
             source_video_path=f"/media/{preview_path.name}",
             segments=segments,
+            flash_text_tracks=pipeline.last_flash_text_tracks,
+            caption_suggestions=pipeline.last_caption_suggestions,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Analyze failed: {exc}") from exc
@@ -674,6 +743,10 @@ async def analyze_video_script_stream(
     ocr_model: str = Form(default=""),
     ocr_interval_seconds: float = Form(default=0.75),
     ocr_crop_bottom_ratio: float = Form(default=0.35),
+    flash_text_enabled: bool = Form(default=False),
+    flash_text_mode: str = Form(default="balanced"),
+    flash_text_min_confidence: float = Form(default=0.58),
+    flash_text_max_duration_s: float = Form(default=3.0),
     copyright_confirmed: bool = Form(default=False),
     copyright_source: str = Form(default="unknown"),
     copyright_notes: str = Form(default=""),
@@ -710,6 +783,10 @@ async def analyze_video_script_stream(
         ocr_model,
         ocr_interval_seconds,
         ocr_crop_bottom_ratio,
+        flash_text_enabled=flash_text_enabled,
+        flash_text_mode=flash_text_mode,
+        flash_text_min_confidence=flash_text_min_confidence,
+        flash_text_max_duration_s=flash_text_max_duration_s,
         copyright_confirmed=copyright_confirmed,
         copyright_source=copyright_source,
         copyright_notes=copyright_notes,
@@ -805,6 +882,10 @@ def _render_config(payload: RenderScriptRequest, clone_reference_audio_path: Pat
         ocr_model=payload.ocr_model,
         ocr_interval_seconds=payload.ocr_interval_seconds,
         ocr_crop_bottom_ratio=payload.ocr_crop_bottom_ratio,
+        flash_text_enabled=payload.flash_text_enabled,
+        flash_text_mode=payload.flash_text_mode,
+        flash_text_min_confidence=payload.flash_text_min_confidence,
+        flash_text_max_duration_s=payload.flash_text_max_duration_s,
         asr_engine=payload.asr_engine,
         whisper_model=payload.whisper_model,
         whisper_beam_size=payload.whisper_beam_size,
@@ -1072,6 +1153,31 @@ async def render_job_status(job_id: str) -> dict[str, object]:
             "error": "Rendered output is missing; submit the same render again to resume.",
         }
     return {**manifest, "output_available": output_available}
+
+
+@stream_router.post("/render-jobs/{job_id}/cancel")
+async def cancel_render_job(job_id: str) -> dict[str, object]:
+    try:
+        UUID(job_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid render job ID.") from exc
+
+    dispatcher = RenderJobDispatcher()
+    try:
+        manifest = await asyncio.to_thread(dispatcher.store.read_manifest, job_id)
+        await asyncio.to_thread(dispatcher.cancel, job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    worker_pid = int(manifest.get("worker_pid", 0) or manifest.get("owner_pid", 0) or 0)
+    if worker_pid == os.getpid() and manifest.get("status") in {"queued", "running"}:
+        schedule_process_termination(reason=f"ui_cancel_render:{job_id}", pid=worker_pid)
+    return {
+        "status": "cancelling",
+        "job_id": job_id,
+        "hard": worker_pid == os.getpid(),
+        "worker_pid": worker_pid,
+    }
 
 
 @router.post("/shorten-text", response_model=ShortenTextResponse)

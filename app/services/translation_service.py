@@ -40,6 +40,7 @@ class TranslationService:
         # Keep batches homogeneous when the ASR detected a language switch.
         # This is the key difference from a single whole-video language hint.
         translated_texts: list[str] = [""] * len(segments)
+        structured_failure_state = {"structured_failure": False}
         groups = self._language_groups(segments)
         for group in groups:
             source_language = segments[group[0]].language or self.config.source_language
@@ -66,7 +67,12 @@ class TranslationService:
                 translated_texts[index] = value
 
         if self.config.translate_review:
-            translated_texts = self._review_timing(translated_texts, segments, context=context)
+            translated_texts = self._review_timing(
+                translated_texts,
+                segments,
+                context=context,
+                failure_state=structured_failure_state,
+            )
 
         # Run continuity QA last so timing compression can never leave a
         # previously coherent review sentence fragmented again. It remains
@@ -88,6 +94,7 @@ class TranslationService:
                     context=context,
                     batch_size=self.config.translate_batch_size,
                     cancel_event=self.cancel_event,
+                    failure_state=structured_failure_state,
                 )
                 for index, value in zip(group, reviewed_values):
                     translated_texts[index] = value
@@ -150,6 +157,7 @@ class TranslationService:
         segments: list[TranscriptSegment],
         *,
         context: str = "",
+        failure_state: dict[str, bool] | None = None,
     ) -> list[str]:
         reviewed = [text.strip() for text in texts]
         candidate_indices: list[int] = []
@@ -190,7 +198,10 @@ class TranslationService:
             max_words=candidate_limits,
             batch_size=self.config.translate_batch_size,
             cancel_event=self.cancel_event,
+            failure_state=failure_state,
         )
+        rejected_count = 0
+        rejected_examples: list[str] = []
         for index, value in zip(candidate_indices, shortened):
             candidate = value.strip()
             original = reviewed[index]
@@ -201,14 +212,17 @@ class TranslationService:
                 original_text=original,
                 target=self.config.target_language,
             ):
-                logger.warning(
-                    "translation.review.rejected_fragment index=%s source=%s candidate=%s",
-                    index,
-                    source_text,
-                    candidate,
-                )
+                rejected_count += 1
+                if len(rejected_examples) < 3:
+                    rejected_examples.append(candidate)
                 continue
             reviewed[index] = candidate or original
+        if rejected_count:
+            logger.warning(
+                "translation.review.rejected_fragments count=%s examples=%s",
+                rejected_count,
+                rejected_examples,
+            )
         logger.info(
             "translation.review.done candidates=%s batches_max=%s",
             len(candidate_indices),

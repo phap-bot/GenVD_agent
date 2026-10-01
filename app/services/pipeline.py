@@ -5,17 +5,20 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import shutil
+import subprocess
 import threading
 import time
 import wave
+from collections import deque
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Generator, Iterable
+from typing import Any, Callable, Generator, Iterable
 
-from app.models.schemas import DubbingScriptSegment, PipelineConfig, TranscriptSegment, WordTimestamp
+from app.models.schemas import DubbingScriptSegment, FlashTextTrack, PipelineConfig, TranscriptSegment, WordTimestamp
 from app.services.dependency_service import DependencyService
 from app.services.timeline_service import TimelineService
 from app.services.translation_service import TranslationService
@@ -26,11 +29,18 @@ from app.utils.media_probe import probe_duration, probe_video_dimensions
 from app.utils.vram import VRAMManager
 from app.utils.workspace import Workspace
 from app.utils.cancel import PipelineCancelledError
+from app.utils.video_encoder import (
+    HARDWARE_ENCODERS,
+    cpu_encoder_plan,
+    is_hardware_encoder_runtime_error,
+    select_video_encoder,
+)
 from utils.model_cache import configure_model_cache
 from utils.model_registry import model_registry
 from utils.ocr import extract_video_ocr_segments
+from utils.flash_text import detect_flash_text_tracks
 from utils.stt import remote_stt_enabled, transcribe_audio_remote
-from utils.translation import TRANSLATION_POLICY_VERSION
+from utils.translation import TRANSLATION_POLICY_VERSION, generate_caption_suggestions
 from utils.tts_voice import (
     ClonedVieneuVoice,
     encode_cloned_vieneu_voice,
@@ -64,6 +74,12 @@ ACCOMPANIMENT_DEFAULT_VOLUME = 0.92
 ORIGINAL_FALLBACK_VOLUME = 0.12
 DEFAULT_X264_PRESET = "superfast"
 DEFAULT_X264_CRF = 22
+DEFAULT_FFMPEG_PROGRESS_INTERVAL_SECONDS = 15.0
+DEFAULT_FFMPEG_RENDER_STALL_TIMEOUT_SECONDS = 180.0
+DEFAULT_FFMPEG_RENDER_FINALIZE_TIMEOUT_SECONDS = 300.0
+DEFAULT_FFMPEG_RENDER_TIMEOUT_FACTOR = 3.0
+DEFAULT_FFMPEG_RENDER_MIN_TIMEOUT_SECONDS = 600.0
+DEFAULT_FFMPEG_RENDER_UNKNOWN_TIMEOUT_SECONDS = 1800.0
 VALID_X264_PRESETS = frozenset(
     {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}
 )
@@ -97,6 +113,7 @@ TTS_CONTIGUOUS_MAX_CHARS = 384
 TTS_MIN_NATURAL_STRETCH_RATIO = 0.82  # do not slow very short utterances into unnatural speech
 TIMELINE_CONTIGUOUS_TOLERANCE_S = 0.04  # absorb timestamp quantization at touching cue boundaries
 TTS_POLICY_VERSION = "tts-contiguous-boundary-v2"
+CAPTION_POLICY_VERSION = "grounded-caption-suggestions-v1"
 
 
 @dataclass(frozen=True)
@@ -118,6 +135,23 @@ class _TTSGroup:
     voice_model: str  # resolved voice key (empty for clone mode)
 
 
+@dataclass(frozen=True)
+class _FFmpegMonitorConfig:
+    heartbeat_seconds: float
+    stall_seconds: float
+    finalize_seconds: float
+    hard_timeout_seconds: float
+
+
+def _parse_ffmpeg_progress_time(value: str) -> float | None:
+    """Parse FFmpeg's HH:MM:SS.microseconds progress value."""
+    try:
+        hours, minutes, seconds = value.strip().split(":", 2)
+        return max(0.0, int(hours) * 3600 + int(minutes) * 60 + float(seconds))
+    except (TypeError, ValueError):
+        return None
+
+
 class AutoDubbingPipeline:
     """SSE-producing orchestrator for the auto-dubbing pipeline.
 
@@ -132,6 +166,25 @@ class AutoDubbingPipeline:
         self.cancel_event = cancel_event
         self.dependencies = DependencyService()
         self.last_source_engine = "unknown"
+        self.last_flash_text_tracks: list[FlashTextTrack] = []
+        self.last_caption_suggestions: list[str] = []
+        self.runtime_event_callback: Callable[[dict[str, object]], None] | None = None
+
+    def set_runtime_event_callback(
+        self,
+        callback: Callable[[dict[str, object]], None] | None,
+    ) -> None:
+        """Attach a durable event sink for long blocking stages such as FFmpeg."""
+        self.runtime_event_callback = callback
+
+    def _publish_runtime_event(self, payload: dict[str, object]) -> None:
+        callback = self.runtime_event_callback
+        if callback is None:
+            return
+        try:
+            callback(payload)
+        except Exception:
+            logger.exception("pipeline.runtime_event.publish_failed phase=%s", payload.get("phase"))
 
     def _checkpoint_store(self, workspace: Workspace) -> CheckpointStore:
         return CheckpointStore(
@@ -177,6 +230,18 @@ class AutoDubbingPipeline:
                 "scene_threshold": self.config.ocr_scene_threshold,
                 "short_video": self.config.short_video,
             }
+        if stage == "flash_text":
+            return {
+                "stage": stage,
+                "policy_version": "flash-text-detector-v1",
+                "enabled": self.config.flash_text_enabled,
+                "mode": self.config.flash_text_mode,
+                "min_confidence": self.config.flash_text_min_confidence,
+                "max_duration_s": self.config.flash_text_max_duration_s,
+                "top_ratio": 0.04,
+                "bottom_exclusion_ratio": 0.28,
+                "short_video": self.config.short_video,
+            }
         if stage == "tts":
             return {
                 "stage": stage,
@@ -189,6 +254,16 @@ class AutoDubbingPipeline:
                 "timing_max_drift_s": round(self.config.timing_max_drift_s, 3),
                 "timing_min_gap_s": round(self.config.timing_min_gap_s, 3),
                 "timing_max_atempo": round(self.config.timing_max_atempo, 3),
+                "short_video": self.config.short_video,
+            }
+        if stage == "captions":
+            return {
+                "stage": stage,
+                "policy_version": CAPTION_POLICY_VERSION,
+                "source_language": self.config.source_language,
+                "target_language": self.config.target_language,
+                "provider": self.config.translation_provider,
+                "model": self.config.translation_model,
                 "short_video": self.config.short_video,
             }
         return {
@@ -208,6 +283,7 @@ class AutoDubbingPipeline:
     def run(self, workspace: Workspace) -> Generator[str, None, Path]:
         output_path = workspace.output_dir / f"{workspace.request_id}_dubbed.mp4"
         output_subtitle_path = output_path.with_suffix(".srt")
+        caption_suggestions: list[str] = []
         self.config.require_copyright_preflight()
 
         try:
@@ -313,11 +389,32 @@ class AutoDubbingPipeline:
                     )
                 yield self._event(
                     "processing",
+                    "Creating grounded caption suggestions...",
+                    phase="translate",
+                    progress=65,
+                    detail="Using the source script and translated script as caption context",
+                )
+                caption_suggestions = self._caption_suggestions(
+                    segments,
+                    translated_segments,
+                    workspace=workspace,
+                )
+                yield self._event(
+                    "processing",
                     "Voice tracks generated",
                     phase="voice",
                     progress=84,
                     stats={"chunks": len(chunks), **self._segment_stats(translated_segments)},
                 )
+                if self.config.flash_text_enabled:
+                    yield self._event(
+                        "processing",
+                        "Detecting large transient on-screen text...",
+                        phase="polish",
+                        progress=87,
+                        detail="Scanning upper/central frame; subtitle band excluded",
+                    )
+                    self._run_flash_text_detection(workspace)
                 VRAMManager.cleanup()
             finally:
                 self._gpu_lock.release()
@@ -335,8 +432,10 @@ class AutoDubbingPipeline:
                 subtitle_path=subtitle_path,
                 tts_mix_path=tts_mix_path,
                 output_path=output_path,
+                video_duration=video_duration,
                 accompaniment_path=accompaniment_path,
                 original_vocal_path=original_vocal_path,
+                flash_text_tracks=self.last_flash_text_tracks,
             )
             self._write_srt(translated_segments, output_subtitle_path, video_duration=video_duration)
 
@@ -347,6 +446,7 @@ class AutoDubbingPipeline:
                 progress=100,
                 video_url=f"/media/{output_path.name}",
                 subtitle_url=f"/media/{output_subtitle_path.name}",
+                caption_suggestions=caption_suggestions,
             )
             return output_path
         except PipelineCancelledError:
@@ -383,8 +483,13 @@ class AutoDubbingPipeline:
                 else:
                     segments = self._source_timeline(self._extract_source_segments(workspace))
                     translated = self._canonical_timeline(self._translate_segments(segments, workspace=workspace))
+                self.last_caption_suggestions = self._caption_suggestions(
+                    segments,
+                    translated,
+                    workspace=workspace,
+                )
                 VRAMManager.cleanup()
-                return [
+                analyzed = [
                     DubbingScriptSegment(
                         id=segment.id,
                         start=segment.start,
@@ -397,6 +502,8 @@ class AutoDubbingPipeline:
                     )
                     for index, segment in enumerate(translated)
                 ]
+                self._run_flash_text_detection(workspace)
+                return analyzed
             finally:
                 VRAMManager.cleanup()
 
@@ -483,6 +590,18 @@ class AutoDubbingPipeline:
                     progress=92,
                     stats=self._segment_stats(translated),
                 )
+                yield self._event(
+                    "processing",
+                    "Creating grounded caption suggestions...",
+                    phase="translate",
+                    progress=95,
+                    detail="Using the source script and translated script as caption context",
+                )
+                self.last_caption_suggestions = self._caption_suggestions(
+                    segments,
+                    translated,
+                    workspace=workspace,
+                )
                 analyzed = [
                     DubbingScriptSegment(
                         id=segment.id,
@@ -496,6 +615,16 @@ class AutoDubbingPipeline:
                     )
                     for index, segment in enumerate(translated)
                 ]
+                if self.config.flash_text_enabled:
+                    yield self._event(
+                        "processing",
+                        "Detecting large transient on-screen text...",
+                        request_id=workspace.request_id,
+                        phase="polish",
+                        progress=96,
+                        detail="Only large overlay text above the subtitle band",
+                    )
+                self._run_flash_text_detection(workspace)
             finally:
                 self._gpu_lock.release()
 
@@ -506,6 +635,8 @@ class AutoDubbingPipeline:
                 progress=100,
                 source_video_path=f"/media/{workspace.request_id}_source.mp4",
                 segments=[segment.model_dump() for segment in analyzed],
+                flash_text_tracks=[track.model_dump(mode="json") for track in self.last_flash_text_tracks],
+                caption_suggestions=self.last_caption_suggestions,
             )
             return analyzed
         except PipelineCancelledError:
@@ -523,6 +654,7 @@ class AutoDubbingPipeline:
         workspace: Workspace,
         source_video_path: Path,
         script_segments: list[DubbingScriptSegment],
+        flash_text_tracks: list[FlashTextTrack] | None = None,
     ) -> Generator[str, None, Path]:
         """Render a final video from user-edited script/timeline segments."""
         output_path = workspace.output_dir / f"{workspace.request_id}_script_dubbed.mp4"
@@ -647,6 +779,7 @@ class AutoDubbingPipeline:
                 video_duration=video_duration,
                 accompaniment_path=accompaniment_path,
                 original_vocal_path=original_vocal_path,
+                flash_text_tracks=flash_text_tracks or [],
             )
             self._write_srt(timeline_segments, output_subtitle_path, video_duration=video_duration)
 
@@ -1122,6 +1255,52 @@ class AutoDubbingPipeline:
             checkpoint.save("ocr", checkpoint_payload, [item.model_dump(mode="json") for item in normalized])
             logger.info("checkpoint.saved stage=ocr request_id=%s segments=%s", workspace.request_id, len(normalized))
         return normalized
+
+    def _run_flash_text_detection(self, workspace: Workspace) -> list[FlashTextTrack]:
+        """Detect large transient overlay text without touching subtitle OCR."""
+        self.last_flash_text_tracks = []
+        if not self.config.flash_text_enabled:
+            return []
+
+        self._raise_if_cancelled(workspace)
+        checkpoint = self._checkpoint_store(workspace)
+        checkpoint_payload = self._checkpoint_config("flash_text")
+        cached = checkpoint.load("flash_text", checkpoint_payload)
+        if isinstance(cached, list):
+            try:
+                restored = [FlashTextTrack.model_validate(item) for item in cached]
+                self.last_flash_text_tracks = restored
+                logger.info(
+                    "checkpoint.hit stage=flash_text request_id=%s tracks=%s",
+                    workspace.request_id,
+                    len(restored),
+                )
+                return restored
+            except Exception:
+                logger.warning("checkpoint.invalid stage=flash_text request_id=%s", workspace.request_id, exc_info=True)
+
+        tracks = detect_flash_text_tracks(
+            workspace.input_video,
+            mode=self.config.flash_text_mode,
+            min_confidence=self.config.flash_text_min_confidence,
+            max_duration_s=self.config.flash_text_max_duration_s,
+            top_ratio=0.04,
+            bottom_exclusion_ratio=0.28,
+            cancel_event=self.cancel_event,
+        )
+        self.last_flash_text_tracks = tracks
+        checkpoint.save(
+            "flash_text",
+            checkpoint_payload,
+            [track.model_dump(mode="json") for track in tracks],
+        )
+        logger.info(
+            "flash_text.detected request_id=%s tracks=%s mode=%s",
+            workspace.request_id,
+            len(tracks),
+            self.config.flash_text_mode,
+        )
+        return tracks
 
     def _merge_asr_ocr_segments(
         self,
@@ -1606,6 +1785,65 @@ class AutoDubbingPipeline:
             logger.info("checkpoint.saved stage=translation request_id=%s segments=%s", workspace.request_id, len(translated))
             return translated
         return TranslationService(self.config, self.cancel_event).translate(segments)
+
+    def _caption_suggestions(
+        self,
+        source_segments: list[TranscriptSegment],
+        translated_segments: list[TranscriptSegment],
+        *,
+        workspace: Workspace | None = None,
+    ) -> list[str]:
+        """Generate/cached grounded captions from the completed translation."""
+        script = [
+            {
+                "source": source.text,
+                "translated": translated_segments[index].text
+                if index < len(translated_segments)
+                else source.text,
+            }
+            for index, source in enumerate(source_segments)
+            if source.text.strip()
+        ]
+        if not script:
+            return []
+
+        payload = {
+            **self._checkpoint_config("captions"),
+            "script": script,
+        }
+        checkpoint = self._checkpoint_store(workspace) if workspace is not None else None
+        if checkpoint is not None:
+            cached = checkpoint.load("captions", payload)
+            if isinstance(cached, list):
+                restored = [str(item).strip() for item in cached if str(item).strip()]
+                if restored:
+                    logger.info(
+                        "checkpoint.hit stage=captions request_id=%s suggestions=%s",
+                        workspace.request_id,
+                        len(restored),
+                    )
+                    self.last_caption_suggestions = restored[:3]
+                    return self.last_caption_suggestions
+
+        self._raise_if_cancelled(workspace)
+        suggestions = generate_caption_suggestions(
+            script,
+            target_language=self.config.target_language,
+            source_language=self.config.source_language,
+            provider=self.config.translation_provider,
+            model=self.config.translation_model,
+            cancel_event=self.cancel_event,
+            max_items=3,
+        )
+        self.last_caption_suggestions = suggestions[:3]
+        if checkpoint is not None and self.last_caption_suggestions:
+            checkpoint.save("captions", payload, self.last_caption_suggestions)
+            logger.info(
+                "checkpoint.saved stage=captions request_id=%s suggestions=%s",
+                workspace.request_id,
+                len(self.last_caption_suggestions),
+            )
+        return self.last_caption_suggestions
 
     def _source_timeline(self, segments: list[TranscriptSegment]) -> list[TranscriptSegment]:
         return TimelineService().from_transcript(
@@ -2533,21 +2771,52 @@ class AutoDubbingPipeline:
         video_duration: float | None = None,
         accompaniment_path: Path | None = None,
         original_vocal_path: Path | None = None,
+        flash_text_tracks: Iterable[FlashTextTrack] | None = None,
     ) -> None:
         ffmpeg = self._ffmpeg()
         video_input = ffmpeg.input(str(video_path))
         tts_input = ffmpeg.input(str(tts_mix_path))
+        script_segment_list = list(script_segments or [])
+        flash_text_track_list = list(flash_text_tracks or [])
+        has_segment_blur = any(
+            segment.blur_style.enabled
+            and segment.blur_style.width > 0
+            and segment.blur_style.height > 0
+            and segment.end > segment.start
+            for segment in script_segment_list
+        )
+        has_flash_blur = self.config.flash_text_enabled and any(
+            track.enabled and bool(track.boxes) and track.end > track.start
+            for track in flash_text_track_list
+        )
+        has_speed_filter = not math.isclose(self.config.video_speed, 1.0, abs_tol=1e-6)
+        has_visual_filters = bool(
+            self.config.burn_subtitles
+            or has_segment_blur
+            or has_flash_blur
+            or has_speed_filter
+        )
 
         video_stream = video_input.video
-        if self.config.video_speed != 1.0:
+        if has_flash_blur:
+            if not video_width or not video_height:
+                video_width, video_height = self._video_dimensions(video_path)
+            video_stream = self._apply_flash_text_blur(
+                ffmpeg,
+                video_stream,
+                flash_text_track_list,
+                video_width=video_width or 0,
+                video_height=video_height or 0,
+            )
+        if has_speed_filter:
             # 0.82 makes the picture slower and leaves roughly 22% more room
             # for Vietnamese speech; 1.0 keeps the original duration.
             video_stream = video_stream.filter("setpts", f"{1.0 / self.config.video_speed:.6f}*PTS")
-        if script_segments:
+        if has_segment_blur:
             video_stream = self._apply_blur_boxes(
                 ffmpeg,
                 video_stream,
-                script_segments,
+                script_segment_list,
                 video_width=video_width or 0,
                 video_height=video_height or 0,
                 video_duration=video_duration,
@@ -2672,24 +2941,79 @@ class AutoDubbingPipeline:
         except ValueError:
             x264_crf = DEFAULT_X264_CRF
         x264_crf = min(51, max(0, x264_crf))
+        encoder_plan = select_video_encoder(
+            ffmpeg_binary=self.dependencies.resolve_binary("ffmpeg") or "ffmpeg",
+            has_visual_filters=has_visual_filters,
+            x264_preset=x264_preset,
+            x264_crf=x264_crf,
+        )
         logger.info(
-            "legacy_pipeline.render.encoder codec=libx264 preset=%s crf=%s",
-            x264_preset,
-            x264_crf,
+            "legacy_pipeline.render.encoder codec=%s reason=%s subtitles=%s segment_blur=%s flash_blur=%s speed_filter=%s",
+            encoder_plan.codec,
+            encoder_plan.reason,
+            self.config.burn_subtitles,
+            has_segment_blur,
+            has_flash_blur,
+            has_speed_filter,
         )
 
-        command = ffmpeg.output(
-            video_stream,
-            mixed_audio,
-            str(output_path),
-            vcodec="libx264",
-            acodec="aac",
-            preset=x264_preset,
-            crf=x264_crf,
-            pix_fmt="yuv420p",
-            movflags="+faststart",
-        ).overwrite_output()
-        self._run_ffmpeg_command(command, "render")
+        def build_output(plan):
+            return ffmpeg.output(
+                video_stream,
+                mixed_audio,
+                str(output_path),
+                acodec="aac",
+                movflags="+faststart",
+                **plan.options,
+            ).overwrite_output()
+
+        command = build_output(encoder_plan)
+        try:
+            self._run_ffmpeg_command(
+                command,
+                "render",
+                expected_duration=video_duration,
+                encoder_codec=encoder_plan.codec,
+            )
+        except PipelineCancelledError:
+            raise
+        except RuntimeError as exc:
+            if (
+                encoder_plan.codec in HARDWARE_ENCODERS
+                and is_hardware_encoder_runtime_error(exc, encoder_plan.codec)
+            ):
+                fallback_plan = cpu_encoder_plan(x264_preset=x264_preset, x264_crf=x264_crf)
+                logger.warning(
+                    "legacy_pipeline.render.encoder_fallback from=%s to=libx264 error=%s",
+                    encoder_plan.codec,
+                    exc,
+                )
+                self._run_ffmpeg_command(
+                    build_output(fallback_plan),
+                    "render",
+                    expected_duration=video_duration,
+                    encoder_codec=fallback_plan.codec,
+                )
+            elif encoder_plan.codec == "copy":
+                fallback_plan = select_video_encoder(
+                    ffmpeg_binary=self.dependencies.resolve_binary("ffmpeg") or "ffmpeg",
+                    has_visual_filters=True,
+                    x264_preset=x264_preset,
+                    x264_crf=x264_crf,
+                )
+                logger.warning(
+                    "legacy_pipeline.render.stream_copy_fallback codec=%s error=%s",
+                    fallback_plan.codec,
+                    exc,
+                )
+                self._run_ffmpeg_command(
+                    build_output(fallback_plan),
+                    "render",
+                    expected_duration=video_duration,
+                    encoder_codec=fallback_plan.codec,
+                )
+            else:
+                raise
 
     def _apply_blur_boxes(
         self,
@@ -2727,12 +3051,21 @@ class AutoDubbingPipeline:
                 split_streams = video_stream.filter_multi_output("split")
                 base_stream = split_streams[0]
                 crop_source = split_streams[1]
+                blur_radius = max(0, int(blur_radius))
+                chroma_radius = min(blur_radius, 38)
+
                 blurred_crop = crop_source.crop(
                     left,
                     top,
                     box_width,
                     box_height,
-                ).filter("boxblur", luma_radius=blur_radius, luma_power=1)
+                ).filter(
+                    "boxblur",
+                    luma_radius=blur_radius,
+                    luma_power=1,
+                    chroma_radius=chroma_radius,
+                    chroma_power=1,
+                )
                 video_stream = ffmpeg.overlay(base_stream, blurred_crop, x=left, y=top, enable=enable)
 
             if opacity > 0:
@@ -2747,6 +3080,78 @@ class AutoDubbingPipeline:
                     enable=enable,
                 )
         return video_stream
+
+    def _apply_flash_text_blur(
+        self,
+        ffmpeg,
+        video_stream,
+        tracks: Iterable[FlashTextTrack],
+        *,
+        video_width: int,
+        video_height: int,
+    ):
+        """Blur only detected flash-text tracks for their exact time window."""
+        width = max(1, int(video_width))
+        height = max(1, int(video_height))
+        for track in sorted(tracks, key=lambda item: (item.start, item.id)):
+            if not track.enabled or not track.boxes or track.end <= track.start:
+                continue
+
+            left, top, box_width, box_height = self._flash_track_bounds(track, width, height)
+            if box_width <= 1 or box_height <= 1:
+                continue
+            blur_radius = max(0, min(int(track.blur), 64, (min(box_width, box_height) // 2) - 1))
+            enable = f"between(t,{track.start:.6f},{track.end:.6f})"
+            split_streams = video_stream.filter_multi_output("split")
+            base_stream = split_streams[0]
+            crop_source = split_streams[1]
+            blurred_crop = crop_source.crop(left, top, box_width, box_height)
+            if blur_radius > 0:
+                blurred_crop = blurred_crop.filter(
+                    "boxblur",
+                    luma_radius=blur_radius,
+                    luma_power=1,
+                    chroma_radius=min(blur_radius, 38),
+                    chroma_power=1,
+            )
+            video_stream = ffmpeg.overlay(
+                base_stream,
+                blurred_crop,
+                x=left,
+                y=top,
+                enable=enable,
+            )
+            logger.info(
+                "flash_text.render track=%s start=%.3f end=%.3f box=%s,%s,%s,%s blur=%s",
+                track.id,
+                track.start,
+                track.end,
+                left,
+                top,
+                box_width,
+                box_height,
+                blur_radius,
+            )
+        return video_stream
+
+    @staticmethod
+    def _flash_track_bounds(track: FlashTextTrack, width: int, height: int) -> tuple[int, int, int, int]:
+        """Use a padded union so animated glyphs remain covered without per-frame filters."""
+        min_x = min(box.x for box in track.boxes)
+        min_y = min(box.y for box in track.boxes)
+        max_x = max(box.x + box.width for box in track.boxes)
+        max_y = max(box.y + box.height for box in track.boxes)
+        padding_x = (max_x - min_x) * max(0.0, min(0.5, track.padding))
+        padding_y = (max_y - min_y) * max(0.0, min(0.5, track.padding))
+        left = max(0.0, min(100.0, min_x - padding_x))
+        top = max(0.0, min(100.0, min_y - padding_y))
+        right = max(left, min(100.0, max_x + padding_x))
+        bottom = max(top, min(100.0, max_y + padding_y))
+        pixel_left = max(0, min(width - 2, round(width * left / 100.0)))
+        pixel_top = max(0, min(height - 2, round(height * top / 100.0)))
+        pixel_right = max(pixel_left + 2, min(width, round(width * right / 100.0)))
+        pixel_bottom = max(pixel_top + 2, min(height, round(height * bottom / 100.0)))
+        return pixel_left, pixel_top, pixel_right - pixel_left, pixel_bottom - pixel_top
 
     def _clip_timeline_to_video(
         self,
@@ -3384,7 +3789,22 @@ class AutoDubbingPipeline:
             escaped = escaped.replace(":", r"\:")
         return escaped
 
-    def _run_ffmpeg_command(self, command, stage: str) -> None:
+    def _run_ffmpeg_command(
+        self,
+        command,
+        stage: str,
+        *,
+        expected_duration: float | None = None,
+        encoder_codec: str | None = None,
+    ) -> None:
+        if stage == "render":
+            self._run_monitored_ffmpeg(
+                command,
+                stage,
+                expected_duration=expected_duration,
+                encoder_codec=encoder_codec,
+            )
+            return
         try:
             command.run(capture_stdout=True, capture_stderr=True)
         except Exception as exc:
@@ -3392,6 +3812,306 @@ class AutoDubbingPipeline:
             logger.error("legacy_pipeline.ffmpeg.%s.error stderr=%s", stage, stderr or "<empty>")
             message = self._last_log_lines(stderr) or str(exc)
             raise RuntimeError(f"FFmpeg {stage} failed: {message}") from exc
+
+    def _run_monitored_ffmpeg(
+        self,
+        command,
+        stage: str,
+        *,
+        expected_duration: float | None,
+        encoder_codec: str | None,
+    ) -> None:
+        """Run final FFmpeg rendering with progress, cancellation and watchdogs."""
+        config = self._ffmpeg_monitor_config(expected_duration)
+        arguments = list(command.compile())
+        # These are global FFmpeg options and must precede every input/output.
+        # Inserting them after the executable avoids version-dependent parsing
+        # when ffmpeg-python appends global_args after the output filename.
+        arguments[1:1] = ["-progress", "pipe:1", "-nostats", "-nostdin"]
+        creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            process = subprocess.Popen(
+                arguments,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=creation_flags,
+            )
+        except OSError as exc:
+            raise RuntimeError(f"FFmpeg {stage} failed to start: {exc}") from exc
+
+        messages: queue.Queue[tuple[str, str | None]] = queue.Queue()
+        stderr_tail: deque[str] = deque(maxlen=80)
+
+        def read_stream(name: str, stream) -> None:
+            try:
+                for raw_line in iter(stream.readline, ""):
+                    messages.put((name, raw_line.rstrip("\r\n")))
+            except (OSError, ValueError) as exc:
+                messages.put(("stderr", f"FFmpeg {name} monitor error: {exc}"))
+            finally:
+                messages.put((name, None))
+
+        readers = [
+            threading.Thread(
+                target=read_stream,
+                args=("progress", process.stdout),
+                name=f"ffmpeg-{stage}-progress",
+                daemon=True,
+            ),
+            threading.Thread(
+                target=read_stream,
+                args=("stderr", process.stderr),
+                name=f"ffmpeg-{stage}-stderr",
+                daemon=True,
+            ),
+        ]
+        for reader in readers:
+            reader.start()
+
+        started_at = time.monotonic()
+        last_progress_at = started_at
+        last_heartbeat_at = started_at
+        media_seconds = 0.0
+        last_frame = 0
+        progress_values: dict[str, str] = {}
+
+        def consume_message(source: str, line: str | None) -> None:
+            nonlocal media_seconds, last_frame, last_progress_at
+            if line is None:
+                return
+            if source == "stderr":
+                if line.strip():
+                    stderr_tail.append(line.strip())
+                return
+            if "=" not in line:
+                return
+            key, value = line.split("=", 1)
+            progress_values[key] = value
+            if key == "out_time":
+                parsed = _parse_ffmpeg_progress_time(value)
+                if parsed is not None and parsed > media_seconds + 0.01:
+                    media_seconds = parsed
+                    last_progress_at = time.monotonic()
+            elif key == "frame":
+                try:
+                    frame = int(value)
+                except ValueError:
+                    return
+                if frame > last_frame:
+                    last_frame = frame
+                    last_progress_at = time.monotonic()
+
+        logger.info(
+            "legacy_pipeline.ffmpeg.%s.started pid=%s encoder=%s expected_duration=%.2f hard_timeout=%.1f stall_timeout=%.1f",
+            stage,
+            process.pid,
+            encoder_codec or "unknown",
+            max(0.0, float(expected_duration or 0.0)),
+            config.hard_timeout_seconds,
+            config.stall_seconds,
+        )
+
+        try:
+            while True:
+                if process.poll() is not None:
+                    break
+                if self.cancel_event is not None and self.cancel_event.is_set():
+                    self._terminate_ffmpeg_process(process)
+                    logger.info("legacy_pipeline.ffmpeg.%s.cancelled pid=%s", stage, process.pid)
+                    raise PipelineCancelledError("Pipeline cancelled during FFmpeg render")
+
+                now = time.monotonic()
+                elapsed = now - started_at
+                if elapsed >= config.hard_timeout_seconds:
+                    self._terminate_ffmpeg_process(process)
+                    raise RuntimeError(
+                        f"FFmpeg {stage} exceeded its {config.hard_timeout_seconds:.0f}s hard timeout "
+                        f"at media time {media_seconds:.1f}s"
+                    )
+
+                near_end = bool(
+                    expected_duration
+                    and expected_duration > 0
+                    and media_seconds >= max(0.0, expected_duration - 1.0)
+                )
+                stall_limit = config.finalize_seconds if near_end else config.stall_seconds
+                if now - last_progress_at >= stall_limit:
+                    self._terminate_ffmpeg_process(process)
+                    tail = self._last_log_lines("\n".join(stderr_tail), limit=4)
+                    detail = f"; last FFmpeg output: {tail}" if tail else ""
+                    raise RuntimeError(
+                        f"FFmpeg {stage} stalled for {stall_limit:.0f}s "
+                        f"at media time {media_seconds:.1f}s{detail}"
+                    )
+
+                try:
+                    source, line = messages.get(timeout=0.5)
+                    consume_message(source, line)
+                except queue.Empty:
+                    pass
+
+                now = time.monotonic()
+                if now - last_heartbeat_at >= config.heartbeat_seconds:
+                    percent = (
+                        min(100.0, media_seconds * 100.0 / expected_duration)
+                        if expected_duration and expected_duration > 0
+                        else None
+                    )
+                    logger.info(
+                        "legacy_pipeline.ffmpeg.%s.progress pid=%s elapsed=%.1f media_time=%.1f percent=%s frame=%s fps=%s speed=%s",
+                        stage,
+                        process.pid,
+                        now - started_at,
+                        media_seconds,
+                        f"{percent:.1f}" if percent is not None else "unknown",
+                        progress_values.get("frame", "unknown"),
+                        progress_values.get("fps", "unknown"),
+                        progress_values.get("speed", "unknown"),
+                    )
+                    ui_progress = (
+                        min(99, 96 + int(percent * 3.0 / 100.0))
+                        if percent is not None
+                        else 96
+                    )
+                    self._publish_runtime_event(
+                        {
+                            "status": "processing",
+                            "step": "Encoding final video...",
+                            "phase": "render",
+                            "progress": ui_progress,
+                            "detail": (
+                                f"FFmpeg {encoder_codec or 'encoder'} encoded {percent:.1f}% ({media_seconds:.1f}s)"
+                                if percent is not None
+                                else f"FFmpeg {encoder_codec or 'encoder'} is active ({now - started_at:.0f}s elapsed)"
+                            ),
+                            "stats": {
+                                "render_media_seconds": round(media_seconds, 2),
+                                "render_percent": round(percent, 1) if percent is not None else None,
+                                "render_elapsed_seconds": round(now - started_at, 1),
+                                "video_encoder": encoder_codec or "unknown",
+                            },
+                        }
+                    )
+                    last_heartbeat_at = now
+
+            for reader in readers:
+                reader.join(timeout=2.0)
+            while True:
+                try:
+                    source, line = messages.get_nowait()
+                except queue.Empty:
+                    break
+                consume_message(source, line)
+
+            return_code = process.wait(timeout=5.0)
+            if return_code != 0:
+                stderr = "\n".join(stderr_tail)
+                logger.error("legacy_pipeline.ffmpeg.%s.error stderr=%s", stage, stderr or "<empty>")
+                message = self._last_log_lines(stderr) or f"exit code {return_code}"
+                raise RuntimeError(f"FFmpeg {stage} failed: {message}")
+
+            logger.info(
+                "legacy_pipeline.ffmpeg.%s.completed pid=%s elapsed=%.1f media_time=%.1f",
+                stage,
+                process.pid,
+                time.monotonic() - started_at,
+                media_seconds,
+            )
+        finally:
+            if process.poll() is None:
+                self._terminate_ffmpeg_process(process)
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+            for reader in readers:
+                if reader.is_alive():
+                    reader.join(timeout=1.0)
+
+    def _ffmpeg_monitor_config(self, expected_duration: float | None) -> _FFmpegMonitorConfig:
+        heartbeat = max(
+            2.0,
+            min(
+                60.0,
+                self._env_float(
+                    "AUTODUB_FFMPEG_PROGRESS_INTERVAL",
+                    DEFAULT_FFMPEG_PROGRESS_INTERVAL_SECONDS,
+                ),
+            ),
+        )
+        stall = max(
+            30.0,
+            min(
+                1800.0,
+                self._env_float(
+                    "AUTODUB_FFMPEG_RENDER_STALL_TIMEOUT",
+                    DEFAULT_FFMPEG_RENDER_STALL_TIMEOUT_SECONDS,
+                ),
+            ),
+        )
+        finalize = max(
+            stall,
+            min(
+                1800.0,
+                self._env_float(
+                    "AUTODUB_FFMPEG_RENDER_FINALIZE_TIMEOUT",
+                    DEFAULT_FFMPEG_RENDER_FINALIZE_TIMEOUT_SECONDS,
+                ),
+            ),
+        )
+        timeout_factor = max(
+            1.0,
+            min(
+                10.0,
+                self._env_float(
+                    "AUTODUB_FFMPEG_RENDER_TIMEOUT_FACTOR",
+                    DEFAULT_FFMPEG_RENDER_TIMEOUT_FACTOR,
+                ),
+            ),
+        )
+        minimum_timeout = max(
+            60.0,
+            min(
+                7200.0,
+                self._env_float(
+                    "AUTODUB_FFMPEG_RENDER_MIN_TIMEOUT",
+                    DEFAULT_FFMPEG_RENDER_MIN_TIMEOUT_SECONDS,
+                ),
+            ),
+        )
+        if expected_duration and expected_duration > 0:
+            hard_timeout = max(minimum_timeout, expected_duration * timeout_factor)
+        else:
+            hard_timeout = max(
+                minimum_timeout,
+                min(
+                    7200.0,
+                    self._env_float(
+                        "AUTODUB_FFMPEG_RENDER_UNKNOWN_TIMEOUT",
+                        DEFAULT_FFMPEG_RENDER_UNKNOWN_TIMEOUT_SECONDS,
+                    ),
+                ),
+            )
+        return _FFmpegMonitorConfig(
+            heartbeat_seconds=heartbeat,
+            stall_seconds=stall,
+            finalize_seconds=finalize,
+            hard_timeout_seconds=hard_timeout,
+        )
+
+    def _terminate_ffmpeg_process(self, process: subprocess.Popen) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5.0)
 
     def _ffmpeg_stderr(self, exc: BaseException) -> str:
         stderr = getattr(exc, "stderr", None)

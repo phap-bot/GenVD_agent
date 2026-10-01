@@ -14,12 +14,12 @@ from app.services.subtitle_service import SubtitleService
 from app.services.timeline_service import TimelineService
 from app.services.translation_service import TranslationService
 from app.services.checkpoint_service import CheckpointStore
-from app.services.pipeline import TTS_POLICY_VERSION
+from app.services.pipeline import CAPTION_POLICY_VERSION, TTS_POLICY_VERSION
 from app.services.tts_service import TTSService
 from app.services.video_service import VideoService
 from app.utils.files import ensure_output_dir, make_request_id
 from app.utils.memory import VRAMManager
-from utils.translation import TRANSLATION_POLICY_VERSION
+from utils.translation import TRANSLATION_POLICY_VERSION, generate_caption_suggestions
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +128,12 @@ class PipelineManager:
                 if translation_service is not None:
                     del translation_service
                 VRAMManager.cleanup()
+                caption_suggestions = self._caption_suggestions(
+                    checkpoint,
+                    config,
+                    segments,
+                    translated_segments,
+                )
 
                 logger.info("Starting TTS stage for request %s", request_id)
                 self._checkpoint_voice_setup(checkpoint, config, translated_segments, request_id)
@@ -153,6 +159,7 @@ class PipelineManager:
                     output_video_path=rendered_path,
                     subtitle_path=output_subtitle_path,
                     segments=translated_segments,
+                    caption_suggestions=caption_suggestions,
                 )
             finally:
                 VRAMManager.cleanup()
@@ -277,14 +284,21 @@ class PipelineManager:
                 translated_segments = TimelineService().from_transcript(translation_service.translate(segments))
                 del translation_service
                 VRAMManager.cleanup()
+                checkpoint = CheckpointStore(
+                    video_path,
+                    root=config.checkpoint_root,
+                    enabled=config.checkpoint_enabled,
+                )
+                caption_suggestions = self._caption_suggestions(
+                    checkpoint,
+                    config,
+                    segments,
+                    translated_segments,
+                )
 
                 logger.info("Starting TTS stage for request %s", request_id)
                 self._checkpoint_voice_setup(
-                    CheckpointStore(
-                        video_path,
-                        root=config.checkpoint_root,
-                        enabled=config.checkpoint_enabled,
-                    ),
+                    checkpoint,
                     config,
                     translated_segments,
                     request_id,
@@ -311,6 +325,7 @@ class PipelineManager:
                     output_video_path=rendered_path,
                     subtitle_path=output_subtitle_path,
                     segments=translated_segments,
+                    caption_suggestions=caption_suggestions,
                 )
             finally:
                 VRAMManager.cleanup()
@@ -335,6 +350,49 @@ class PipelineManager:
                 VRAMManager.cleanup()
 
         return BatchPipelineResult(request_id=request_id, results=results, failed=failed)
+
+    def _caption_suggestions(
+        self,
+        checkpoint: CheckpointStore,
+        config: PipelineConfig,
+        source_segments: list[TranscriptSegment],
+        translated_segments: list[TranscriptSegment],
+    ) -> list[str]:
+        script = [
+            {
+                "source": source.text,
+                "translated": translated_segments[index].text
+                if index < len(translated_segments)
+                else source.text,
+            }
+            for index, source in enumerate(source_segments)
+            if source.text.strip()
+        ]
+        payload = {
+            "stage": "captions",
+            "policy_version": CAPTION_POLICY_VERSION,
+            "source_language": config.source_language,
+            "target_language": config.target_language,
+            "provider": config.translation_provider,
+            "model": config.translation_model,
+            "script": script,
+        }
+        cached = checkpoint.load("captions", payload)
+        if isinstance(cached, list):
+            restored = [str(item).strip() for item in cached if str(item).strip()]
+            if restored:
+                return restored[:3]
+        suggestions = generate_caption_suggestions(
+            script,
+            target_language=config.target_language,
+            source_language=config.source_language,
+            provider=config.translation_provider,
+            model=config.translation_model,
+            max_items=3,
+        )[:3]
+        if suggestions:
+            checkpoint.save("captions", payload, suggestions)
+        return suggestions
 
     def process_douyin(
         self,

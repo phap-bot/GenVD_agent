@@ -7,6 +7,12 @@ from app.models.schemas import PipelineConfig, TranscriptSegment
 from app.services.dependency_service import DependencyService
 from app.services.timeline_service import TimelineService
 from app.services.tts_service import TTSAudioTrack
+from app.utils.video_encoder import (
+    HARDWARE_ENCODERS,
+    cpu_encoder_plan,
+    is_hardware_encoder_runtime_error,
+    select_video_encoder,
+)
 
 logger = logging.getLogger(__name__)
 ACCOMPANIMENT_DEFAULT_VOLUME = 0.92
@@ -23,7 +29,7 @@ def _ffmpeg():
 
 
 class VideoService:
-    """CPU-only ffmpeg composition for subtitles and mixed audio."""
+    """FFmpeg composition with graph-aware video encoder selection."""
 
     def __init__(self, config: PipelineConfig) -> None:
         self.config = config
@@ -150,14 +156,7 @@ class VideoService:
                     audio_stream = ffmpeg.input(str(accompaniment_path)).audio
             else:
                 audio_stream = video_input.audio
-            command = ffmpeg.output(
-                video_stream,
-                audio_stream,
-                str(output_path),
-                vcodec="libx264",
-                acodec="aac",
-            ).overwrite_output()
-            self._run_ffmpeg_command(command, "render")
+            self._render_output(ffmpeg, video_stream, audio_stream, output_path)
             return
 
         tts_input = ffmpeg.input(str(tts_mix_path))
@@ -228,15 +227,58 @@ class VideoService:
             )
         mixed_audio = mixed_audio.filter("alimiter", limit=0.95)
 
-        command = ffmpeg.output(
-            video_stream,
-            mixed_audio,
-            str(output_path),
-            vcodec="libx264",
-            acodec="aac",
-            shortest=None,
-        ).overwrite_output()
-        self._run_ffmpeg_command(command, "render")
+        self._render_output(ffmpeg, video_stream, mixed_audio, output_path)
+
+    def _render_output(self, ffmpeg, video_stream, audio_stream, output_path: Path) -> None:
+        plan = select_video_encoder(
+            ffmpeg_binary=DependencyService().resolve_binary("ffmpeg") or "ffmpeg",
+            has_visual_filters=self.config.burn_subtitles,
+            x264_preset="superfast",
+            x264_crf=22,
+        )
+        logger.info(
+            "video_service.render.encoder codec=%s reason=%s subtitles=%s",
+            plan.codec,
+            plan.reason,
+            self.config.burn_subtitles,
+        )
+
+        def build_output(selected_plan):
+            return ffmpeg.output(
+                video_stream,
+                audio_stream,
+                str(output_path),
+                acodec="aac",
+                movflags="+faststart",
+                **selected_plan.options,
+            ).overwrite_output()
+
+        try:
+            self._run_ffmpeg_command(build_output(plan), "render")
+        except RuntimeError as exc:
+            if plan.codec in HARDWARE_ENCODERS and is_hardware_encoder_runtime_error(exc, plan.codec):
+                fallback = cpu_encoder_plan(x264_preset="superfast", x264_crf=22)
+                logger.warning(
+                    "video_service.render.encoder_fallback from=%s to=libx264 error=%s",
+                    plan.codec,
+                    exc,
+                )
+                self._run_ffmpeg_command(build_output(fallback), "render")
+            elif plan.codec == "copy":
+                fallback = select_video_encoder(
+                    ffmpeg_binary=DependencyService().resolve_binary("ffmpeg") or "ffmpeg",
+                    has_visual_filters=True,
+                    x264_preset="superfast",
+                    x264_crf=22,
+                )
+                logger.warning(
+                    "video_service.render.stream_copy_fallback codec=%s error=%s",
+                    fallback.codec,
+                    exc,
+                )
+                self._run_ffmpeg_command(build_output(fallback), "render")
+            else:
+                raise
 
     def _srt_time(self, seconds: float) -> str:
         millis = round(seconds * 1000)

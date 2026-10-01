@@ -73,6 +73,12 @@ class PipelineConfig(BaseModel):
     ocr_max_frames: int = Field(default=80, ge=1, le=2000)
     ocr_adaptive: bool = True
     ocr_scene_threshold: float = Field(default=0.28, ge=0.02, le=1.0)
+    # Large transient overlay text is a separate visual-cleanup stage.  It is
+    # opt-in so the established subtitle OCR path remains unchanged.
+    flash_text_enabled: bool = False
+    flash_text_mode: Literal["balanced", "strict"] = "balanced"
+    flash_text_min_confidence: float = Field(default=0.58, ge=0.2, le=0.98)
+    flash_text_max_duration_s: float = Field(default=3.0, ge=0.1, le=10.0)
     vocal_separation: bool = False
     # Demucs produces separate stems; these gains control the final source
     # mix after separation. They are independent from background_volume,
@@ -121,6 +127,7 @@ class PipelineResult(BaseModel):
     output_video_path: Path
     subtitle_path: Path | None = None
     segments: list[TranscriptSegment]
+    caption_suggestions: list[str] = Field(default_factory=list, max_length=3)
 
 
 class SubtitleStyle(BaseModel):
@@ -145,6 +152,37 @@ class BlurStyle(BaseModel):
     opacity: float = Field(default=0.26, ge=0, le=0.95)
 
 
+class FlashTextBox(BaseModel):
+    """Normalized bounding box for one frame of a transient large overlay."""
+
+    timestamp: float = Field(ge=0)
+    x: float = Field(ge=0, le=100)
+    y: float = Field(ge=0, le=100)
+    width: float = Field(gt=0, le=100)
+    height: float = Field(gt=0, le=100)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+
+
+class FlashTextTrack(BaseModel):
+    """Independent timeline track for large, short-lived on-screen text."""
+
+    id: int = Field(ge=0)
+    start: float = Field(ge=0)
+    end: float = Field(ge=0)
+    confidence: float = Field(default=0.0, ge=0, le=1)
+    enabled: bool = True
+    boxes: list[FlashTextBox] = Field(default_factory=list, max_length=256)
+    blur: int = Field(default=24, ge=0, le=64)
+    padding: float = Field(default=0.12, ge=0, le=0.5)
+    feather: float = Field(default=0.04, ge=0, le=0.25)
+
+    @model_validator(mode="after")
+    def validate_timeline(self):
+        if self.end < self.start:
+            raise ValueError("flash text track end must be greater than or equal to start")
+        return self
+
+
 class DubbingScriptSegment(BaseModel):
     id: int
     start: float = Field(ge=0)
@@ -167,6 +205,8 @@ class AnalyzeResponse(BaseModel):
     status: Literal["completed"]
     source_video_path: str
     segments: list[DubbingScriptSegment]
+    flash_text_tracks: list[FlashTextTrack] = Field(default_factory=list)
+    caption_suggestions: list[str] = Field(default_factory=list, max_length=3)
 
 
 class RenderScriptRequest(BaseModel):
@@ -194,6 +234,10 @@ class RenderScriptRequest(BaseModel):
     ocr_model: str = Field(default="gemini/gemini-2.5-flash", min_length=1, max_length=160)
     ocr_interval_seconds: float = Field(default=0.75, ge=0.25, le=5.0)
     ocr_crop_bottom_ratio: float = Field(default=0.35, ge=0.12, le=0.85)
+    flash_text_enabled: bool = False
+    flash_text_mode: Literal["balanced", "strict"] = "balanced"
+    flash_text_min_confidence: float = Field(default=0.58, ge=0.2, le=0.98)
+    flash_text_max_duration_s: float = Field(default=3.0, ge=0.1, le=10.0)
     asr_engine: Literal["auto", "whisper", "paraformer"] = "auto"
     whisper_model: str = "auto"
     whisper_beam_size: int = Field(default=1, ge=1, le=10)
@@ -213,6 +257,7 @@ class RenderScriptRequest(BaseModel):
     voice_target_lufs: float = Field(default=-16.0, ge=-40, le=-1)
     bg_duck_voice_db: float = Field(default=-7.0, ge=-30, le=0)
     segments: list[DubbingScriptSegment] = Field(min_length=1)
+    flash_text_tracks: list[FlashTextTrack] = Field(default_factory=list, max_length=1000)
 
     @model_validator(mode="after")
     def require_selected_voice_source(self):
@@ -259,6 +304,7 @@ class DubbingResponse(BaseModel):
     output_video_path: str
     subtitle_path: str | None = None
     segments_count: int
+    caption_suggestions: list[str] = Field(default_factory=list, max_length=3)
 
 
 class BatchDubbingResponse(BaseModel):

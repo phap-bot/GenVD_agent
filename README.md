@@ -199,6 +199,15 @@ number-flooding hallucinations are retried with guarded decoding and rejected
 before translation if they remain suspect, so bad ASR is not silently turned
 into subtitles.
 
+After translation, analyze responses also include `caption_suggestions`: up to
+three one-line captions generated from the source transcript and its translated
+script using the configured translation LLM. The prompt requires factual
+grounding and forbids invented plot details, hashtags and explanations. The
+suggestions are content-addressed under the caption checkpoint and are shown
+with a copy/use action in both Clone Video and Short Video workspaces. If the
+configured provider is not an LLM gateway or the gateway is unavailable, the
+backend returns extractive captions from the translated script instead.
+
 For continuous dialogue, ASR runs without an aggressive VAD filter and the
 pipeline checks the original PCM audio between cues. Audio-bearing gaps are
 closed at the midpoint; genuine silence is preserved. This behavior is

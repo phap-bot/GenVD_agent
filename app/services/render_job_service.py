@@ -15,7 +15,7 @@ from uuid import uuid4
 
 from dotenv import load_dotenv
 
-from app.models.schemas import DubbingScriptSegment, PipelineConfig, RenderScriptRequest
+from app.models.schemas import DubbingScriptSegment, FlashTextTrack, PipelineConfig, RenderScriptRequest
 from app.services.pipeline import AutoDubbingPipeline
 from app.services.short_video_pipeline import ShortVideoPipeline
 from app.utils.workspace import Workspace
@@ -198,6 +198,7 @@ class RenderJobStore:
                 "fingerprint": fingerprint_payload,
                 "config": job_config.model_dump(mode="json"),
                 "segments": [segment.model_dump(mode="json") for segment in payload.segments],
+                "flash_text_tracks": [track.model_dump(mode="json") for track in payload.flash_text_tracks],
             }
             self._atomic_write_json(self.request_path(job_id), request_document)
 
@@ -326,7 +327,11 @@ class RenderJobStore:
             if int(manifest.get("attempt", attempt)) != attempt:
                 return
             status = str(event.get("status", "processing"))
-            manifest["status"] = "complete" if status == "success" else ("failed" if status == "error" else "running")
+            manifest["status"] = (
+                "complete"
+                if status == "success"
+                else ("failed" if status == "error" else ("cancelled" if status == "cancelled" else "running"))
+            )
             manifest["phase"] = str(event.get("phase", manifest.get("phase", "prepare")))
             manifest["progress"] = int(event.get("progress", manifest.get("progress", 0)) or 0)
             manifest["updated_at"] = time.time()
@@ -344,6 +349,34 @@ class RenderJobStore:
                 manifest["output_video_url"] = event.get("video_url")
                 manifest["output_subtitle_url"] = event.get("subtitle_url")
             self._atomic_write_json(self.manifest_path(job_id), manifest)
+
+    def mark_cancelled(self, job_id: str, reason: str = "Cancelled by user") -> bool:
+        with _job_lock(job_id):
+            manifest = self.read_manifest(job_id)
+            if manifest.get("status") in {"complete", "failed", "cancelled"}:
+                return False
+            attempt = int(manifest.get("attempt", 0) or 0)
+            if attempt <= 0:
+                manifest["status"] = "cancelled"
+                manifest["phase"] = "cancelled"
+                manifest["error"] = reason
+                manifest["updated_at"] = time.time()
+                self._atomic_write_json(self.manifest_path(job_id), manifest)
+                return True
+            self.append_event(
+                job_id,
+                attempt,
+                {
+                    "step": "cancelled",
+                    "status": "cancelled",
+                    "phase": "cancelled",
+                    "progress": int(manifest.get("progress", 0) or 0),
+                    "error": reason,
+                    "message": "Render cancelled by user",
+                    "job_id": job_id,
+                },
+            )
+            return True
 
     def attach_task(self, job_id: str, attempt: int, task_id: str) -> None:
         with _job_lock(job_id):
@@ -413,11 +446,12 @@ class RenderJobStore:
                 events.append(value)
         return events
 
-    def load_request(self, job_id: str) -> tuple[PipelineConfig, list[DubbingScriptSegment]]:
+    def load_request(self, job_id: str) -> tuple[PipelineConfig, list[DubbingScriptSegment], list[FlashTextTrack]]:
         document = json.loads(self.request_path(job_id).read_text(encoding="utf-8"))
         config = PipelineConfig.model_validate(document["config"])
         segments = [DubbingScriptSegment.model_validate(item) for item in document["segments"]]
-        return config, segments
+        tracks = [FlashTextTrack.model_validate(item) for item in document.get("flash_text_tracks", [])]
+        return config, segments, tracks
 
     def workspace(self, job_id: str) -> Workspace:
         root = self.job_dir(job_id) / "workspace"
@@ -526,23 +560,37 @@ class RenderJobRunner:
                 return {"job_id": job_id, "status": "complete", "attempt": attempt}
 
             self.store.mark_running(job_id, attempt)
-            config, segments = self.store.load_request(job_id)
+            config, segments, flash_text_tracks = self.store.load_request(job_id)
             workspace = self.store.workspace(job_id)
             terminal_payload: dict[str, Any] | None = None
             try:
                 pipeline_cls = ShortVideoPipeline if config.short_video else AutoDubbingPipeline
                 pipeline = pipeline_cls(config)
-                for sse_event in pipeline.render_script(
-                    workspace=workspace,
-                    source_video_path=self.store.source_path(job_id),
-                    script_segments=segments,
-                ):
-                    payload = _parse_sse_event(sse_event)
-                    if payload is None:
-                        continue
+
+                def persist_event(payload: dict[str, Any]) -> None:
                     self.store.append_event(job_id, attempt, payload)
                     if state_callback is not None:
                         state_callback(payload)
+
+                set_runtime_event_callback = getattr(pipeline, "set_runtime_event_callback", None)
+                if callable(set_runtime_event_callback):
+                    set_runtime_event_callback(persist_event)
+                render_kwargs = {
+                    "workspace": workspace,
+                    "source_video_path": self.store.source_path(job_id),
+                    "script_segments": segments,
+                }
+                # Keep the worker compatible with lightweight pipeline doubles
+                # and older custom pipeline implementations.  The real
+                # AutoDubbingPipeline receives the optional track list when it
+                # is present; an empty list has no rendering effect.
+                if flash_text_tracks:
+                    render_kwargs["flash_text_tracks"] = flash_text_tracks
+                for sse_event in pipeline.render_script(**render_kwargs):
+                    payload = _parse_sse_event(sse_event)
+                    if payload is None:
+                        continue
+                    persist_event(payload)
                     if payload.get("status") in {"success", "error"}:
                         terminal_payload = payload
 
@@ -584,6 +632,20 @@ class RenderJobDispatcher:
 
         self._enqueue(job_id, attempt)
         return RenderJobSubmission(job_id=job_id, attempt=attempt, enqueued=True)
+
+    def cancel(self, job_id: str, reason: str = "Cancelled by user") -> dict[str, Any]:
+        manifest = self.store.read_manifest(job_id)
+        self.store.mark_cancelled(job_id, reason)
+        task_id = str(manifest.get("task_id", "") or "")
+        backend = os.environ.get("AUTODUB_QUEUE_BACKEND", "local").strip().lower()
+        if backend == "celery" and task_id:
+            try:
+                from app.celery_app import celery_app
+
+                celery_app.control.revoke(task_id, terminate=True, signal="SIGTERM")
+            except Exception:
+                logger.exception("render_job.cancel_revoke_failed job_id=%s task_id=%s", job_id, task_id)
+        return manifest
 
     def _enqueue(self, job_id: str, attempt: int) -> None:
         backend = os.environ.get("AUTODUB_QUEUE_BACKEND", "local").strip().lower()

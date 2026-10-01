@@ -18,6 +18,13 @@ Flow:
 10. Mix original background audio with generated TTS audio.
 11. Burn subtitles and export final video.
 
+After translation, the pipeline also sends the paired source/translated script
+to the configured translation LLM and returns up to three grounded, one-line
+caption suggestions. This is a separate metadata stage: captions do not alter
+the canonical subtitle/TTS timeline. Results are checkpointed by media, script,
+provider and model, with an extractive translated-script fallback when an LLM
+gateway is unavailable.
+
 ## 2. Video + SRT to Dubbed Video
 
 Endpoint: `POST /api/v1/dub-with-srt`
