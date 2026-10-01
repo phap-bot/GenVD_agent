@@ -1,7 +1,7 @@
 "use client";
 
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { CheckCircle2, Download, FileVideo, Headphones, Loader2, Play, Scissors, Trash2, UploadCloud } from "lucide-react";
+import { CheckCircle2, Copy, Download, FileVideo, Headphones, Loader2, Play, Scissors, Trash2, UploadCloud, X } from "lucide-react";
 import AudioClipSelector, { PreparedAudioClip, VOICE_REFERENCE_SECONDS } from "./audio-clip-selector";
 import { downloadUrlToDestination } from "@/lib/download-destination";
 
@@ -10,6 +10,8 @@ const INSPECT_URL = `${BACKEND_URL}/api/v1/short-video/inspect`;
 const ANALYZE_URL = `${BACKEND_URL}/api/v1/short-video/analyze`;
 const DUB_URL = `${BACKEND_URL}/api/v1/short-video/dub`;
 const RENDER_URL = `${BACKEND_URL}/api/v1/short-video/render-script`;
+const CANCEL_URL = `${BACKEND_URL}/api/cancel`;
+const RENDER_JOB_URL = `${BACKEND_URL}/api/render-jobs`;
 const VOICE_REFERENCE_URL = `${BACKEND_URL}/api/voice-reference`;
 
 type ShortProfile = {
@@ -90,6 +92,7 @@ export default function ShortVideoWorkspace({ onOpenClone }: Props) {
   const [inspection, setInspection] = useState<Inspection | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
   const [segments, setSegments] = useState<Segment[]>([]);
+  const [captionSuggestions, setCaptionSuggestions] = useState<string[]>([]);
   const [sourceLanguage, setSourceLanguage] = useState("auto");
   const [targetLanguage, setTargetLanguage] = useState("vi");
   const [asrEngine, setAsrEngine] = useState<"auto" | "whisper" | "paraformer">("auto");
@@ -121,6 +124,10 @@ export default function ShortVideoWorkspace({ onOpenClone }: Props) {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const auditStopTimerRef = useRef<number | null>(null);
   const cloneSelectionRevisionRef = useRef(0);
+  const activeControllerRef = useRef<AbortController | null>(null);
+  const activeOperationIdRef = useRef("");
+  const activeRenderJobIdRef = useRef("");
+  const cancelRequestedRef = useRef(false);
 
   useEffect(() => () => {
     if (auditStopTimerRef.current !== null) window.clearTimeout(auditStopTimerRef.current);
@@ -159,6 +166,7 @@ export default function ShortVideoWorkspace({ onOpenClone }: Props) {
     setFile(nextFile);
     setInspection(null);
     setSegments([]);
+    setCaptionSuggestions([]);
     setPreviewUrl(nextFile ? URL.createObjectURL(nextFile) : "");
     setResultUrl("");
     setCloneReferencePath("");
@@ -256,6 +264,10 @@ export default function ShortVideoWorkspace({ onOpenClone }: Props) {
 
   async function consumeStream(response: Response, operation: "analyze" | "dub") {
     if (!response.ok) throw new Error(await errorMessage(response));
+    const responseOperationId = response.headers.get("X-Operation-ID");
+    if (responseOperationId) activeOperationIdRef.current = responseOperationId;
+    const responseJobId = response.headers.get("X-Render-Job-ID");
+    if (responseJobId) activeRenderJobIdRef.current = responseJobId;
     if (!response.body) throw new Error("Backend không trả event stream.");
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -267,11 +279,20 @@ export default function ShortVideoWorkspace({ onOpenClone }: Props) {
         const raw = line.replace(/^data:\s*/, "").trim();
         if (!raw || raw === "[DONE]") continue;
         const payload = JSON.parse(raw) as Record<string, unknown>;
+        if (typeof payload.request_id === "string") activeOperationIdRef.current = payload.request_id;
+        if (typeof payload.job_id === "string") activeRenderJobIdRef.current = payload.job_id;
         if (typeof payload.error === "string") throw new Error(payload.error);
         if (typeof payload.phase === "string") setPhase(payload.phase);
         if (typeof payload.progress === "number") setProgress(Math.max(0, Math.min(100, Math.round(payload.progress))));
         if (typeof payload.step === "string") setStatus(String(payload.step));
         if (Array.isArray(payload.segments)) setSegments(payload.segments as Segment[]);
+        if (Array.isArray(payload.caption_suggestions)) {
+          setCaptionSuggestions(
+            payload.caption_suggestions
+              .filter((item): item is string => typeof item === "string")
+              .slice(0, 3),
+          );
+        }
         if (typeof payload.video_url === "string") setResultUrl(mediaUrl(payload.video_url));
         if (payload.status === "success") {
           setProgress(100);
@@ -289,6 +310,15 @@ export default function ShortVideoWorkspace({ onOpenClone }: Props) {
       events.forEach(consumeEvent);
     }
     if (buffer.trim()) consumeEvent(buffer);
+  }
+
+  async function copyCaption(caption: string) {
+    try {
+      await navigator.clipboard.writeText(caption);
+      setStatus("Đã sao chép caption để bạn dùng ngay");
+    } catch {
+      setError("Không thể sao chép caption trên trình duyệt này.");
+    }
   }
 
   function makeForm(clonePathOverride = cloneReferencePath) {
@@ -357,17 +387,23 @@ export default function ShortVideoWorkspace({ onOpenClone }: Props) {
     if (!canProcess) return;
     setBusy("analyze");
     setError("");
+    const controller = new AbortController();
+    activeControllerRef.current = controller;
+    activeOperationIdRef.current = "";
+    activeRenderJobIdRef.current = "";
+    cancelRequestedRef.current = false;
     setStatus("Đang nhận dạng thoại và subtitle...");
     setPhase("recognize");
     try {
       const cloneSelectionRevision = cloneSelectionRevisionRef.current;
       const selectedClonePath = await uploadCloneReference(cloneSelectionRevision);
       assertCloneSelectionUnchanged(cloneSelectionRevision);
-      await consumeStream(await fetch(ANALYZE_URL, { method: "POST", body: makeForm(selectedClonePath), headers: { Accept: "text/event-stream" } }), "analyze");
+      await consumeStream(await fetch(ANALYZE_URL, { method: "POST", body: makeForm(selectedClonePath), headers: { Accept: "text/event-stream" }, signal: controller.signal }), "analyze");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Analyze thất bại.");
       setStatus("Analyze thất bại");
     } finally {
+      if (activeControllerRef.current === controller) activeControllerRef.current = null;
       setBusy("");
     }
   }
@@ -376,6 +412,11 @@ export default function ShortVideoWorkspace({ onOpenClone }: Props) {
     if (!canProcess) return;
     setBusy("dub");
     setError("");
+    const controller = new AbortController();
+    activeControllerRef.current = controller;
+    activeOperationIdRef.current = "";
+    activeRenderJobIdRef.current = "";
+    cancelRequestedRef.current = false;
     setResultUrl("");
     setStatus("Đang dịch, lồng tiếng và render Short Video...");
     try {
@@ -425,16 +466,46 @@ export default function ShortVideoWorkspace({ onOpenClone }: Props) {
             voice_speed: 1.0,
             segments: renderSegments,
           }),
+          signal: controller.signal,
         });
         await consumeStream(response, "dub");
       } else {
-        await consumeStream(await fetch(DUB_URL, { method: "POST", body: makeForm(selectedClonePath), headers: { Accept: "text/event-stream" } }), "dub");
+        await consumeStream(await fetch(DUB_URL, { method: "POST", body: makeForm(selectedClonePath), headers: { Accept: "text/event-stream" }, signal: controller.signal }), "dub");
       }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Dubbing thất bại.");
       setStatus("Dubbing thất bại");
     } finally {
+      if (activeControllerRef.current === controller) activeControllerRef.current = null;
       setBusy("");
+    }
+  }
+
+  async function cancelCurrentOperation() {
+    if (!busy || busy === "inspect") return;
+    cancelRequestedRef.current = true;
+    const controller = activeControllerRef.current;
+    const operationId = activeOperationIdRef.current;
+    const jobId = activeRenderJobIdRef.current;
+    try {
+      if (busy === "dub" && jobId) {
+        await fetch(`${RENDER_JOB_URL}/${jobId}/cancel`, { method: "POST" });
+      } else {
+        await fetch(CANCEL_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ request_id: operationId || null, hard: true }),
+        });
+      }
+    } catch {
+      // Hard cancellation may terminate the BE before the response reaches the browser.
+    } finally {
+      controller?.abort();
+      activeControllerRef.current = null;
+      activeOperationIdRef.current = "";
+      activeRenderJobIdRef.current = "";
+      setBusy("");
+      setStatus("Đã hủy và gửi lệnh dừng process BE");
     }
   }
 
@@ -568,6 +639,24 @@ export default function ShortVideoWorkspace({ onOpenClone }: Props) {
         <nav aria-label="Short Video checkpoints"><ol className="flex flex-wrap gap-3 text-sm font-semibold text-slate-500"><li className={phase === "prepare" ? "text-blue-700" : ""}>1. Media</li><li className={phase === "recognize" ? "text-blue-700" : ""}>2. Nhận dạng</li><li className={phase === "translate" ? "text-blue-700" : ""}>3. Dịch</li><li className={phase === "voice" ? "text-blue-700" : ""}>4. Lồng tiếng</li><li className={phase === "render" || progress === 100 ? "text-blue-700" : ""}>5. Xuất bản</li></ol></nav>
         <header className="mt-5 flex items-end justify-between gap-3"><hgroup><p className="text-xs font-bold uppercase tracking-wide text-blue-700">Pipeline bổ sung</p><h1 className="mt-1 text-2xl font-semibold">Short Video dubbing</h1><p className="mt-1 text-sm text-slate-600">{profileLabel}</p></hgroup>{inspection?.profile.route === "clone_video" && <button type="button" disabled={controlsLocked} onClick={onOpenClone} className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm font-semibold text-amber-800 disabled:cursor-not-allowed disabled:opacity-60">Mở Clone Video</button>}</header>
         <section className="mt-4 rounded-lg border border-blue-100 bg-white p-4 shadow-sm" aria-live="polite"><header className="flex items-center justify-between"><h2 className="font-semibold">{status}</h2><output className="font-bold text-blue-700">{progress}%</output></header><progress className="mt-3 h-2 w-full" max={100} value={progress} />{error && <p className="mt-3 rounded bg-red-50 p-3 text-sm text-red-700">{error}</p>}</section>
+        {captionSuggestions.length > 0 && (
+          <section className="mt-4 rounded-lg border border-amber-200 bg-amber-50/60 p-4" aria-labelledby="short-caption-suggestions-title">
+            <p className="text-xs font-bold uppercase tracking-wide text-amber-700">Caption bám sát nội dung</p>
+            <h2 id="short-caption-suggestions-title" className="mt-1 font-semibold text-slate-950">3 đề xuất từ kịch bản đã dịch</h2>
+            <p className="mt-1 text-xs text-slate-600">Tạo từ transcript gốc và bản dịch của chính video này.</p>
+            <ol className="mt-3 grid gap-2">
+              {captionSuggestions.map((caption, index) => (
+                <li key={`${index}-${caption}`} className="flex items-start gap-2 rounded-md border border-amber-100 bg-white p-3">
+                  <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-amber-100 text-xs font-bold text-amber-800">{index + 1}</span>
+                  <p className="min-w-0 flex-1 text-sm font-medium leading-6 text-slate-800">{caption}</p>
+                  <button type="button" onClick={() => void copyCaption(caption)} className="inline-flex shrink-0 items-center gap-1 rounded border border-amber-200 bg-amber-50 px-2 py-1 text-xs font-semibold text-amber-800">
+                    <Copy size={13} aria-hidden="true" /> Dùng
+                  </button>
+                </li>
+              ))}
+            </ol>
+          </section>
+        )}
         <section className="mt-4 rounded-lg border border-slate-200 bg-white p-4" aria-labelledby="short-script-title">
           <header className="flex flex-wrap items-center justify-between gap-2">
             <div><h2 id="short-script-title" className="font-semibold">Review timeline & audit giọng gốc</h2><p className="mt-1 text-xs text-slate-500">Sửa text, chỉnh mốc thời gian, nghe từng đoạn hoặc chia nhỏ trước khi lồng tiếng.</p></div>
@@ -601,6 +690,7 @@ export default function ShortVideoWorkspace({ onOpenClone }: Props) {
         </section>
         <menu className="mt-4 flex flex-wrap gap-3"><button type="button" disabled={!canProcess || Boolean(busy)} onClick={() => void analyze()} className="inline-flex h-10 items-center gap-2 rounded-md border border-blue-200 bg-blue-50 px-4 text-sm font-semibold text-blue-700 disabled:opacity-50">{busy === "analyze" ? <Loader2 className="animate-spin" size={16} /> : <CheckCircle2 size={16} />} Nhận dạng & dịch</button><button type="button" disabled={!canProcess || segments.length === 0 || Boolean(busy)} onClick={() => void dub()} className="inline-flex h-10 items-center gap-2 rounded-md bg-blue-600 px-4 text-sm font-semibold text-white disabled:bg-slate-300">{busy === "dub" ? <Loader2 className="animate-spin" size={16} /> : <Play size={16} />} Lồng tiếng timeline đã duyệt</button>{resultUrl && <button type="button" onClick={() => void downloadResult()} className="inline-flex h-10 items-center gap-2 rounded-md bg-slate-950 px-4 text-sm font-semibold text-white"><Download size={16} /> Tải video</button>}</menu>
       </section>
+    {busy === "analyze" || busy === "dub" ? <button type="button" onClick={() => void cancelCurrentOperation()} className="fixed bottom-5 right-5 z-20 inline-flex h-10 items-center gap-2 rounded-md border border-red-300 bg-red-50 px-4 text-sm font-semibold text-red-700 shadow-lg"><X size={16} /> Hủy & dừng process BE</button> : null}
     </main>
   );
 }

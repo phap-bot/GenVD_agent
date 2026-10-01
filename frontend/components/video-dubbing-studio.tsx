@@ -4,6 +4,7 @@ import {
   AlertCircle,
   CheckCircle2,
   Clock3,
+  Copy,
   Download,
   FileVideo,
   Languages,
@@ -33,6 +34,7 @@ const ANALYZE_URL = `${BACKEND_URL}/api/analyze-stream`;
 const RENDER_SCRIPT_URL = `${BACKEND_URL}/api/render-script`;
 const RENDER_SCRIPT_UPLOAD_URL = `${BACKEND_URL}/api/render-script-upload`;
 const RENDER_JOB_URL = `${BACKEND_URL}/api/render-jobs`;
+const CANCEL_URL = `${BACKEND_URL}/api/cancel`;
 const VOICE_REFERENCE_URL = `${BACKEND_URL}/api/voice-reference`;
 const SHORTEN_TEXT_URL = `${BACKEND_URL}/api/shorten-text`;
 const TRANSLATION_MODELS_URL = `${BACKEND_URL}/api/translation/models`;
@@ -43,7 +45,7 @@ const DEFAULT_OCR_MODEL = "gemini/gemini-2.5-flash";
 const DEFAULT_ASR_MODEL = "base";
 const VI_WORDS_PER_SECOND = 3;
 const STUDIO_SESSION_KEY = 'video-clone:studio-session:v1';
-const STUDIO_SESSION_VERSION = 3;
+const STUDIO_SESSION_VERSION = 4;
 
 type CopyrightSource = "unknown" | "owned" | "licensed" | "public_domain" | "permission" | "platform_library";
 type VoiceMode = "system" | "clone";
@@ -69,6 +71,10 @@ type StudioConfig = {
   ocrModel: string;
   ocrIntervalSeconds: number;
   ocrCropBottomRatio: number;
+  flashTextEnabled: boolean;
+  flashTextMode: "balanced" | "strict";
+  flashTextMinConfidence: number;
+  flashTextMaxDuration: number;
   vocalSeparation: boolean;
   originalVocalGain: number;
   accompanimentGain: number;
@@ -115,6 +121,27 @@ type BlurStyle = {
   opacity: number;
 };
 
+type FlashTextBox = {
+  timestamp: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  confidence: number;
+};
+
+type FlashTextTrack = {
+  id: number;
+  start: number;
+  end: number;
+  confidence: number;
+  enabled: boolean;
+  boxes: FlashTextBox[];
+  blur: number;
+  padding: number;
+  feather: number;
+};
+
 type ScriptSegment = {
   id: number;
   start: number;
@@ -158,6 +185,8 @@ type StudioSessionSnapshot = {
   activeWorkspace: 'clone' | 'short' | 'gen' | 'setup';
   sourceVideoUrl: string;
   segments: ScriptSegment[];
+  captionSuggestions: string[];
+  flashTextTracks: FlashTextTrack[];
   config: StudioConfig;
   activeStep: number;
   selectedSegmentId: number | null;
@@ -494,11 +523,17 @@ export default function VideoDubbingStudio() {
   const lastStoredCloneFileRef = useRef<File | null>(null);
   const pendingFileSavesRef = useRef(0);
   const cloneSelectionRevisionRef = useRef(0);
+  const activeRequestControllerRef = useRef<AbortController | null>(null);
+  const activeOperationIdRef = useRef("");
+  const activeRenderJobIdRef = useRef("");
+  const cancelRequestedRef = useRef(false);
   const [activeWorkspace, setActiveWorkspace] = useState<"clone" | "short" | "gen" | "setup">("clone");
   const [file, setFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState("");
   const [sourceVideoUrl, setSourceVideoUrl] = useState("");
   const [segments, setSegments] = useState<ScriptSegment[]>([]);
+  const [captionSuggestions, setCaptionSuggestions] = useState<string[]>([]);
+  const [flashTextTracks, setFlashTextTracks] = useState<FlashTextTrack[]>([]);
   const [config, setConfig] = useState<StudioConfig>({
     sourceLanguage: "auto",
     targetLanguage: "vi",
@@ -520,6 +555,10 @@ export default function VideoDubbingStudio() {
     ocrModel: DEFAULT_OCR_MODEL,
     ocrIntervalSeconds: 0.75,
     ocrCropBottomRatio: 0.35,
+    flashTextEnabled: false,
+    flashTextMode: "balanced",
+    flashTextMinConfidence: 0.58,
+    flashTextMaxDuration: 3.0,
     vocalSeparation: false,
     originalVocalGain: 0,
     accompanimentGain: 1,
@@ -604,6 +643,8 @@ export default function VideoDubbingStudio() {
     activeWorkspace,
     sourceVideoUrl: sourceVideoUrl.startsWith('blob:') ? '' : sourceVideoUrl,
     segments,
+    captionSuggestions,
+    flashTextTracks,
     config,
     activeStep,
     selectedSegmentId,
@@ -645,11 +686,13 @@ export default function VideoDubbingStudio() {
     savedDemoSegments,
     savedTextLayerEnabled,
     segments,
+    captionSuggestions,
     selectedSegmentId,
     sessionHydrated,
     sourceVideoUrl,
     statusText,
     textLayerEnabled,
+    flashTextTracks,
   ]);
 
   useEffect(() => {
@@ -666,7 +709,7 @@ export default function VideoDubbingStudio() {
           // Version 1 stored the old OCR default as enabled. Versions 1/2 also
           // used the old always-on vocal-separation default; migrate that
           // legacy default to the new opt-in behavior below.
-          if ((parsed.version === STUDIO_SESSION_VERSION || parsed.version === 2 || parsed.version === 1) && parsed.sessionId) snapshot = parsed;
+          if ((parsed.version === STUDIO_SESSION_VERSION || parsed.version === 3 || parsed.version === 2 || parsed.version === 1) && parsed.sessionId) snapshot = parsed;
         }
       } catch {
         window.sessionStorage.removeItem(STUDIO_SESSION_KEY);
@@ -683,6 +726,12 @@ export default function VideoDubbingStudio() {
           restoredConfig.originalVocalGain = 0;
           restoredConfig.accompanimentGain = 1;
         }
+        if (snapshot.version < 4) {
+          restoredConfig.flashTextEnabled = false;
+          restoredConfig.flashTextMode = "balanced";
+          restoredConfig.flashTextMinConfidence = 0.58;
+          restoredConfig.flashTextMaxDuration = 3.0;
+        }
         const restoredSegments = Array.isArray(snapshot.segments)
           ? snapshot.segments.map((segment) => normalizeSegment(segment, restoredConfig.voiceModel))
           : [];
@@ -694,6 +743,8 @@ export default function VideoDubbingStudio() {
         setActiveWorkspace(snapshot.activeWorkspace === 'gen' ? 'gen' : snapshot.activeWorkspace === 'short' ? 'short' : snapshot.activeWorkspace === 'setup' ? 'setup' : 'clone');
         setSourceVideoUrl(snapshot.sourceVideoUrl || '');
         setSegments(restoredSegments);
+        setCaptionSuggestions(Array.isArray(snapshot.captionSuggestions) ? snapshot.captionSuggestions.slice(0, 3) : []);
+        setFlashTextTracks(Array.isArray(snapshot.flashTextTracks) ? snapshot.flashTextTracks : []);
         setConfig(restoredConfig);
         setActiveStep(clampNumber(snapshot.activeStep, 0, workflowSteps.length - 1));
         setSelectedSegmentId(snapshot.selectedSegmentId ?? restoredSegments[0]?.id ?? null);
@@ -998,6 +1049,15 @@ export default function VideoDubbingStudio() {
     window.setTimeout(() => setToast(null), 5200);
   }
 
+  async function copyCaption(caption: string) {
+    try {
+      await navigator.clipboard.writeText(caption);
+      showToast({ type: "success", message: "Đã sao chép caption để bạn dùng ngay." });
+    } catch {
+      showToast({ type: "error", message: "Không thể sao chép caption trên trình duyệt này." });
+    }
+  }
+
   async function persistVideoFileForRetry(videoFile: File | null) {
     if (!sessionIdRef.current || !videoFile) return;
     try {
@@ -1025,6 +1085,8 @@ export default function VideoDubbingStudio() {
     setPreviewUrl('');
     setSourceVideoUrl('');
     setSegments([]);
+    setCaptionSuggestions([]);
+    setFlashTextTracks([]);
     setConfig({
       sourceLanguage: 'auto',
       targetLanguage: 'vi',
@@ -1046,6 +1108,10 @@ export default function VideoDubbingStudio() {
       ocrModel: DEFAULT_OCR_MODEL,
       ocrIntervalSeconds: 0.75,
       ocrCropBottomRatio: 0.35,
+      flashTextEnabled: false,
+      flashTextMode: 'balanced',
+      flashTextMinConfidence: 0.58,
+      flashTextMaxDuration: 3.0,
       vocalSeparation: false,
       originalVocalGain: 0,
       accompanimentGain: 1,
@@ -1135,6 +1201,7 @@ export default function VideoDubbingStudio() {
     setFile(nextFile);
     void persistVideoFileForRetry(nextFile);
     setPreviewUrl(URL.createObjectURL(nextFile));
+    setFlashTextTracks([]);
     if (segments.length > 0) {
       setSourceVideoUrl("");
       setResultVideoUrl("");
@@ -1147,6 +1214,7 @@ export default function VideoDubbingStudio() {
     setResultVideoUrl("");
     setResultSubtitleUrl("");
     setSegments([]);
+    setCaptionSuggestions([]);
     setSavedDemoSegments(null);
     setSelectedSegmentId(null);
     setActiveStep(0);
@@ -1321,6 +1389,10 @@ export default function VideoDubbingStudio() {
     formData.append("ocr_model", config.ocrModel);
     formData.append("ocr_interval_seconds", String(config.ocrIntervalSeconds));
     formData.append("ocr_crop_bottom_ratio", String(config.ocrCropBottomRatio));
+    formData.append("flash_text_enabled", String(config.flashTextEnabled));
+    formData.append("flash_text_mode", config.flashTextMode);
+    formData.append("flash_text_min_confidence", String(config.flashTextMinConfidence));
+    formData.append("flash_text_max_duration_s", String(config.flashTextMaxDuration));
     formData.append("soft_timing_fit", String(config.softTimingFit));
     formData.append("timing_max_drift_s", String(config.timingMaxDrift));
     formData.append("timing_min_gap_s", String(config.timingMinGap));
@@ -1335,14 +1407,21 @@ export default function VideoDubbingStudio() {
     resetProcessing("Đang nhận dạng và tách timeline...", 5, "recognize");
     setActiveStep(1);
     setToast(null);
+    const controller = new AbortController();
+    activeRequestControllerRef.current = controller;
+    cancelRequestedRef.current = false;
+    activeOperationIdRef.current = "";
+    activeRenderJobIdRef.current = "";
 
     try {
       const response = await fetch(ANALYZE_URL, {
         method: "POST",
         body: formData,
         headers: { Accept: "text/event-stream" },
+        signal: controller.signal,
       });
       await readEventStream(response);
+      if (cancelRequestedRef.current) return;
       showToast({ type: "success", message: "Đã phân tích timeline kịch bản." });
     } catch (error) {
       showToast({
@@ -1351,6 +1430,7 @@ export default function VideoDubbingStudio() {
       });
       setStatusText("Phân tích thất bại");
     } finally {
+      if (activeRequestControllerRef.current === controller) activeRequestControllerRef.current = null;
       setIsAnalyzing(false);
     }
   }
@@ -1370,7 +1450,12 @@ export default function VideoDubbingStudio() {
 
       const parsed = JSON.parse(message) as Record<string, unknown>;
       const parsedJobId = typeof parsed.job_id === "string" ? parsed.job_id : "";
-      if (parsedJobId) setRenderJobId(parsedJobId);
+      if (parsedJobId) {
+        activeRenderJobIdRef.current = parsedJobId;
+        setRenderJobId(parsedJobId);
+      }
+      const parsedRequestId = typeof parsed.request_id === "string" ? parsed.request_id : "";
+      if (parsedRequestId) activeOperationIdRef.current = parsedRequestId;
       const error = typeof parsed.error === "string" ? parsed.error : "";
       if (error) throw new Error(error);
 
@@ -1389,6 +1474,10 @@ export default function VideoDubbingStudio() {
       const subtitleUrl = typeof parsed.subtitle_url === "string" ? parsed.subtitle_url : "";
       const sourceVideoPath = typeof parsed.source_video_path === "string" ? parsed.source_video_path : "";
       const nextSegments = Array.isArray(parsed.segments) ? (parsed.segments as ScriptSegment[]) : null;
+      const nextFlashTextTracks = Array.isArray(parsed.flash_text_tracks) ? (parsed.flash_text_tracks as FlashTextTrack[]) : null;
+      const nextCaptionSuggestions = Array.isArray(parsed.caption_suggestions)
+        ? parsed.caption_suggestions.filter((item): item is string => typeof item === "string").slice(0, 3)
+        : null;
       const nextProgress = parsedProgress !== null ? clampProgress(parsedProgress) : progress;
       const statusLabel = phase ? phaseLabel(phase) : step ? normalizeStage(step) : statusText;
       const nextDetail = detail || statsSummary(stats) || (step && phase ? normalizeStage(step) : "");
@@ -1430,6 +1519,8 @@ export default function VideoDubbingStudio() {
         setProcessingDetail("Timeline đã sẵn sàng để chỉnh sửa và chọn giọng.");
         setStatusText(`Đã tách ${nextSegments.length} đoạn thoại`);
       }
+      if (nextFlashTextTracks) setFlashTextTracks(nextFlashTextTracks);
+      if (nextCaptionSuggestions) setCaptionSuggestions(nextCaptionSuggestions);
     }
   }
 
@@ -1448,7 +1539,12 @@ export default function VideoDubbingStudio() {
     if (!response.ok) throw new Error(await httpErrorMessage(response));
     if (!response.body) throw new Error("Backend khong tra stream.");
     const responseJobId = response.headers.get("X-Render-Job-ID");
-    if (responseJobId) setRenderJobId(responseJobId);
+    if (responseJobId) {
+      activeRenderJobIdRef.current = responseJobId;
+      setRenderJobId(responseJobId);
+    }
+    const responseOperationId = response.headers.get("X-Operation-ID");
+    if (responseOperationId) activeOperationIdRef.current = responseOperationId;
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -1463,6 +1559,36 @@ export default function VideoDubbingStudio() {
       for (const event of events) await handleStreamEvent(event);
     }
     if (buffer.trim()) await handleStreamEvent(buffer);
+  }
+
+  async function cancelCurrentOperation() {
+    if (!isAnalyzing && !isRendering) return;
+    cancelRequestedRef.current = true;
+    const controller = activeRequestControllerRef.current;
+    const operationId = activeOperationIdRef.current;
+    const jobId = activeRenderJobIdRef.current || renderJobId;
+    try {
+      if (isRendering && jobId) {
+        await fetch(`${RENDER_JOB_URL}/${jobId}/cancel`, { method: "POST" });
+      } else {
+        await fetch(CANCEL_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ request_id: operationId || null, hard: true }),
+        });
+      }
+    } catch {
+      // Hard cancellation may terminate the BE before the response reaches the browser.
+    } finally {
+      controller?.abort();
+      activeRequestControllerRef.current = null;
+      activeOperationIdRef.current = "";
+      activeRenderJobIdRef.current = "";
+      setIsAnalyzing(false);
+      setIsRendering(false);
+      setStatusText("Đã hủy và gửi lệnh dừng process BE");
+      showToast({ type: "success", message: "Đã gửi lệnh hủy cưỡng bức tới backend." });
+    }
   }
 
   function assertCloneSelectionUnchanged(expectedRevision: number) {
@@ -1515,6 +1641,11 @@ export default function VideoDubbingStudio() {
     }
     setIsRendering(true);
     setRenderJobId("");
+    const controller = new AbortController();
+    activeRequestControllerRef.current = controller;
+    cancelRequestedRef.current = false;
+    activeOperationIdRef.current = "";
+    activeRenderJobIdRef.current = "";
     setActiveStep(3);
     resetProcessing("Đang bắt đầu render bản demo...", 5, "voice");
     setResultVideoUrl("");
@@ -1564,6 +1695,11 @@ export default function VideoDubbingStudio() {
           ocr_model: config.ocrModel,
           ocr_interval_seconds: config.ocrIntervalSeconds,
           ocr_crop_bottom_ratio: config.ocrCropBottomRatio,
+          flash_text_enabled: config.flashTextEnabled,
+          flash_text_mode: config.flashTextMode,
+          flash_text_min_confidence: config.flashTextMinConfidence,
+          flash_text_max_duration_s: config.flashTextMaxDuration,
+          flash_text_tracks: flashTextTracks,
           asr_engine: config.asrEngine,
           whisper_model: config.whisperModel,
           whisper_beam_size: config.whisperBeamSize,
@@ -1593,6 +1729,7 @@ export default function VideoDubbingStudio() {
             method: "POST",
             headers: { Accept: "text/event-stream" },
             body: formData,
+            signal: controller.signal,
           });
         };
         const postRenderWithSourcePath = () =>
@@ -1603,6 +1740,7 @@ export default function VideoDubbingStudio() {
               "Content-Type": "application/json",
             },
             body: JSON.stringify(renderPayload),
+            signal: controller.signal,
           });
 
         const renderVideoFile = file || (await readStoredVideoFile());
@@ -1641,6 +1779,7 @@ export default function VideoDubbingStudio() {
       });
       setStatusText("Render thất bại");
     } finally {
+      if (activeRequestControllerRef.current === controller) activeRequestControllerRef.current = null;
       setIsRendering(false);
     }
   }
@@ -1773,6 +1912,7 @@ export default function VideoDubbingStudio() {
                   setPreviewUrl("");
                   setSourceVideoUrl("");
                   setSegments([]);
+                  setFlashTextTracks([]);
                   resetProcessing("Chưa có video");
                 }}
               >
@@ -1830,6 +1970,28 @@ export default function VideoDubbingStudio() {
                 <label className="grid gap-1 text-xs font-medium">Khoảng quét OCR (giây)<input type="number" min="0.25" max="5" step="0.05" value={config.ocrIntervalSeconds} disabled={!config.ocrFallback && !config.ocrForce} onChange={(event) => setConfig((current) => ({ ...current, ocrIntervalSeconds: Math.max(0.25, Math.min(5, Number(event.target.value) || 0.75)) }))} className="rounded border border-slate-300 bg-white px-2 py-2" /></label>
                 <label className="grid gap-1 text-xs font-medium">Vùng phụ đề phía dưới (%)<input type="number" min="12" max="85" step="1" value={Math.round(config.ocrCropBottomRatio * 100)} disabled={!config.ocrFallback && !config.ocrForce} onChange={(event) => setConfig((current) => ({ ...current, ocrCropBottomRatio: Math.max(0.12, Math.min(0.85, (Number(event.target.value) || 35) / 100)) }))} className="rounded border border-slate-300 bg-white px-2 py-2" /></label>
               </div>
+            </fieldset>
+            <fieldset className="grid gap-3 rounded-md border border-amber-200 bg-amber-50/50 p-3">
+              <legend className="px-1 text-sm font-semibold text-amber-800">Che chữ hiệu ứng chớp nhoáng</legend>
+              <label className="flex items-start gap-3 text-sm font-medium text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={config.flashTextEnabled}
+                  onChange={(event) => setConfig((current) => ({ ...current, flashTextEnabled: event.target.checked }))}
+                  className="mt-1 h-4 w-4 rounded border-amber-300 text-amber-600 focus:ring-amber-500"
+                />
+                <span>
+                  Tự detect và blur chữ lớn trên màn hình
+                  <span className="mt-1 block text-xs font-normal text-amber-800">Chỉ quét vùng giữa/phía trên, bỏ qua subtitle phía dưới và không gọi OCR dịch thuật.</span>
+                </span>
+              </label>
+              {config.flashTextEnabled && (
+                <div className="grid grid-cols-2 gap-2">
+                  <label className="grid gap-1 text-xs font-medium">Độ quét<select value={config.flashTextMode} onChange={(event) => setConfig((current) => ({ ...current, flashTextMode: event.target.value as StudioConfig["flashTextMode"] }))} className="rounded border border-amber-200 bg-white px-2 py-2"><option value="balanced">Cân bằng (mỗi 2 frame)</option><option value="strict">Khắt khe (mọi frame)</option></select></label>
+                  <label className="grid gap-1 text-xs font-medium">Thời lượng tối đa (giây)<input type="number" min="0.1" max="10" step="0.1" value={config.flashTextMaxDuration} onChange={(event) => setConfig((current) => ({ ...current, flashTextMaxDuration: Math.max(0.1, Math.min(10, Number(event.target.value) || 3)) }))} className="rounded border border-amber-200 bg-white px-2 py-2" /></label>
+                </div>
+              )}
+              {flashTextTracks.length > 0 && <p className="text-xs font-semibold text-amber-800">Đã phát hiện {flashTextTracks.length} cụm chữ overlay; sẽ che đúng timeline khi render.</p>}
             </fieldset>
             <fieldset className="grid gap-3 rounded-md border border-emerald-200 bg-emerald-50/40 p-3">
               <legend className="px-1 text-sm font-semibold text-emerald-800">Khớp voice theo timeline gốc</legend>
@@ -2007,6 +2169,16 @@ export default function VideoDubbingStudio() {
               {isRendering ? <Loader2 className="animate-spin" size={16} /> : <Play size={16} />}
               <span className="truncate">{segments.length > 0 && sourceVideoUrl ? "Render bản đã lưu" : "Render"}</span>
             </button>
+            {(isAnalyzing || isRendering) && (
+              <button
+                type="button"
+                onClick={() => void cancelCurrentOperation()}
+                className="col-span-2 inline-flex h-10 items-center justify-center gap-2 rounded-md border border-red-300 bg-red-50 px-2 text-sm font-semibold text-red-700"
+              >
+                <X size={16} />
+                <span className="truncate">Hủy & dừng process BE</span>
+              </button>
+            )}
           </menu>
         </aside>
 
@@ -2132,10 +2304,34 @@ export default function VideoDubbingStudio() {
             )}
           </section>
 
+          {captionSuggestions.length > 0 && (
+            <section className="mt-4 rounded-lg border border-amber-200 bg-amber-50/60 p-4 shadow-sm" aria-labelledby="caption-suggestions-title">
+              <header className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs font-bold uppercase tracking-wide text-amber-700">Caption bám sát nội dung</p>
+                  <h3 id="caption-suggestions-title" className="mt-1 text-base font-semibold text-slate-950">3 đề xuất từ kịch bản đã dịch</h3>
+                  <p className="mt-1 text-sm text-slate-600">Các câu được tạo từ transcript gốc và bản dịch, không lấy ý tưởng rời khỏi nội dung video.</p>
+                </div>
+              </header>
+              <ol className="mt-3 grid gap-2">
+                {captionSuggestions.map((caption, index) => (
+                  <li key={`${index}-${caption}`} className="flex items-start gap-3 rounded-md border border-amber-100 bg-white p-3">
+                    <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-amber-100 text-xs font-bold text-amber-800">{index + 1}</span>
+                    <p className="min-w-0 flex-1 text-sm font-medium leading-6 text-slate-800">{caption}</p>
+                    <button type="button" onClick={() => void copyCaption(caption)} className="inline-flex shrink-0 items-center gap-1 rounded border border-amber-200 bg-amber-50 px-2 py-1 text-xs font-semibold text-amber-800 hover:bg-amber-100">
+                      <Copy size={13} aria-hidden="true" /> Dùng
+                    </button>
+                  </li>
+                ))}
+              </ol>
+            </section>
+          )}
+
           {segments.length > 0 && currentVideoUrl && selectedSegment && (
             <SubtitleLayoutEditor
               videoUrl={currentVideoUrl}
               segments={segments}
+              flashTextTracks={flashTextTracks}
               selectedSegment={selectedSegment}
               hasSavedDemo={hasSavedDemo}
               hasUnsavedDemoChanges={hasUnsavedDemoChanges}
@@ -2245,6 +2441,7 @@ export default function VideoDubbingStudio() {
 function SubtitleLayoutEditor({
   videoUrl,
   segments,
+  flashTextTracks,
   selectedSegment,
   hasSavedDemo,
   hasUnsavedDemoChanges,
@@ -2258,6 +2455,7 @@ function SubtitleLayoutEditor({
 }: {
   videoUrl: string;
   segments: ScriptSegment[];
+  flashTextTracks: FlashTextTrack[];
   selectedSegment: ScriptSegment;
   hasSavedDemo: boolean;
   hasUnsavedDemoChanges: boolean;
@@ -2282,6 +2480,17 @@ function SubtitleLayoutEditor({
     const runningSegment = orderedSegments.findLast((segment) => previewTime >= segment.start);
     return runningSegment ? [runningSegment] : [selectedSegment];
   }, [previewTime, segments, selectedSegment]);
+  const activeFlashTextBoxes = useMemo(
+    () => flashTextTracks
+      .filter((track) => track.enabled && previewTime >= track.start && previewTime <= track.end && track.boxes.length > 0)
+      .map((track) => ({
+        track,
+        box: track.boxes.reduce((closest, current) =>
+          Math.abs(current.timestamp - previewTime) < Math.abs(closest.timestamp - previewTime) ? current : closest
+        ),
+      })),
+    [flashTextTracks, previewTime],
+  );
 
   useEffect(() => {
     const video = videoRef.current;
@@ -2488,6 +2697,20 @@ function SubtitleLayoutEditor({
             onSeeked={(event) => setPreviewTime(event.currentTarget.currentTime)}
           />
           <div className="pointer-events-none absolute inset-0 z-20">
+            {activeFlashTextBoxes.map(({ track, box }) => (
+              <div
+                key={`flash-text-${track.id}`}
+                className="absolute rounded-md border-2 border-amber-400/90 bg-black/25 shadow-[0_0_0_2px_rgba(251,191,36,0.25)]"
+                style={{
+                  left: `${box.x}%`,
+                  top: `${box.y}%`,
+                  width: `${box.width}%`,
+                  height: `${box.height}%`,
+                  backdropFilter: `blur(${Math.max(0, box.height * track.blur / 18)}px)`,
+                  WebkitBackdropFilter: `blur(${Math.max(0, box.height * track.blur / 18)}px)`,
+                }}
+              />
+            ))}
             {selectedBlur.enabled && (
               <button
                 type="button"
