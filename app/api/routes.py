@@ -43,7 +43,7 @@ from app.utils.vram import VRAMManager
 from app.utils.workspace import WorkspaceManager
 from utils.model_registry import model_registry
 from utils.stt import list_stt_models, remote_stt_enabled, transcribe_audio_remote
-from utils.translation import list_translation_models, shorten_text_for_duration
+from utils.translation import list_translation_models, normalize_translation_model, shorten_text_for_duration
 
 router = APIRouter(prefix="/api/v1", tags=["dubbing"])
 compat_router = APIRouter(prefix="/api", tags=["dubbing-compat"])
@@ -62,7 +62,7 @@ VOICE_REFERENCE_SUFFIXES = {".wav"}
 VOICE_REFERENCE_DIR = Path("output")
 DEFAULT_VOICE_REFERENCE_MAX_BYTES = 16 * 1024 * 1024
 SOURCE_MEDIA_DIR = Path("temp") / "source_media"
-TranslationProvider = Literal["9router", "google", "mock"]
+TranslationProvider = Literal["antigravity", "9router", "google", "mock"]
 ComputeType = Literal["int8", "float16"]
 AsrEngine = Literal["auto", "whisper", "paraformer"]
 CopyrightSource = Literal["unknown", "owned", "licensed", "public_domain", "permission", "platform_library"]
@@ -226,16 +226,16 @@ def _config_from_form(
     translation_provider_value = _first_config_value(
         translation_provider,
         ("AUTODUB_TRANSLATION_PROVIDER",),
-        "9router",
+        "antigravity",
     )
     resolved_translation_provider = cast(
         TranslationProvider,
-        translation_provider_value if translation_provider_value in {"9router", "google", "mock"} else "9router",
+        "mock" if translation_provider_value == "mock" else "antigravity",
     )
     resolved_translation_model = _first_config_value(
         translation_model,
         ("AUTODUB_TRANSLATION_MODEL",),
-        "ag/gemini-3-flash-agent",
+        normalize_translation_model(None),
     )
     resolved_asr_model = _fallback_asr_model(asr_model)
     compute_type_value = _first_config_value(compute_type, ("AUTODUB_COMPUTE_TYPE",), "float16")
@@ -1407,12 +1407,12 @@ def stt_models_v1() -> dict[str, object]:
 
 @router.get("/translation/models")
 def translation_models_v1() -> dict[str, object]:
-    return list_translation_models(timeout=0.5)
+    return list_translation_models(timeout=5.0)
 
 
 @stream_router.get("/translation/models")
 def translation_models() -> dict[str, object]:
-    return list_translation_models(timeout=0.5)
+    return list_translation_models(timeout=5.0)
 
 
 @stream_router.get("/stt/models")

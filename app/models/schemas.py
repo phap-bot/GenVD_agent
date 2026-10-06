@@ -37,8 +37,8 @@ class TranscribeRequest(BaseModel):
 class PipelineConfig(BaseModel):
     source_language: str | None = Field(default=None, max_length=16)
     target_language: str = Field(default="en", min_length=2, max_length=16)
-    translation_provider: Literal["9router", "google", "mock"] = "9router"
-    translation_model: str = Field(default="ag/gemini-3-flash-agent", min_length=1, max_length=160)
+    translation_provider: Literal["antigravity", "9router", "google", "mock"] = "antigravity"
+    translation_model: str = Field(default="", max_length=160)
     asr_model: str = Field(default="base", min_length=1, max_length=160)
     asr_engine: Literal["auto", "whisper", "paraformer"] = "auto"
     whisper_model: str = Field(default="auto", min_length=1, max_length=32)
@@ -213,8 +213,8 @@ class RenderScriptRequest(BaseModel):
     source_video_path: str = Field(min_length=1)
     source_language: str | None = Field(default=None, max_length=16)
     target_language: str = Field(default="vi", min_length=2, max_length=16)
-    translation_provider: Literal["9router", "google", "mock"] = "9router"
-    translation_model: str = Field(default="ag/gemini-3-flash-agent", min_length=1, max_length=160)
+    translation_provider: Literal["antigravity", "9router", "google", "mock"] = "antigravity"
+    translation_model: str = Field(default="", max_length=160)
     voice_model: str = Field(default="Trúc Ly", min_length=1, max_length=64)
     voice_mode: Literal["system", "clone"] = "system"
     clone_reference_audio_path: str | None = Field(default=None, max_length=1024)
@@ -277,7 +277,7 @@ class ShortenTextRequest(BaseModel):
     text: str = Field(min_length=1, max_length=4000)
     target_duration: float = Field(gt=0, le=120)
     target_language: str = Field(default="vi", min_length=2, max_length=16)
-    translation_provider: Literal["9router", "google", "mock"] = "9router"
+    translation_provider: Literal["antigravity", "9router", "google", "mock"] = "antigravity"
     translation_model: str = Field(default="", max_length=160)
     source_text: str | None = Field(default=None, max_length=4000)
     context: str | None = Field(default=None, max_length=4000)
@@ -355,8 +355,8 @@ class ShortVideoRenderRequest(BaseModel):
     media_id: str = Field(min_length=1, max_length=64)
     source_language: str | None = Field(default=None, max_length=16)
     target_language: str = Field(default="vi", min_length=2, max_length=16)
-    translation_provider: Literal["9router", "google", "mock"] = "9router"
-    translation_model: str = Field(default="ag/gemini-3-flash-agent", min_length=1, max_length=160)
+    translation_provider: Literal["antigravity", "9router", "google", "mock"] = "antigravity"
+    translation_model: str = Field(default="", max_length=160)
     voice_model: str = Field(default="Trúc Ly", min_length=1, max_length=64)
     voice_mode: Literal["system", "clone"] = "system"
     clone_reference_audio_path: str | None = Field(default=None, max_length=1024)

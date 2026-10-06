@@ -42,11 +42,13 @@ class TranslationService:
         translated_texts: list[str] = [""] * len(segments)
         structured_failure_state = {"structured_failure": False}
         groups = self._language_groups(segments)
-        for group in groups:
+        fallback_groups: set[int] = set()
+        for group_index, group in enumerate(groups):
             source_language = segments[group[0]].language or self.config.source_language
             texts = [segments[index].text for index in group]
             durations = [max(0.1, segments[index].end - segments[index].start) for index in group]
             intervals = [(segments[index].start, segments[index].end) for index in group]
+            group_fallback_indices: set[int] = set()
             if self.config.mock_translation:
                 values = [f"[{self.config.target_language}] {text}" for text in texts]
             else:
@@ -62,7 +64,10 @@ class TranslationService:
                     batch_size=self.config.translate_batch_size,
                     context=context,
                     cps_budget=self.config.translate_cps_budget,
+                    fallback_indices=group_fallback_indices,
                 )
+            if group_fallback_indices:
+                fallback_groups.add(group_index)
             for index, value in zip(group, values):
                 translated_texts[index] = value
 
@@ -78,11 +83,23 @@ class TranslationService:
         # previously coherent review sentence fragmented again. It remains
         # batch-based and keeps every source cue mapped to the same timestamp.
         if self.config.translate_analysis and not self.config.mock_translation:
-            for group in groups:
+            for group_index, group in enumerate(groups):
                 texts = [segments[index].text for index in group]
                 durations = [max(0.1, segments[index].end - segments[index].start) for index in group]
-                if len(texts) < 8 and not any(duration >= 6.0 for duration in durations):
+                if (
+                    len(texts) < 8
+                    and not any(duration >= 6.0 for duration in durations)
+                    and group_index not in fallback_groups
+                ):
                     continue
+                coherence_context = context
+                if group_index in fallback_groups:
+                    fallback_note = (
+                        "One or more current translations in this batch needed Antigravity model repair. "
+                        "Check them against the source and actively restore supported emotional direction and "
+                        "spoken cadence; factual accuracy alone does not make a flat literal draft coherent."
+                    )
+                    coherence_context = "\n".join(part for part in (context, fallback_note) if part)
                 reviewed_values = review_translation_coherence(
                     [translated_texts[index] for index in group],
                     target_durations=durations,
@@ -91,7 +108,7 @@ class TranslationService:
                     target_language=self.config.target_language,
                     provider=self.config.translation_provider,
                     model=resolved_model,
-                    context=context,
+                    context=coherence_context,
                     batch_size=self.config.translate_batch_size,
                     cancel_event=self.cancel_event,
                     failure_state=structured_failure_state,
